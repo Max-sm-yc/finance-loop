@@ -1,0 +1,25 @@
+services:
+  - type: worker
+    name: finance-loop-worker
+    runtime: docker
+    plan: 0.5c-512mb
+    branch: main
+    dockerfilePath: ./ops/worker/Dockerfile
+    dockerContext: .
+    envVars:
+      - key: SQUARE_ENVIRONMENT
+        value: sandbox
+      - key: SQUARE_API_VERSION
+        sync: false
+      - key: SQUARE_CLIENT_ID
+        sync: false
+      - key: SQUARE_CLIENT_SECRET
+        sync: false
+      - key: SQUARE_TOKEN_ENCRYPTION_KEY
+        sync: false
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SECRET_KEY
+        sync: false
+      - key: ACCOUNTING_TIMEZONE
+        value: America/New_York

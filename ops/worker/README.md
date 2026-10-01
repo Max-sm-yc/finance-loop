@@ -54,11 +54,11 @@ The process prints structured job lifecycle logs without tokens or payment
 payloads. Ctrl+C or a container stop signal lets the current job finish before
 it exits.
 
-## Deploy on Northflank
+## Deploy on Render
 
-The worker is a continuously running queue consumer, so create a Northflank
-**service** (not a one-off or scheduled job). Northflank's background-task guide
-uses services for continuous workers and jobs for tasks that end.
+The worker is a continuously running queue consumer, so deploy it as a Render
+**Background Worker**. The root `render.yaml` defines this service and its
+Docker build settings.
 
 1. Apply the worker database migration from the repository root:
 
@@ -66,30 +66,30 @@ uses services for continuous workers and jobs for tasks that end.
    npx supabase db push
    ```
 
-2. In Northflank, create a project and a **Service** connected to the GitHub
-   repository `Max-sm-yc/finance-loop`, branch `main`.
-3. Choose Dockerfile build, set the Dockerfile location to
-   `/ops/worker/Dockerfile`, and the build context to `/` (the repository root).
-   The Dockerfile runs `node src/worker/run.mjs` by default.
-4. Add the required environment variables below in the service's runtime
-   variables/secrets. Mark credentials and keys as secrets. Set
-   `SQUARE_ENVIRONMENT=sandbox` for the first deploy.
-5. Configure one instance initially. Do not add a port, public domain, or
-   Cloudflare DNS record; this worker only makes outbound calls to Supabase and
-   Square. Keep automatic deploys from `main` enabled if desired.
-6. Deploy, then check the service logs for its startup/idle polling messages.
-   Enqueue the initial sync below and verify the job completes before treating
+2. In Render, create a **Blueprint** from the GitHub repository
+   `Max-sm-yc/finance-loop`, branch `main`, and review the `finance-loop-worker`
+   service before applying it.
+3. The Blueprint selects the Docker runtime, Dockerfile path
+   `./ops/worker/Dockerfile`, repository-root build context, and one Background
+   Worker instance. The image's `CMD` starts `node src/worker/run.mjs`.
+4. During the initial Blueprint setup, provide the variables marked `sync: false`
+   in `render.yaml` using the required values below. Keep `SQUARE_ENVIRONMENT`
+   on `sandbox` for this first deploy. For later-added secrets, set them on the
+   Render worker's Environment page.
+5. The worker has no inbound endpoint, so no port, public URL, or Cloudflare DNS
+   record is needed. Deploy and check the service logs for startup/idle polling
+   messages.
+6. Enqueue the initial sync below and verify the job completes before treating
    the worker as operational.
 
 The browser app and webhook stay on Vercel. The webhook URL remains
 `https://operations.ccdsinvest.com/api/square/webhook`; it does not change when
-the worker moves to Northflank. Do not run this infinite poll loop in a Vercel
+the worker runs on Render. Do not run this infinite poll loop in a Vercel
 request or cron invocation.
 
-Northflank's Developer Sandbox advertises always-on compute and includes free
-service resources, but Northflank explicitly says the Sandbox should not be
-used for production applications. Use it for the Square Sandbox integration
-test; move to an appropriate paid plan before processing live merchant data.
+Render does not offer a Free compute plan for Background Workers. The Blueprint
+uses Render's smallest listed Background Worker plan (`0.5c-512mb`); check the
+current price in Render before applying it.
 
 ## First backfill and verification
 
