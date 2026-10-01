@@ -2,6 +2,53 @@
 
 `schema.sql` is the reviewed initial baseline and is mirrored by `migrations/202609300000_initial_schema.sql`. Apply migrations in filename order. The hardening migration expects the baseline objects and does not create Auth users or seed merchant data. Migration `202609300002_evidence_storage.sql` creates or locks down the private `finance-evidence` bucket used by the authenticated upload API. Prefer the Supabase CLI migration workflow (`supabase db push`) against a linked project; for review, run `supabase db reset` against a disposable local instance first. Never test migrations against a production project.
 
+## Apply the migrations to the hosted project
+
+The repository includes `config.toml` so the Supabase CLI can use the existing migrations. From the repository root, install or run the current Supabase CLI, then:
+
+```sh
+supabase login
+supabase link --project-ref <project-ref>
+supabase migration list
+supabase db push
+supabase migration list
+```
+
+The project reference is in the Supabase Dashboard project URL. `supabase login` uses a Supabase Personal Access Token; `supabase link` may ask for the database password. These are distinct from `SUPABASE_SECRET_KEY`. Confirm the linked project is the intended empty/staging project before `db push`; back up and review the target first if it contains data. The migrations create the app schema and private evidence bucket, but do not create Auth users or organization rows. The CLI is not installed in the current workspace, so no remote migration has been applied from this checkout.
+
+## Enable the first sign-in
+
+The web app supports email/password sign-in and has no public sign-up form. Supabase email/password Auth is enabled by default. In **Authentication → URL Configuration**, set the Site URL to `https://operations.ccdsinvest.com` and allow that URL for Auth email redirects. This Supabase Auth URL is separate from the Square OAuth callback URL.
+
+Create or invite the first account in **Authentication → Users**. Once the user exists, run this one-time bootstrap block in the Supabase SQL Editor, replacing both placeholders. It creates an organization and grants that user the `owner` role; do not put the user's password in SQL.
+
+```sql
+do $$
+declare
+  initial_user_id uuid;
+  new_organization_id uuid;
+begin
+  select id into initial_user_id
+  from auth.users
+  where lower(email) = lower('YOUR_LOGIN_EMAIL')
+  limit 1;
+
+  if initial_user_id is null then
+    raise exception 'Create the Auth user first, then rerun this block';
+  end if;
+
+  insert into public.organizations (name, base_currency, timezone)
+  values ('YOUR_ORGANIZATION_NAME', 'USD', 'America/New_York')
+  returning id into new_organization_id;
+
+  insert into public.memberships (organization_id, user_id, role)
+  values (new_organization_id, initial_user_id, 'owner');
+end
+$$;
+```
+
+The owner can then sign in at `https://operations.ccdsinvest.com`. The app will show an empty state until an account is configured and a projection is produced.
+
 The browser role has `SELECT` only. The authenticated write contracts added by `202609300001_database_hardening.sql` are:
 
 * `record_cash_movement(org, account, kind, amount_minor, currency, occurred_at, description, evidence_file_id, idempotency_key, approved_by)` returns the movement UUID. Owner/operator may enter a movement. The account and evidence must belong to the organization, currency must match, and replaying the same idempotency key with changed data fails. Adjustments are created pending; single-leg transfers are rejected.

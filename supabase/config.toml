@@ -1,0 +1,3 @@
+# Supabase CLI project configuration. Link this local project to a hosted
+# project with `supabase link --project-ref <project-ref>` before `db push`.
+project_id = "finance-loop"

@@ -50,7 +50,7 @@ export default function Home() {
   const reportTimezone = dashboard?.organization?.timezone ?? 'UTC';
 
   useEffect(() => {
-    if (!supabase) { setError('Supabase is not configured. Add the public project URL and anon key to the web environment.'); setLoadingAuth(false); return; }
+    if (!supabase) { setError('Supabase is not configured. Add the project URL and publishable key to the web environment.'); setLoadingAuth(false); return; }
     supabase.auth.getUser().then(({ data }) => { setUser(data.user); setLoadingAuth(false); }).catch(() => { setError('Could not validate your sign-in session. Try again.'); setLoadingAuth(false); });
     const { data: listener } = supabase.auth.onAuthStateChange((_event, session) => setUser(session?.user ?? null));
     return () => listener.subscription.unsubscribe();
