@@ -19,8 +19,8 @@ test('OAuth URL and server-side code/refresh exchange use least-privilege caller
   assert.equal(calls[1][1].refresh_token, 'refresh');
 });
 
-test('Square OAuth token errors expose only the provider code and request ID', async () => {
-  const fetchImpl = async () => new Response(JSON.stringify({ error: 'invalid_client', error_description: 'sensitive details are omitted' }), {
+test('Square OAuth token errors expose only sanitized provider diagnostics', async () => {
+  const fetchImpl = async () => new Response(JSON.stringify({ message: 'Not Authorized', type: 'service.not_authorized', error_description: 'sensitive details are omitted' }), {
     status: 401,
     headers: { 'square-request-id': 'req-123-safe' }
   });
@@ -28,7 +28,8 @@ test('Square OAuth token errors expose only the provider code and request ID', a
     () => exchangeAuthorizationCode({ code: 'one-time-code', clientId: 'app', clientSecret: 'secret', redirectUri: 'https://host/cb', fetchImpl }),
     error => {
       assert.equal(error.status, 401);
-      assert.equal(error.code, 'invalid_client');
+      assert.equal(error.code, undefined);
+      assert.equal(error.providerType, 'service.not_authorized');
       assert.equal(error.squareRequestId, 'req-123-safe');
       assert.equal(error.message, 'Square request failed (401)');
       assert.equal(error.message.includes('sensitive details'), false);
