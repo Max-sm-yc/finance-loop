@@ -9,6 +9,9 @@ export function createAuthorizationUrl({ clientId, redirectUri, state, scopes, b
   url.searchParams.set('redirect_uri', redirectUri);
   url.searchParams.set('state', state);
   if (scopes?.length) url.searchParams.set('scope', scopes.join(' '));
+  // Square's production OAuth flow requires session=false. Sandbox only
+  // supports its existing session behavior, so omit the parameter there.
+  if (new URL(baseUrl).hostname === 'connect.squareup.com') url.searchParams.set('session', 'false');
   return url.toString();
 }
 

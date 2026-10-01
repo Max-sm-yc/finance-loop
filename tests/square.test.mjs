@@ -7,6 +7,9 @@ test('OAuth URL and server-side code/refresh exchange use least-privilege caller
   const url = new URL(createAuthorizationUrl({ clientId: 'app', redirectUri: 'https://host/cb', state: 'csrf', scopes: ['ORDERS_READ', 'PAYMENTS_READ'] }));
   assert.equal(url.searchParams.get('state'), 'csrf');
   assert.equal(url.searchParams.get('scope'), 'ORDERS_READ PAYMENTS_READ');
+  assert.equal(url.searchParams.get('session'), 'false');
+  const sandboxUrl = new URL(createAuthorizationUrl({ clientId: 'sandbox-app', redirectUri: 'https://host/cb', state: 'csrf', scopes: ['ORDERS_READ'], baseUrl: 'https://connect.squareupsandbox.com' }));
+  assert.equal(sandboxUrl.searchParams.has('session'), false);
   const calls = [];
   const fetchImpl = async (u, init) => { calls.push([u, JSON.parse(init.body)]); return new Response(JSON.stringify({ access_token: 'secret' }), { status: 200 }); };
   await exchangeAuthorizationCode({ code: 'auth-code', clientId: 'app', clientSecret: 'secret', redirectUri: 'https://host/cb', fetchImpl });
