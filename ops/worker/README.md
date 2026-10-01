@@ -54,18 +54,42 @@ The process prints structured job lifecycle logs without tokens or payment
 payloads. Ctrl+C or a container stop signal lets the current job finish before
 it exits.
 
-## Container deployment
+## Deploy on Northflank
 
-Build from the repository root, using `ops/worker/Dockerfile`:
+The worker is a continuously running queue consumer, so create a Northflank
+**service** (not a one-off or scheduled job). Northflank's background-task guide
+uses services for continuous workers and jobs for tasks that end.
 
-```sh
-docker build -f ops/worker/Dockerfile -t finance-loop-worker .
-```
+1. Apply the worker database migration from the repository root:
 
-Run it as a continuously running/background worker service on your chosen host
-and add the required variables above in that host's secret settings. Do not run
-an infinite poll loop as a Vercel request or cron invocation. Keep the web app
-on Vercel; deploy this container separately. Start with Square Sandbox.
+   ```powershell
+   npx supabase db push
+   ```
+
+2. In Northflank, create a project and a **Service** connected to the GitHub
+   repository `Max-sm-yc/finance-loop`, branch `main`.
+3. Choose Dockerfile build, set the Dockerfile location to
+   `/ops/worker/Dockerfile`, and the build context to `/` (the repository root).
+   The Dockerfile runs `node src/worker/run.mjs` by default.
+4. Add the required environment variables below in the service's runtime
+   variables/secrets. Mark credentials and keys as secrets. Set
+   `SQUARE_ENVIRONMENT=sandbox` for the first deploy.
+5. Configure one instance initially. Do not add a port, public domain, or
+   Cloudflare DNS record; this worker only makes outbound calls to Supabase and
+   Square. Keep automatic deploys from `main` enabled if desired.
+6. Deploy, then check the service logs for its startup/idle polling messages.
+   Enqueue the initial sync below and verify the job completes before treating
+   the worker as operational.
+
+The browser app and webhook stay on Vercel. The webhook URL remains
+`https://operations.ccdsinvest.com/api/square/webhook`; it does not change when
+the worker moves to Northflank. Do not run this infinite poll loop in a Vercel
+request or cron invocation.
+
+Northflank's Developer Sandbox advertises always-on compute and includes free
+service resources, but Northflank explicitly says the Sandbox should not be
+used for production applications. Use it for the Square Sandbox integration
+test; move to an appropriate paid plan before processing live merchant data.
 
 ## First backfill and verification
 
