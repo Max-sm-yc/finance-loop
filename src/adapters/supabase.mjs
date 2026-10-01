@@ -2,6 +2,7 @@ const requiredString = (value, name) => {
   if (typeof value !== 'string' || !value.trim()) throw new TypeError(`${name} is required`);
   return value.replace(/\/$/, '');
 };
+const SQUARE_FACT_BATCH_SIZE = 500;
 
 function safeError(payload, status) {
   const error = new Error(`Supabase request failed (${status})`);
@@ -221,11 +222,20 @@ export function createSupabaseAdapters({ url, publishableKey, secretKey, tokenEn
         const { raw: _rawSquareObject, ...safeFact } = fact;
         return { kind: fact.kind, objectId: fact.objectId, version: String(fact.version), versionSort: squareVersionSort(fact.version), fact: safeFact };
       });
-      const { data, error } = await serviceRest().rpc('upsert_square_facts', {
-        organization_id: organizationId, facts: normalized, cause: String(cause ?? 'worker').slice(0, 300),
-      });
-      if (error) throw error;
-      return data;
+      const batches = normalized.length
+        ? Array.from({ length: Math.ceil(normalized.length / SQUARE_FACT_BATCH_SIZE) }, (_, index) => normalized.slice(index * SQUARE_FACT_BATCH_SIZE, (index + 1) * SQUARE_FACT_BATCH_SIZE))
+        : [normalized];
+      let changed = false;
+      let revision = null;
+      for (const batch of batches) {
+        const { data, error } = await serviceRest().rpc('upsert_square_facts', {
+          organization_id: organizationId, facts: batch, cause: String(cause ?? 'worker').slice(0, 300),
+        });
+        if (error) throw error;
+        changed ||= data?.changed === true;
+        if (Number.isSafeInteger(data?.revision)) revision = data.revision;
+      }
+      return { changed, revision };
     },
     async recordSourceHealth(record) {
       const { data, error } = await serviceRest().rpc('record_square_worker_health', {

@@ -132,6 +132,26 @@ test('worker fact upserts use the service key, preserve version ordering, and om
   assert.ok(cashCorrection.versionSort > fact.versionSort, 'normalization correction sorts after its original Square version');
 });
 
+test('worker fact upserts split large Square pages below the database RPC limit', async () => {
+  const batches = [];
+  let revision = 0;
+  const adapters = createSupabaseAdapters({
+    url: 'https://tenant.supabase.test', secretKey: 'sb_secret_worker',
+    fetchImpl: async (_url, init) => {
+      const body = JSON.parse(init.body);
+      batches.push(body.p_facts);
+      revision += 1;
+      return response({ changed: true, revision });
+    }
+  });
+  const facts = Array.from({ length: 1001 }, (_, index) => ({
+    kind: 'payment', objectId: `payment-${index}`, version: '2026-09-30T12:00:00Z', amountMinor: 100,
+  }));
+  const result = await adapters.db.upsertSquareFacts({ organizationId: org, cause: 'sync:large-page', facts });
+  assert.deepEqual(batches.map(batch => batch.length), [500, 500, 1]);
+  assert.deepEqual(result, { changed: true, revision: 3 });
+});
+
 test('worker projection snapshot maps Square income, refunds, approved costs, and configured reconciliations', async () => {
   const startAt = '2026-09-01T00:00:00.000Z'; const endAt = '2026-10-01T00:00:00.000Z';
   const adapters = createSupabaseAdapters({

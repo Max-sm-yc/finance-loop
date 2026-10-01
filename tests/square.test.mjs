@@ -122,10 +122,12 @@ test('backfill paginates, retries transient failures, persists normalized payout
 });
 
 test('backfill exposes a durable gap marker and withholds last-success marker after exhausted pagination', async () => {
-  const client = { async request(path) { if (path.includes('/orders/search')) { const e = new Error('no permission'); e.status = 403; throw e; } return {}; } };
+  const client = { async request(path) { if (path.includes('/orders/search')) { const e = new Error('no permission'); e.status = 403; e.code = 'INSUFFICIENT_SCOPES'; throw e; } return {}; } };
   const result = await backfillSquare({ client, startAt: '2026-01-01T00:00:00Z', endAt: '2026-02-01T00:00:00Z', persist: async () => {} });
   assert.equal(result.freshness, 'incomplete');
   assert.equal(result.lastSuccessfulSyncAt, null);
   assert.equal(result.gaps[0].code, 'PERMISSION_LOST');
+  assert.equal(result.gaps[0].providerStatus, 403);
+  assert.equal(result.gaps[0].providerCode, 'INSUFFICIENT_SCOPES');
   assert.equal(result.resources.orders.status, 'incomplete');
 });

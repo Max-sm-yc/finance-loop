@@ -28,7 +28,17 @@ async function paginate({ name, fetchPage, onPage, state, retries, sleep, random
     } while (cursor);
     state.resources[name] = { status: 'fresh', pages, completedAt: new Date().toISOString() };
   } catch (error) {
-    state.gaps.push({ resource: name, code: error.status === 403 ? 'PERMISSION_LOST' : error.status === 429 ? 'RATE_LIMITED' : 'BACKFILL_INCOMPLETE', message: error.message, cursor });
+    const providerCode = typeof error?.code === 'string' && /^[A-Za-z0-9_.-]{1,100}$/.test(error.code)
+      ? error.code
+      : Array.isArray(error?.errors) ? error.errors.find(item => typeof item?.code === 'string' && /^[A-Za-z0-9_.-]{1,100}$/.test(item.code))?.code : undefined;
+    state.gaps.push({
+      resource: name,
+      code: error.status === 403 ? 'PERMISSION_LOST' : error.status === 429 ? 'RATE_LIMITED' : 'BACKFILL_INCOMPLETE',
+      message: error.message,
+      ...(Number.isInteger(error?.status) ? { providerStatus: error.status } : {}),
+      ...(providerCode ? { providerCode } : {}),
+      cursor,
+    });
     state.resources[name] = { status: 'incomplete', pages, cursor, error: error.message };
   }
 }
