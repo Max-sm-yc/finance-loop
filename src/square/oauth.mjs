@@ -61,6 +61,7 @@ export function createSquareOAuthHandlers({ authenticateOwner, stateStore, token
         route,
         status: Number.isInteger(error?.status) ? error.status : undefined,
         code: typeof error?.code === 'string' && /^[A-Za-z0-9_-]{1,80}$/.test(error.code) ? error.code : undefined,
+        squareRequestId: typeof error?.squareRequestId === 'string' && /^[A-Za-z0-9-]{1,120}$/.test(error.squareRequestId) ? error.squareRequestId : undefined,
         providerErrors: Array.isArray(error?.errors) ? error.errors.map(item => ({
           category: typeof item?.category === 'string' ? item.category : undefined,
           code: typeof item?.code === 'string' ? item.code : undefined

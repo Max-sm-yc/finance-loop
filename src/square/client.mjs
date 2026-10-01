@@ -23,6 +23,12 @@ async function jsonRequest(fetchImpl, url, { method = 'GET', headers = {}, body,
   if (!response.ok) {
     const error = new Error(data.errors?.map(e => e.detail || e.code).join('; ') || `Square request failed (${response.status})`);
     error.status = response.status; error.retryAfter = response.headers.get('retry-after'); error.errors = data.errors;
+    // OAuth token failures can use the OAuth error shape rather than Square's
+    // standard `errors` array. Keep only the short code and request ID for
+    // diagnostics; never attach or log the response body or submitted tokens.
+    if (typeof data.error === 'string' && /^[A-Za-z0-9_-]{1,80}$/.test(data.error)) error.code = data.error;
+    const requestId = response.headers.get('square-request-id') ?? response.headers.get('x-square-request-id');
+    if (typeof requestId === 'string' && /^[A-Za-z0-9-]{1,120}$/.test(requestId)) error.squareRequestId = requestId;
     throw error;
   }
   return data;

@@ -19,6 +19,24 @@ test('OAuth URL and server-side code/refresh exchange use least-privilege caller
   assert.equal(calls[1][1].refresh_token, 'refresh');
 });
 
+test('Square OAuth token errors expose only the provider code and request ID', async () => {
+  const fetchImpl = async () => new Response(JSON.stringify({ error: 'invalid_client', error_description: 'sensitive details are omitted' }), {
+    status: 401,
+    headers: { 'square-request-id': 'req-123-safe' }
+  });
+  await assert.rejects(
+    () => exchangeAuthorizationCode({ code: 'one-time-code', clientId: 'app', clientSecret: 'secret', redirectUri: 'https://host/cb', fetchImpl }),
+    error => {
+      assert.equal(error.status, 401);
+      assert.equal(error.code, 'invalid_client');
+      assert.equal(error.squareRequestId, 'req-123-safe');
+      assert.equal(error.message, 'Square request failed (401)');
+      assert.equal(error.message.includes('sensitive details'), false);
+      return true;
+    }
+  );
+});
+
 test('webhook verifies exact raw body and atomically deduplicates notification IDs', async () => {
   const rawBody = Buffer.from('{"event_id":"evt-1","type":"payment.updated","merchant_id":"m1","data":{"id":"p1"}}');
   const notificationUrl = 'https://example.test/api/square/webhook';
