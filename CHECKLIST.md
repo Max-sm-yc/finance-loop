@@ -33,14 +33,15 @@
 ### Backend and data
 
 - [ ] Apply migrations to a real Supabase project; execute RLS, organization isolation, cross-organization reference, and restore tests. The SQL has not run locally.
-- [ ] Wire and test durable worker claim/ack/retry, monotonic source upserts, projection snapshots, freshness records, and scheduled catch-up against Supabase.
-- [ ] Verify source-to-projection mappings and persist source snapshots so every production projection can be replayed from its facts.
+- [x] Implement a standalone container worker, durable versioned Square fact persistence, source health/issues, and replayable projection snapshots; validate core mappings with local tests.
+- [ ] Apply the worker migration and verify durable claim/ack/retry, Sandbox ingestion, source freshness, and projection persistence against the linked Supabase project.
+- [ ] Verify production source-to-projection mappings with merchant records, especially refunds, fees, gift cards, and account opening/observed balances.
 - [ ] Add evidence malware scanning and retention/deletion policy; run the documented database-and-Storage backup/restore drill.
 
 ### Integrations and agent
 
 - [ ] Configure and run Square OAuth/token vault, webhook URL, sandbox ingestion, and export reconciliation end to end. The modules have only fixture tests.
-- [ ] Configure OpenRouter and verify model/schema compatibility, durable budget accounting, and human approval with real exceptions.
+- [ ] Configure OpenRouter and implement/verify worker-side durable budget accounting, issue investigation, model/schema compatibility, and human approval with real exceptions. The first worker container deliberately leaves investigation jobs unclaimed.
 - [ ] Verify the authenticated Next.js UI and Supabase API against a deployed project. The local demo still intentionally uses sample data.
 - [ ] Add human notifications for unresolved cases and integration failures.
 

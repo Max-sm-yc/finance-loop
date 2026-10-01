@@ -49,7 +49,7 @@ const webhook = (id, type, object) => ({ event_id: id, type, data: { object } })
 test('duplicate Square webhook jobs fetch authoritative state and produce only one changed fact/projection', async () => {
   const payload = webhook('evt-1', 'payment.updated', { payment: { id: 'p1', amount_money: { amount: 10, currency: 'USD' } } });
   const path = '/v2/payments/p1';
-  const { worker, events, facts, projectionRuns } = harness({ payload, responses: { [path]: { payment: { id: 'p1', updated_at: '2026-09-30T11:00:00Z', amount_money: { amount: 1000, currency: 'USD' }, processing_fee: [], status: 'COMPLETED' } } } });
+  const { worker, events, facts, projectionRuns } = harness({ payload, responses: { [path]: { payment: { id: 'p1', created_at: '2026-09-30T10:55:00Z', updated_at: '2026-09-30T11:00:00Z', amount_money: { amount: 1000, currency: 'USD' }, processing_fee: [], status: 'COMPLETED' } } } });
   const job = { id: 'j1', type: 'square.webhook', organizationId: org, payload: { notificationId: 'evt-1' } };
   await worker.processJob(job); await worker.processJob(job);
   assert.equal(facts.size, 1);

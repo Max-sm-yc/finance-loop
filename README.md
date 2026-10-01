@@ -12,10 +12,10 @@ Finance Loop is a supervised operational accounting and cash reconciliation proj
 | `src/square/` | Square OAuth, signed webhook, API client, pagination, and normalization primitives. |
 | `src/agent/` | Bounded OpenRouter diagnosis that returns evidence-linked draft proposals only. |
 | `src/server/`, `src/adapters/` | Authenticated API handlers and Supabase REST/RPC adapters. |
-| `src/worker/` | Durable job processor contract for Square sync, replay, and investigations. |
+| `src/worker/` | Durable Square sync/webhook/replay processor and standalone worker entry point. |
 | `supabase/migrations/` | Initial and hardening migrations with RLS, audit, approval, and idempotency controls. |
 | `tests/` | Dependency-free Node tests for the pure and adapter boundaries. |
-| `ops/`, `docs/` | Operational readiness and pilot procedures. |
+| `ops/`, `docs/` | Worker container/run instructions, operational readiness, and pilot procedures. |
 
 ## Run the local demo
 
@@ -29,7 +29,7 @@ Serve this folder with `python -m http.server 4173` and open `http://localhost:4
 4. In `web/`, run `pnpm install` and `pnpm dev` for local UI development, or `pnpm build` for a production build. The UI requires a real Supabase Auth user and organization membership. It displays an explicit unavailable state when no projection exists.
 5. Run the dependency-free focused suite with `node --test tests/*.test.mjs` from the repository root.
 
-The API route wrapper and database RPCs cover authenticated reads, cash entries, balance observations, proposal decisions, webhook intake, OAuth state and encrypted token storage, and queued sync requests. The worker's source fact, projection, and investigation adapter methods must be wired and verified against Square sandbox records before live use. An evidence record must exist before a cash entry can reference it. The account opening balance and cutoff remain configuration input. The Next.js build passed locally; the SQL migrations, live integrations, restore drill, pilot, and accountant sign-off have not been verified.
+The API route wrapper and database RPCs cover authenticated reads, cash entries, balance observations, proposal decisions, webhook intake, OAuth state and encrypted-token storage, and queued sync requests. The standalone worker is in [ops/worker/README.md](./ops/worker/README.md); its new migration must be applied and its end-to-end Sandbox behavior verified before live use. Worker-side automated issue investigations remain disabled until their durable model-budget and proposal persistence methods are implemented. An evidence record must exist before a cash entry can reference it. The account opening balance and cutoff remain configuration input. Local unit tests pass; the new SQL migration, live integrations, restore drill, pilot, and accountant sign-off have not been verified.
 
 ## Deploy the web app with Vercel and Cloudflare DNS
 

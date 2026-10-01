@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import { replayAccounting } from '../engine/index.mjs';
 import { backfillSquare, normalizeOrder, normalizePayment, normalizeRefund, normalizeCatalog, normalizePayout, normalizePayoutEntry, normalizeGiftCardActivity } from '../square/sync.mjs';
+import { refreshAccessToken } from '../square/client.mjs';
 import { diagnoseIssue } from '../agent/diagnosis.mjs';
 
 const JOBS = new Set(['square.webhook', 'square.sync', 'projection.replay', 'issue.investigate']);
@@ -23,6 +24,25 @@ function canonical(value) {
 }
 const hash = value => createHash('sha256').update(JSON.stringify(canonical(value))).digest('hex');
 function errorMessage(error) { return error?.status ? `Square/API failure (${error.status})` : 'Worker job failed'; }
+function zonedMidnightUtc(year, monthIndex, day, timeZone) {
+  const target = Date.UTC(year, monthIndex, day);
+  const formatter = new Intl.DateTimeFormat('en-US', { timeZone, year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit', hourCycle: 'h23' });
+  let instant = target;
+  for (let attempt = 0; attempt < 4; attempt += 1) {
+    const parts = Object.fromEntries(formatter.formatToParts(new Date(instant)).filter(part => part.type !== 'literal').map(part => [part.type, Number(part.value)]));
+    instant += target - Date.UTC(parts.year, parts.month - 1, parts.day, parts.hour, parts.minute, parts.second);
+  }
+  return new Date(instant).toISOString();
+}
+function monthWindow(value, timeZone = 'America/New_York', fallback = new Date()) {
+  const parsed = Date.parse(value ?? '');
+  const anchor = new Date(Number.isFinite(parsed) ? parsed : fallback.getTime());
+  const parts = Object.fromEntries(new Intl.DateTimeFormat('en-US', { timeZone, year: 'numeric', month: '2-digit' }).formatToParts(anchor).filter(part => part.type !== 'literal').map(part => [part.type, Number(part.value)]));
+  return {
+    startAt: zonedMidnightUtc(parts.year, parts.month - 1, 1, timeZone),
+    endAt: zonedMidnightUtc(parts.year, parts.month, 1, timeZone),
+  };
+}
 function eventObject(payload) {
   const root = payload?.data?.object ?? {};
   const key = (payload?.type ?? '').split('.')[0];
@@ -60,28 +80,53 @@ export function createWorker(dependencies) {
   const leaseSeconds = Number.isInteger(config.leaseSeconds) ? Math.max(30, Math.min(config.leaseSeconds, 900)) : 120;
   const freshnessTargetMs = Number.isFinite(config.freshnessTargetMs) ? Math.max(60_000, config.freshnessTargetMs) : 24 * 60 * 60 * 1000;
   const maxPages = Number.isInteger(config.maxBackfillPages) ? Math.max(1, Math.min(config.maxBackfillPages, 20_000)) : 10_000;
+  const enabledJobTypes = config.enabledJobTypes ?? [...JOBS];
+  if (!Array.isArray(enabledJobTypes) || enabledJobTypes.length === 0 || enabledJobTypes.some(type => !JOBS.has(type))) throw new TypeError('config.enabledJobTypes must contain supported job types');
 
   async function getClient(organizationId) {
-    const connection = await tokenVault.getDecrypted({ organizationId });
+    let connection = await tokenVault.getDecrypted({ organizationId });
     if (!connection?.accessToken) throw Object.assign(new Error('Square connection unavailable'), { permanent: true });
+    const expiresAt = Date.parse(connection.expiresAt ?? '');
+    if (Number.isFinite(expiresAt) && expiresAt <= now().getTime() + 5 * 60_000) {
+      if (!connection.refreshToken || !config.squareClientId || !config.squareClientSecret) {
+        throw Object.assign(new Error('Square authorization expired and refresh is not configured'), { permanent: true });
+      }
+      const refreshed = await refreshAccessToken({
+        refreshToken: connection.refreshToken, clientId: config.squareClientId,
+        clientSecret: config.squareClientSecret, fetchImpl,
+        baseUrl: config.squareBaseUrl ?? 'https://connect.squareup.com',
+      });
+      await tokenVault.storeEncrypted({
+        organizationId, connectedBy: connection.connectedBy, merchantId: refreshed.merchant_id ?? connection.merchantId,
+        accessToken: refreshed.access_token, refreshToken: refreshed.refresh_token,
+        expiresAt: refreshed.expires_at, scopes: refreshed.scopes ?? connection.scopes,
+        tokenType: refreshed.token_type ?? connection.tokenType,
+      });
+      connection = { ...connection, accessToken: refreshed.access_token, expiresAt: refreshed.expires_at };
+    }
     // Tokens remain server-side and must be decrypted only inside the adapter.
-    return makeSquareClient({ accessToken: connection.accessToken, apiVersion: config.squareApiVersion });
+    return makeSquareClient({ accessToken: connection.accessToken, apiVersion: config.squareApiVersion, baseUrl: config.squareBaseUrl });
   }
 
-  async function writeFacts(organizationId, facts, cause) {
+  async function writeFacts(organizationId, facts, cause, window = {}) {
     if (!facts.length) return { changed: false, revision: null };
-    const result = await db.upsertSquareFacts({ organizationId, facts, cause, enforceMonotonicVersion: true });
+    const persistable = facts.filter(fact => fact?.objectId && fact.version !== null && fact.version !== undefined && String(fact.version) !== '');
+    const result = persistable.length
+      ? await db.upsertSquareFacts({ organizationId, facts: persistable, cause, enforceMonotonicVersion: true })
+      : { changed: false, revision: null };
     if (!result || typeof result.changed !== 'boolean') throw new Error('upsertSquareFacts must return {changed, revision}');
     const problems = facts.flatMap(fact => {
       const missing = [];
       if (!fact.objectId || fact.version === null || fact.version === undefined || fact.version === '') missing.push('object_identity_or_version');
       if (fact.currency !== null && fact.currency !== undefined && !/^[A-Z]{3}$/.test(fact.currency)) missing.push('invalid_currency');
       if (fact.kind === 'order_line') {
+        if (!fact.occurredAt || !Number.isFinite(Date.parse(fact.occurredAt))) missing.push('missing_occurred_at');
         if (!fact.currency) missing.push('missing_currency');
         if (!Number.isSafeInteger(Number(fact.quantity)) || Number(fact.quantity) <= 0) missing.push('unsupported_or_missing_quantity');
         if (fact.itemType !== 'GIFT_CARD' && (fact.grossMinor === null || fact.discountMinor === null)) missing.push('missing_square_sales_amount');
       }
       if (fact.kind === 'payment' && (!fact.currency || fact.amountMinor === null || (fact.status === 'COMPLETED' && fact.feeMinor === null))) missing.push('missing_square_payment_or_fee_amount');
+      if ((fact.kind === 'payment' || fact.kind === 'refund' || fact.kind === 'gift_card_activity') && (!fact.occurredAt || !Number.isFinite(Date.parse(fact.occurredAt)))) missing.push('missing_occurred_at');
       if (fact.kind === 'refund' && (!fact.currency || fact.amountMinor === null)) missing.push('missing_square_refund_amount');
       if ((fact.kind === 'payout' || fact.kind === 'payout_entry') && (!fact.currency || fact.amountMinor === null)) missing.push('missing_square_payout_amount');
       if (fact.kind === 'gift_card_activity' && (!fact.currency || fact.amountMinor === null)) missing.push('missing_square_gift_card_amount');
@@ -101,16 +146,20 @@ export function createWorker(dependencies) {
       await db.resolveSourceIssueRefs({ organizationId, code: 'UNSUPPORTED_ACTIVITY', sourceRefs: factRefs, resolvedAt: now().toISOString() });
     }
     if (result.changed) {
-      const projection = await recomputeProjection(organizationId, result.revision, cause);
+      const projection = await recomputeProjection(organizationId, result.revision, cause, window);
       if (projection?.incomplete) return { ...result, incomplete: true, problems: [projection.gap] };
     }
     return result;
   }
 
-  async function recomputeProjection(organizationId, sourceRevision, cause) {
+  async function recomputeProjection(organizationId, sourceRevision, cause, window = {}) {
     if (typeof engine?.replayAccounting !== 'function') throw Object.assign(new Error('Accounting engine unavailable'), { permanent: true });
-    const snapshot = await db.getProjectionSnapshot({ organizationId, sourceRevision });
-    if (!snapshot || snapshot.sourceRevision !== sourceRevision) throw new Error('Projection snapshot does not match source revision');
+    const snapshot = await db.getProjectionSnapshot({ organizationId, sourceRevision, startAt: window.startAt, endAt: window.endAt });
+    if (!snapshot || !Number.isSafeInteger(snapshot.sourceRevision) || !snapshot.snapshot) throw new Error('Projection snapshot is unavailable');
+    // Another leased job may have committed while this job was fetching Square.
+    // The adapter locks the org revision while assembling the snapshot, so use
+    // that coherent latest revision instead of projecting a stale one.
+    sourceRevision = snapshot.sourceRevision;
     const sourceSnapshot = snapshot.snapshot ?? snapshot;
     const giftCardLines = (sourceSnapshot.lines ?? []).filter(line => line.status === 'completed' && line.itemType === 'GIFT_CARD');
     const giftCardActivities = sourceSnapshot.giftCardActivities ?? [];
@@ -122,8 +171,9 @@ export function createWorker(dependencies) {
       return { incomplete: true, gap };
     }
     const result = engine.replayAccounting(sourceSnapshot);
-    await db.saveProjectionRunSystem({ organizationId, sourceRevision, calculationVersion: result.calculationVersion, result, cause, idempotencyKey: `projection:${sourceRevision}:${result.calculationVersion}` });
-    await db.syncProjectionIssues({ organizationId, sourceRevision, calculationVersion: result.calculationVersion, issues: result.issues.map(issue => ({ code: issue.code, message: issue.message, sourceRefs: issue.sourceRefs ?? [], state: 'awaiting_human' })) });
+    const replayableSnapshot = { ...sourceSnapshot, sourceRevision, projectionCause: cause };
+    await db.saveProjectionRunSystem({ organizationId, sourceRevision, calculationVersion: result.calculationVersion, result, sourceSnapshot: replayableSnapshot, cause, idempotencyKey: `projection:${sourceRevision}:${result.calculationVersion}:${window.startAt ?? 'all'}:${window.endAt ?? 'all'}:${cause}` });
+    await db.syncProjectionIssues({ organizationId, sourceRevision, calculationVersion: result.calculationVersion, periodStart: sourceSnapshot.periodStart ?? null, periodEnd: sourceSnapshot.periodEnd ?? null, issues: result.issues.map(issue => ({ code: issue.code, message: issue.message, sourceRefs: issue.sourceRefs ?? [], state: 'awaiting_human' })) });
   }
 
   async function recordGap(organizationId, resource, code, details = {}) {
@@ -135,6 +185,17 @@ export function createWorker(dependencies) {
   async function recordSyncResult(organizationId, result) {
     const lastSuccessfulSyncAt = result.gaps.length ? null : result.lastSuccessfulSyncAt;
     await db.recordSourceHealth({ organizationId, resource: 'square', status: result.freshness, lastSuccessfulSyncAt, syncResult: result, checkedAt: now().toISOString() });
+    for (const [resource, resourceResult] of Object.entries(result.resources ?? {})) {
+      const completedAt = resourceResult?.completedAt ?? resourceResult?.completed_at ?? null;
+      await db.recordSourceHealth({
+        organizationId, resource,
+        status: resourceResult?.status === 'fresh' ? 'fresh' : 'incomplete',
+        lastSuccessfulSyncAt: resourceResult?.status === 'fresh' ? completedAt : null,
+        gap: resourceResult?.status === 'fresh' ? null : result.gaps.find(gap => gap.resource === resource) ?? { code: 'BACKFILL_INCOMPLETE' },
+        syncResult: resourceResult, sourceRevision: result.sourceRevision ?? null,
+        checkedAt: completedAt ?? now().toISOString(),
+      });
+    }
     for (const gap of result.gaps) {
       await db.recordSourceHealth({ organizationId, resource: gap.resource, status: 'incomplete', lastSuccessfulSyncAt: null, gap, checkedAt: now().toISOString() });
       await db.upsertSourceIssue({ organizationId, code: 'SOURCE_GAP', state: 'awaiting_human', revision: result.sourceRevision ?? null, details: gap, sourceRefs: [] });
@@ -215,7 +276,9 @@ export function createWorker(dependencies) {
     }
     // Each fetch is authoritative: reordered/duplicate event payloads cannot roll
     // the ledger backwards. The durable upsert adapter must reject older versions.
-    const result = await writeFacts(job.organizationId, authoritative.facts, `webhook:${notificationId}`);
+    const occurredAt = authoritative.facts.map(fact => fact.occurredAt).find(value => typeof value === 'string') ?? notification.payload.created_at;
+    const window = monthWindow(occurredAt, config.accountingTimezone ?? 'America/New_York', now());
+    const result = await writeFacts(job.organizationId, authoritative.facts, `webhook:${notificationId}`, window);
     if (result.incomplete) return { notificationId, outcome: 'normalization_gap', problems: result.problems };
     await db.recordSourceHealth({ organizationId: job.organizationId, resource: authoritative.resource, status: 'fresh', lastSuccessfulSyncAt: now().toISOString(), processedNotificationId: notificationId, sourceRevision: result.revision });
     await updateFreshnessIssue(job.organizationId);
@@ -225,10 +288,13 @@ export function createWorker(dependencies) {
   async function handleSync(job) {
     const { startAt, endAt, locationIds = [] } = job.payload ?? {};
     const client = await getClient(job.organizationId);
+    let sourceRevision = null;
     const result = await backfillSquare({ client, startAt, endAt, locationIds, maxPages, random, sleep, persist: async facts => {
-      const stored = await writeFacts(job.organizationId, facts, `sync:${job.id}`);
+      const stored = await writeFacts(job.organizationId, facts, `sync:${job.id}`, { startAt, endAt });
+      if (stored.revision !== null) sourceRevision = stored.revision;
       if (stored.incomplete) throw new Error('Square normalization has incomplete financial facts');
     } });
+    result.sourceRevision = sourceRevision;
     await recordSyncResult(job.organizationId, result);
     if (result.gaps.length) throw Object.assign(new Error('Square backfill incomplete'), { retryableGap: true });
     return result;
@@ -237,7 +303,7 @@ export function createWorker(dependencies) {
   async function handleReplay(job) {
     const revision = job.payload?.sourceRevision;
     if (!Number.isSafeInteger(revision) || revision < 0) throw Object.assign(new Error('Invalid replay revision'), { permanent: true });
-    await recomputeProjection(job.organizationId, revision, `job:${job.id}`);
+    await recomputeProjection(job.organizationId, revision, `job:${job.id}`, monthWindow(now().toISOString(), config.accountingTimezone ?? 'America/New_York', now()));
     return { revision };
   }
 
@@ -281,14 +347,31 @@ export function createWorker(dependencies) {
 
   async function runOne({ workerId }) {
     if (!workerId) throw new TypeError('workerId is required');
-    const job = await queue.claim({ workerId, leaseSeconds, types: [...JOBS] });
+    const job = await queue.claim({ workerId, leaseSeconds, types: enabledJobTypes });
     if (!job) return { status: 'idle' };
     if (typeof job.leaseToken !== 'string' || !job.leaseToken) throw new Error('queue.claim must return a fencing leaseToken');
+    let ownsLease = true;
+    let renewing = false;
+    let renewal = Promise.resolve();
+    const heartbeat = typeof queue.extendLease === 'function' ? setInterval(() => {
+      if (renewing || !ownsLease) return;
+      renewing = true;
+      renewal = queue.extendLease({ jobId: job.id, workerId, leaseToken: job.leaseToken, leaseSeconds })
+        .then(extended => { if (extended === false) ownsLease = false; })
+        .catch(() => {}) // The fenced ack/retry path remains authoritative if a transient heartbeat fails.
+        .finally(() => { renewing = false; });
+    }, Math.max(1000, Math.floor(leaseSeconds * 1000 / 3))) : null;
+    heartbeat?.unref?.();
     try {
       const result = await processJob(job);
-      await queue.ack({ jobId: job.id, workerId, leaseToken: job.leaseToken });
+      if (heartbeat) { clearInterval(heartbeat); await renewal; }
+      if (!ownsLease) return { status: 'lease_lost', jobId: job.id };
+      const acknowledged = await queue.ack({ jobId: job.id, workerId, leaseToken: job.leaseToken });
+      if (acknowledged === false) return { status: 'lease_lost', jobId: job.id };
       return { status: 'completed', jobId: job.id, result };
     } catch (error) {
+      if (heartbeat) { clearInterval(heartbeat); await renewal; }
+      if (!ownsLease) return { status: 'lease_lost', jobId: job.id };
       const attempts = Number(job.attempts ?? 1);
       if (error.permanent || attempts >= retryLimit || attempts >= Number(job.maxAttempts ?? retryLimit)) {
         if (job.type === 'square.webhook' || job.type === 'square.sync') {

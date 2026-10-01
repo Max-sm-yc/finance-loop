@@ -30,6 +30,23 @@ test('missing cost marks margin incomplete and never treats COGS as zero', () =>
   assert.ok(result.issues.some(x => x.code === 'UNKNOWN_ITEM'));
 });
 
+test('completed Square refunds reduce recognized income and hold margin for human return-cost review', () => {
+  const result = calculateIncome({
+    lines: [{ id: 'line-1', status: 'completed', currency: 'USD', quantity: 2, grossMinor: 2000,
+      discountMinor: 0, refundMinor: 0, taxMinor: 0, tipMinor: 0, unitCostMinor: 500, costCurrency: 'USD' }],
+    refundFacts: [{ id: 'refund-1', status: 'completed', currency: 'USD', amountMinor: 250 }],
+    policy: { tax: 'exclude', tips: 'exclude' },
+  });
+  assert.equal(result.grossItemSalesMinor, 2000);
+  assert.equal(result.refundsMinor, 250);
+  assert.equal(result.netSalesMinor, 1750);
+  assert.equal(result.unitsSold, 2);
+  assert.equal(result.status, 'incomplete');
+  assert.equal(result.cogsMinor, null);
+  assert.equal(result.operationalMarginMinor, null);
+  assert.ok(result.issues.some(issue => issue.code === 'REFUND_COGS_REVIEW'));
+});
+
 test('exact duplicate source replay is idempotent and conflicting same-version facts are exceptions', () => {
   const fact = { id: 'o1', version: '2', status: 'completed', currency: 'USD', quantity: 1, grossMinor: 100, unitCostMinor: 20, costCurrency: 'USD' };
   const replay = calculateIncome({ lines: [fact, structuredClone(fact)] });

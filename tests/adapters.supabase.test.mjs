@@ -73,6 +73,21 @@ test('only durable queue and inbox RPCs use the server key, and lack of key fail
   await assert.rejects(noSecret.queue.enqueueSquareWebhook({ notificationId: 'x' }), /Privileged Supabase operation is unavailable/);
 });
 
+test('worker lease renewal is fenced by the queue lease token', async () => {
+  let call;
+  const adapters = createSupabaseAdapters({
+    url: 'https://tenant.supabase.test', secretKey: 'sb_secret_worker',
+    fetchImpl: async (url, init) => {
+      call = { url: String(url), body: JSON.parse(init.body) };
+      return response(true);
+    },
+  });
+  const extended = await adapters.queue.extendLease({ jobId: 'job-1', workerId: 'worker-1', leaseToken: 'lease-1', leaseSeconds: 120 });
+  assert.equal(extended, true);
+  assert.match(call.url, /rpc\/extend_durable_job_lease$/);
+  assert.deepEqual(call.body, { p_job_id: 'job-1', p_worker_id: 'worker-1', p_lease_token: 'lease-1', p_lease_seconds: 120 });
+});
+
 test('Supabase sb_secret keys are sent as apikey values, not Bearer tokens', async () => {
   const secretKey = 'sb_secret_test';
   const seen = [];
@@ -86,6 +101,60 @@ test('Supabase sb_secret keys are sent as apikey values, not Bearer tokens', asy
   await adapters.queue.enqueueSquareWebhook({ notificationId: 'square-event-1' });
   assert.equal(seen[0].get('apikey'), secretKey);
   assert.equal(seen[0].get('authorization'), null);
+});
+
+test('worker fact upserts use the service key, preserve version ordering, and omit Square raw payloads', async () => {
+  let call;
+  const adapters = createSupabaseAdapters({
+    url: 'https://tenant.supabase.test', secretKey: 'sb_secret_worker',
+    fetchImpl: async (url, init) => {
+      call = { url: String(url), headers: new Headers(init.headers), body: JSON.parse(init.body) };
+      return response({ changed: true, revision: 7 });
+    }
+  });
+  const result = await adapters.db.upsertSquareFacts({
+    organizationId: org, cause: 'sync:job-1', enforceMonotonicVersion: true,
+    facts: [{ kind: 'payment', objectId: 'payment-1', version: '2026-09-30T12:00:00Z', status: 'COMPLETED', amountMinor: 100, raw: { card_details: { card: { last_4: '1234' } } } }],
+  });
+  assert.deepEqual(result, { changed: true, revision: 7 });
+  assert.match(call.url, /rpc\/upsert_square_facts$/);
+  assert.equal(call.headers.get('apikey'), 'sb_secret_worker');
+  assert.equal(call.headers.get('authorization'), null);
+  const fact = call.body.p_facts[0];
+  assert.equal(fact.kind, 'payment');
+  assert.match(fact.versionSort, /^t:\d{16}$/);
+  assert.deepEqual(fact.fact, { kind: 'payment', objectId: 'payment-1', version: '2026-09-30T12:00:00Z', status: 'COMPLETED', amountMinor: 100 });
+});
+
+test('worker projection snapshot maps Square income, refunds, approved costs, and configured reconciliations', async () => {
+  const startAt = '2026-09-01T00:00:00.000Z'; const endAt = '2026-10-01T00:00:00.000Z';
+  const adapters = createSupabaseAdapters({
+    url: 'https://tenant.supabase.test', secretKey: 'sb_secret_worker',
+    fetchImpl: async url => {
+      assert.match(String(url), /rpc\/get_square_projection_snapshot$/);
+      return response({ sourceRevision: 9, periodStart: startAt, periodEnd: endAt,
+        policy: { tax_treatment: 'exclude', currency: 'USD', reconciliation_tolerance_minor: 50 },
+        facts: [
+          { kind: 'order', objectId: 'order-1', version: '1', status: 'COMPLETED', occurredAt: '2026-09-15T12:00:00Z' },
+          { kind: 'order_line', objectId: 'order-1:line-1', version: '1', orderId: 'order-1', lineItemUid: 'line-1', occurredAt: '2026-09-15T12:00:00Z', itemType: 'ITEM', currency: 'USD', quantity: '2', grossMinor: 2000, discountMinor: 100, taxMinor: 0, tipMinor: 0, catalogObjectId: 'variation-1' },
+          { kind: 'payment', objectId: 'payment-1', version: '1', status: 'COMPLETED', currency: 'USD', feeMinor: 60, occurredAt: '2026-09-15T12:00:00Z' },
+          { kind: 'refund', objectId: 'refund-1', version: '1', status: 'COMPLETED', currency: 'USD', amountMinor: 250, occurredAt: '2026-09-20T12:00:00Z' },
+        ],
+        itemDefinitions: [{ square_catalog_object_id: 'variation-1', unit_cost_minor: '400', currency: 'USD', effective_from: '2026-01-01T00:00:00Z', effective_until: null }],
+        accounts: [{ id: 'bank-1', currency: 'USD', opening_balance_minor: 10000, opening_balance_at: '2026-09-01T00:00:00Z' }],
+        observations: [{ id: 'obs-1', account_id: 'bank-1', amount_minor: 12000, currency: 'USD', observed_at: '2026-09-30T00:00:00Z' }],
+        movements: [{ id: 'movement-1', account_id: 'bank-1', kind: 'other_inflow', amount_minor: 1000, currency: 'USD', occurred_at: '2026-09-10T00:00:00Z', approval_status: 'approved', idempotency_key: 'inflow:1' }],
+      });
+    }
+  });
+  const { sourceRevision, snapshot } = await adapters.db.getProjectionSnapshot({ organizationId: org, sourceRevision: 9, startAt, endAt });
+  assert.equal(sourceRevision, 9);
+  assert.equal(snapshot.lines[0].status, 'completed');
+  assert.equal(snapshot.lines[0].unitCostMinor, 400);
+  assert.equal(snapshot.fees[0].amountMinor, 60);
+  assert.equal(snapshot.refunds[0].amountMinor, 250);
+  assert.equal(snapshot.accounts[0].toleranceMinor, 50);
+  assert.equal(snapshot.reconciliations['bank-1'].movements[0].status, 'posted');
 });
 
 test('dashboard returns actual projection or explicit unavailable values and tenant-scoped accounts', async () => {

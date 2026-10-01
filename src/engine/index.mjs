@@ -71,15 +71,16 @@ function resolveCurrency(currencyValues, issues, ref) {
  * `tax` and `tips` inclusion is explicit per policy; discounts/refunds always
  * reduce recognized sales. Refund COGS is reversed only when explicitly approved.
  */
-export function calculateIncome({ lines = [], fees = [], giftCardActivities = [], policy = {} } = {}) {
-  assert(Array.isArray(lines) && Array.isArray(fees) && Array.isArray(giftCardActivities), 'lines, fees and giftCardActivities must be arrays');
+export function calculateIncome({ lines = [], fees = [], refundFacts = [], giftCardActivities = [], policy = {} } = {}) {
+  assert(Array.isArray(lines) && Array.isArray(fees) && Array.isArray(refundFacts) && Array.isArray(giftCardActivities), 'lines, fees, refunds and giftCardActivities must be arrays');
   const p = { tax: 'exclude', tips: 'exclude', ...policy };
   assert(['include', 'exclude'].includes(p.tax), 'policy.tax must be include or exclude');
   assert(['include', 'exclude'].includes(p.tips), 'policy.tips must be include or exclude');
   const ld = deduplicateFacts(lines, x => `${x.id}@${x.version ?? '1'}`);
   const fd = deduplicateFacts(fees, x => `${x.id}@${x.version ?? '1'}`);
+  const rd = deduplicateFacts(refundFacts, x => `${x.id}@${x.version ?? '1'}`);
   const gd = deduplicateFacts(giftCardActivities, x => `${x.id}@${x.version ?? '1'}`);
-  const issues = [...ld.issues, ...fd.issues, ...gd.issues];
+  const issues = [...ld.issues, ...fd.issues, ...rd.issues, ...gd.issues];
   let gross = 0, discounts = 0, refunds = 0, tax = 0, tips = 0, recognized = 0;
   let unitsSold = 0, unitsSoldGross = 0, unitsReturned = 0, cogs = 0, feesMinor = 0;
   let marginComplete = true;
@@ -134,6 +135,20 @@ export function calculateIncome({ lines = [], fees = [], giftCardActivities = []
     const amount = money(fee.amountMinor, `${fee.id}.amountMinor`);
     assert(amount >= 0, `${fee.id}.amountMinor cannot be negative`);
     feesMinor = add(feesMinor, amount, 'fees');
+  }
+  for (const refund of rd.facts) {
+    assert(typeof refund.id === 'string' && refund.id.length, 'refund id is required');
+    if (refund.status !== 'completed') continue;
+    currencies.push(refund.currency);
+    const amount = money(refund.amountMinor, `${refund.id}.amountMinor`);
+    assert(amount >= 0, `${refund.id}.amountMinor cannot be negative`);
+    refunds = add(refunds, amount, 'refunds');
+    recognized -= amount;
+    assert(Number.isSafeInteger(recognized), 'recognized sales exceeds safe integer range');
+    if (amount > 0) {
+      marginComplete = false;
+      issues.push(issue('REFUND_COGS_REVIEW', `Refund ${refund.id} needs a human decision about returned inventory and any approved COGS reversal.`, [refund.id, refund.orderId].filter(Boolean)));
+    }
   }
   for (const activity of gd.facts) {
     assert(typeof activity.id === 'string' && activity.id.length, 'gift card activity id is required');
@@ -238,11 +253,14 @@ export function replayAccounting(snapshot) {
   assert(snapshot && typeof snapshot === 'object', 'snapshot is required');
   assert(snapshot.incomePolicy && own(snapshot.incomePolicy, 'tax') && own(snapshot.incomePolicy, 'tips'),
     'replay requires explicit tax and tip policy');
-  const income = calculateIncome({ lines: structuredClone(snapshot.lines ?? []), fees: structuredClone(snapshot.fees ?? []), giftCardActivities: structuredClone(snapshot.giftCardActivities ?? []), policy: snapshot.incomePolicy });
+  const income = calculateIncome({ lines: structuredClone(snapshot.lines ?? []), fees: structuredClone(snapshot.fees ?? []), refundFacts: structuredClone(snapshot.refunds ?? []), giftCardActivities: structuredClone(snapshot.giftCardActivities ?? []), policy: snapshot.incomePolicy });
   const accounts = (snapshot.accounts ?? []).map(a => {
     const args = snapshot.reconciliations?.[a.id];
     assert(args, `missing reconciliation inputs for account ${a.id}`);
     return reconcileAccount({ ...args, account: a, movements: structuredClone(args.movements ?? []) });
   });
-  return { calculationVersion: CALCULATION_VERSION, income, accounts, issues: [...income.issues, ...accounts.flatMap(x => x.issues)] };
+  const issues = [...income.issues, ...accounts.flatMap(x => x.issues)];
+  const failed = income.status === 'failed' || accounts.some(account => account.status === 'failed');
+  const incomplete = income.status !== 'complete' || accounts.some(account => account.status !== 'matched');
+  return { calculationVersion: CALCULATION_VERSION, status: failed ? 'failed' : incomplete ? 'incomplete' : 'complete', income, accounts, issues };
 }

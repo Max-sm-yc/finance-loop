@@ -40,10 +40,99 @@ function createRest({ baseUrl, apiKey, authorization, fetchImpl }) {
 }
 
 const eq = value => `eq.${value}`;
+const stable = value => Array.isArray(value) ? value.map(stable) : value && typeof value === 'object'
+  ? Object.fromEntries(Object.keys(value).sort().map(key => [key, stable(value[key])])) : value;
+const sha256 = value => createHash('sha256').update(JSON.stringify(stable(value))).digest('hex');
+function squareVersionSort(version) {
+  const value = String(version ?? '');
+  if (/^\d+$/.test(value)) return `n:${value.padStart(40, '0')}`;
+  const epoch = Date.parse(value);
+  if (Number.isFinite(epoch) && /^\d{4}-\d\d-\d\d(?:T|$)/.test(value)) return `t:${String(epoch).padStart(16, '0')}`;
+  return `s:${value}`;
+}
+const safeMinor = value => value !== null && value !== undefined && value !== '' && Number.isSafeInteger(Number(value)) ? Number(value) : null;
+const statusText = value => String(value ?? '').toLowerCase();
+
+function makeProjectionSnapshot(data, { startAt, endAt }) {
+  const facts = Array.isArray(data?.facts) ? data.facts : [];
+  const orders = new Map(facts.filter(x => x.kind === 'order').map(x => [x.objectId, x]));
+  const inWindow = value => {
+    if (!startAt || !endAt) return true;
+    const at = Date.parse(value ?? '');
+    return Number.isFinite(at) && at >= Date.parse(startAt) && at < Date.parse(endAt);
+  };
+  const definitions = Array.isArray(data?.itemDefinitions) ? data.itemDefinitions : [];
+  const definitionAt = (catalogId, soldAt) => definitions.filter(d => d.square_catalog_object_id === catalogId
+    && Date.parse(d.effective_from) <= Date.parse(soldAt ?? '')
+    && (!d.effective_until || Date.parse(d.effective_until) > Date.parse(soldAt ?? '')))
+    .sort((a, b) => Date.parse(b.effective_from) - Date.parse(a.effective_from))[0] ?? null;
+  const lines = facts.filter(x => x.kind === 'order_line' && inWindow(x.occurredAt)).map(fact => {
+    const order = orders.get(fact.orderId);
+    const definition = definitionAt(fact.catalogObjectId, fact.occurredAt);
+    const cost = safeMinor(definition?.unit_cost_minor);
+    return {
+      id: fact.objectId, version: fact.version, orderId: fact.orderId, lineItemUid: fact.lineItemUid,
+      status: statusText(order?.status), itemType: fact.itemType, currency: fact.currency,
+      quantity: Number(fact.quantity), grossMinor: safeMinor(fact.grossMinor),
+      discountMinor: safeMinor(fact.discountMinor), refundMinor: 0,
+      taxMinor: safeMinor(fact.taxMinor) ?? 0, tipMinor: safeMinor(fact.tipMinor) ?? 0,
+      unitCostMinor: Number.isSafeInteger(cost) && cost >= 0 ? cost : null,
+      costCurrency: definition?.currency ?? null,
+    };
+  });
+  const fees = facts.filter(x => x.kind === 'payment' && inWindow(x.occurredAt)).map(fact => ({
+    id: fact.objectId, version: fact.version, status: statusText(fact.status), currency: fact.currency,
+    amountMinor: safeMinor(fact.feeMinor),
+  }));
+  const refunds = facts.filter(x => x.kind === 'refund' && inWindow(x.occurredAt)).map(fact => ({
+    id: fact.objectId, version: fact.version, status: statusText(fact.status), currency: fact.currency,
+    amountMinor: safeMinor(fact.amountMinor), orderId: fact.orderId,
+  }));
+  const giftCardActivities = facts.filter(x => x.kind === 'gift_card_activity' && inWindow(x.occurredAt)).map(fact => ({
+    id: fact.objectId, version: fact.version, type: fact.type, status: statusText(fact.status),
+    currency: fact.currency, amountMinor: safeMinor(fact.amountMinor), orderId: fact.orderId,
+    lineItemUid: fact.lineItemUid,
+  }));
+  const observations = Array.isArray(data?.observations) ? data.observations : [];
+  const movements = Array.isArray(data?.movements) ? data.movements : [];
+  const accounts = (Array.isArray(data?.accounts) ? data.accounts : []).map(account => {
+    const accountObservations = observations.filter(row => row.account_id === account.id)
+      .sort((a, b) => Date.parse(a.observed_at) - Date.parse(b.observed_at));
+    const latest = accountObservations.at(-1);
+    const openingAt = account.opening_balance_at;
+    const openingMinor = safeMinor(account.opening_balance_minor);
+    if (!openingAt || openingMinor === null || !latest || Date.parse(latest.observed_at) <= Date.parse(openingAt)) return null;
+    return {
+      id: account.id, currency: account.currency,
+      opening: { id: `opening:${account.id}`, accountId: account.id, amountMinor: openingMinor, currency: account.currency, observedAt: openingAt },
+      observed: { id: latest.id, accountId: account.id, amountMinor: safeMinor(latest.amount_minor), currency: latest.currency, observedAt: latest.observed_at },
+      toleranceMinor: safeMinor(data?.policy?.reconciliation_tolerance_minor) ?? 0,
+      movements: movements.filter(m => m.account_id === account.id).map(m => ({
+        id: m.id, kind: m.kind, transferId: m.linked_transfer_id, amountMinor: safeMinor(m.amount_minor),
+        currency: m.currency, occurredAt: m.occurred_at,
+        status: m.approval_status === 'approved' ? 'posted' : 'pending', idempotencyKey: m.idempotency_key,
+        accountId: m.account_id,
+      })),
+    };
+  }).filter(Boolean);
+  const currencies = facts.map(x => x.currency).filter(x => typeof x === 'string');
+  const policyCurrency = data?.policy?.currency ?? currencies[0] ?? 'USD';
+  return {
+    incomePolicy: { tax: data?.policy?.tax_treatment === 'include' ? 'include' : 'exclude', tips: 'exclude' },
+    lines, fees, refunds, giftCardActivities, accounts,
+    reconciliations: Object.fromEntries(accounts.map(account => [account.id, {
+      opening: account.opening, observed: account.observed, movements: account.movements,
+      toleranceMinor: account.toleranceMinor,
+    }])),
+    currency: policyCurrency,
+    periodStart: startAt ?? null, periodEnd: endAt ?? null,
+  };
+}
+
 /** Server-only Supabase adapters. Do not import this module into browser bundles. */
 export function createSupabaseAdapters({ url, publishableKey, secretKey, tokenEncryptionKey, fetchImpl = fetch }) {
   const baseUrl = requiredString(url, 'Supabase URL');
-  const publicKey = requiredString(publishableKey, 'Supabase publishable key');
+  const publicKey = typeof publishableKey === 'string' && publishableKey.trim() ? requiredString(publishableKey, 'Supabase publishable key') : null;
   const serviceKey = secretKey ? requiredString(secretKey, 'Supabase secret key') : null;
   // Supabase's current sb_secret keys are API keys, not JWTs. They belong in
   // apikey only; legacy service_role JWTs still need the Bearer header.
@@ -52,7 +141,10 @@ export function createSupabaseAdapters({ url, publishableKey, secretKey, tokenEn
   if (tokenEncryptionKey && encryptionKey.byteLength !== 32) throw new TypeError('tokenEncryptionKey must be a base64 encoded 32-byte AES key');
   if (typeof fetchImpl !== 'function') throw new TypeError('fetchImpl must be a function');
 
-  const userRest = accessToken => createRest({ baseUrl, apiKey: publicKey, authorization: `Bearer ${requiredString(accessToken, 'accessToken')}`, fetchImpl });
+  const userRest = accessToken => {
+    if (!publicKey) throw new Error('Supabase publishable key is unavailable');
+    return createRest({ baseUrl, apiKey: publicKey, authorization: `Bearer ${requiredString(accessToken, 'accessToken')}`, fetchImpl });
+  };
   const serviceRest = () => {
     if (!serviceKey) throw new Error('Privileged Supabase operation is unavailable');
     return createRest({ baseUrl, apiKey: serviceKey, authorization: serviceAuthorization, fetchImpl });
@@ -61,6 +153,13 @@ export function createSupabaseAdapters({ url, publishableKey, secretKey, tokenEn
   const one = (rows, context) => {
     if (!Array.isArray(rows) || rows.length > 1) throw new Error(`Unexpected ${context} response`);
     return rows[0] ?? null;
+  };
+  const getWorkerHealth = async organizationId => {
+    try {
+      const { data, error } = await serviceRest().rpc('get_square_worker_health', { organization_id: organizationId });
+      if (error) return null; // Keep the dashboard usable while an older migration set is deployed.
+      return data;
+    } catch { return null; }
   };
 
   const db = {
@@ -114,6 +213,87 @@ export function createSupabaseAdapters({ url, publishableKey, secretKey, tokenEn
       if (error) throw error;
       return data;
     },
+    async upsertSquareFacts({ organizationId, facts, cause }) {
+      const normalized = facts.map(fact => {
+        const { raw: _rawSquareObject, ...safeFact } = fact;
+        return { kind: fact.kind, objectId: fact.objectId, version: String(fact.version), versionSort: squareVersionSort(fact.version), fact: safeFact };
+      });
+      const { data, error } = await serviceRest().rpc('upsert_square_facts', {
+        organization_id: organizationId, facts: normalized, cause: String(cause ?? 'worker').slice(0, 300),
+      });
+      if (error) throw error;
+      return data;
+    },
+    async recordSourceHealth(record) {
+      const { data, error } = await serviceRest().rpc('record_square_worker_health', {
+        organization_id: record.organizationId,
+        record: {
+          resource: record.resource, status: record.status,
+          lastSuccessfulSyncAt: record.lastSuccessfulSyncAt ?? null,
+          gap: record.gap ?? null, syncResult: record.syncResult ?? null,
+          processedNotificationId: record.processedNotificationId ?? null,
+          sourceRevision: record.sourceRevision ?? null, checkedAt: record.checkedAt ?? new Date().toISOString(),
+        },
+      });
+      if (error) throw error;
+      return data;
+    },
+    async upsertSourceIssue(issue) {
+      const { data, error } = await serviceRest().rpc('upsert_square_worker_issue', {
+        organization_id: issue.organizationId, code: issue.code, state: issue.state,
+        revision: issue.revision ?? null, details: issue.details ?? {}, source_refs: issue.sourceRefs ?? [],
+      });
+      if (error) throw error;
+      return data;
+    },
+    async resolveSourceIssue({ organizationId, code, resolvedAt }) {
+      const { data, error } = await serviceRest().rpc('resolve_square_worker_issue', {
+        organization_id: organizationId, code, resolved_at: resolvedAt ?? new Date().toISOString(), source_refs: null,
+      });
+      if (error) throw error;
+      return data;
+    },
+    async resolveSourceIssueRefs({ organizationId, code, sourceRefs, resolvedAt }) {
+      if (!Array.isArray(sourceRefs) || sourceRefs.length === 0) return 0;
+      const { data, error } = await serviceRest().rpc('resolve_square_worker_issue', {
+        organization_id: organizationId, code, resolved_at: resolvedAt ?? new Date().toISOString(), source_refs: sourceRefs,
+      });
+      if (error) throw error;
+      return data;
+    },
+    async getProjectionSnapshot({ organizationId, sourceRevision, startAt, endAt }) {
+      const { data, error } = await serviceRest().rpc('get_square_projection_snapshot', {
+        organization_id: organizationId, source_revision: sourceRevision,
+        start_at: startAt ?? null, end_at: endAt ?? null,
+      });
+      if (error) throw error;
+      if (!data || !Number.isSafeInteger(data.sourceRevision) || !Array.isArray(data.facts)) return data;
+      const snapshot = makeProjectionSnapshot(data, { startAt: data.periodStart ?? startAt, endAt: data.periodEnd ?? endAt });
+      return { sourceRevision: data.sourceRevision, snapshot };
+    },
+    async saveProjectionRunSystem({ organizationId, sourceRevision, calculationVersion, result, sourceSnapshot, cause, idempotencyKey }) {
+      const sourceSnapshotHash = sha256(sourceSnapshot);
+      const { data, error } = await serviceRest().rpc('save_projection_run_system', {
+        organization_id: organizationId, source_revision: sourceRevision,
+        calculation_version: calculationVersion, result, source_snapshot: sourceSnapshot,
+        source_snapshot_hash: sourceSnapshotHash, cause: String(cause ?? 'worker').slice(0, 300),
+        idempotency_key: idempotencyKey,
+      });
+      if (error) throw error;
+      return typeof data === 'string' ? { id: data } : data;
+    },
+    async syncProjectionIssues({ organizationId, sourceRevision, calculationVersion, periodStart, periodEnd, issues }) {
+      const { data, error } = await serviceRest().rpc('sync_square_projection_issues', {
+        organization_id: organizationId, source_revision: sourceRevision,
+        calculation_version: calculationVersion, period_start: periodStart ?? null,
+        period_end: periodEnd ?? null, issues,
+      });
+      if (error) throw error;
+      return data;
+    },
+    async getSyncHealth({ organizationId }) {
+      return await getWorkerHealth(organizationId);
+    },
     async getMembership({ organizationId, userId, accessToken }) {
       const rest = userRest(accessToken);
       const rows = await table(rest, 'memberships', new URLSearchParams({ select: 'role', organization_id: eq(organizationId), user_id: eq(userId), limit: '2' }));
@@ -126,9 +306,10 @@ export function createSupabaseAdapters({ url, publishableKey, secretKey, tokenEn
       const policyQuery = new URLSearchParams({ select: 'currency,timezone,tax_treatment,inventory_cost_method,gift_card_treatment,reconciliation_tolerance_minor', organization_id: eq(organizationId), limit: '2' });
       if (accountId) accountQuery.set('id', eq(accountId));
       const runQuery = new URLSearchParams({ select: '*', organization_id: eq(organizationId), period_start: `gte.${from}`, period_end: `lte.${to}`, order: 'created_at.desc', limit: '1' });
-      const [orgRows, accounts, policies, rows] = await Promise.all([
+      const [orgRows, accounts, policies, rows, workerHealth] = await Promise.all([
         table(rest, 'organizations', orgQuery), table(rest, 'accounts', accountQuery),
-        table(rest, 'organization_accounting_policies', policyQuery), table(rest, 'projection_runs', runQuery)
+        table(rest, 'organization_accounting_policies', policyQuery), table(rest, 'projection_runs', runQuery),
+        getWorkerHealth(organizationId),
       ]);
       const latest = rows[0] ?? null;
       const result = latest?.result ?? null;
@@ -137,7 +318,7 @@ export function createSupabaseAdapters({ url, publishableKey, secretKey, tokenEn
         message: String(issue.message ?? 'Projection issue requires review.').slice(0, 500)
       })) : [];
       if (!latest) flags.push({ code: 'PROJECTION_UNAVAILABLE', message: 'No projection is available for this period.', severity: 'info' });
-      flags.push({ code: 'SOURCE_FRESHNESS_UNAVAILABLE', message: 'Source sync freshness is unavailable.', severity: 'info' });
+      if (!workerHealth) flags.push({ code: 'SOURCE_FRESHNESS_UNAVAILABLE', message: 'Source sync freshness is unavailable.', severity: 'info' });
       const organization = one(orgRows, 'organization');
       const policy = one(policies, 'accounting policy');
       const selectedAccount = accountId ? accounts.find(account => account.id === accountId) : null;
@@ -149,7 +330,7 @@ export function createSupabaseAdapters({ url, publishableKey, secretKey, tokenEn
         organization,
         period: { from, to, accountId: accountId ?? null, currency: selectedAccount?.currency ?? policy?.currency ?? organization?.base_currency ?? null, toleranceMinor: policy?.reconciliation_tolerance_minor ?? null },
         projectionVersion: latest?.calculation_version ?? null,
-        freshness: { status: 'unknown', lastSyncedAt: null },
+        freshness: { status: workerHealth?.status ?? 'unknown', lastSyncedAt: workerHealth?.lastSuccessfulSyncAt ?? null },
         income: result?.income ?? null,
         cash,
         accounts,
@@ -225,7 +406,7 @@ export function createSupabaseAdapters({ url, publishableKey, secretKey, tokenEn
       const query = new URLSearchParams({ select: '*', organization_id: eq(organizationId), id: eq(issueId), limit: '2' });
       const row = one(await table(userRest(accessToken), 'issues', query), 'issue');
       if (!row) return null;
-      const typeByCode = { UNKNOWN_ITEM: 'unknown_item', AMBIGUOUS_CLASSIFICATION: 'ambiguous_transaction', BALANCE_MISMATCH: 'balance_mismatch', UNSUPPORTED_ACTIVITY: 'unsupported_activity' };
+      const typeByCode = { UNKNOWN_ITEM: 'unknown_item', AMBIGUOUS_CLASSIFICATION: 'ambiguous_transaction', BALANCE_MISMATCH: 'balance_mismatch', UNSUPPORTED_ACTIVITY: 'unsupported_activity', REFUND_COGS_REVIEW: 'refund_cogs_review' };
       return { ...row, type: row.details?.issue_type ?? typeByCode[row.code], policyVersion: row.details?.policy_version ?? null, allowedCategories: row.details?.allowed_categories ?? [] };
     },
     async getIssueEvidence({ organizationId, issueId, accessToken }) {
@@ -314,6 +495,13 @@ export function createSupabaseAdapters({ url, publishableKey, secretKey, tokenEn
       const row = Array.isArray(data) ? data[0] : data;
       return row ? { id: row.id, organizationId: row.organization_id, type: row.job_type, payload: row.payload, attempts: row.attempts, maxAttempts: row.max_attempts, leaseToken: row.lease_token } : null;
     },
+    async extendLease({ jobId, workerId, leaseToken, leaseSeconds }) {
+      const { data, error } = await serviceRest().rpc('extend_durable_job_lease', {
+        job_id: jobId, worker_id: workerId, lease_token: leaseToken, lease_seconds: leaseSeconds,
+      });
+      if (error) throw error;
+      return data === true;
+    },
     async ack({ jobId, workerId, leaseToken }) {
       const { data, error } = await serviceRest().rpc('ack_durable_job', { job_id: jobId, worker_id: workerId, lease_token: leaseToken });
       if (error) throw error;
@@ -395,6 +583,7 @@ export function createSupabaseAdapters({ url, publishableKey, secretKey, tokenEn
   const supabase = {
     auth: {
       async getUser(accessToken) {
+        if (!publicKey) return { data: null, error: new Error('Supabase publishable key is unavailable') };
         const response = await fetchImpl(`${baseUrl}/auth/v1/user`, {
           headers: { apikey: publicKey, Authorization: `Bearer ${requiredString(accessToken, 'accessToken')}` }
         });
