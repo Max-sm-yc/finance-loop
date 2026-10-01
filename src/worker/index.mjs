@@ -116,7 +116,7 @@ export function createWorker(dependencies) {
     return makeSquareClient({ accessToken: connection.accessToken, apiVersion: config.squareApiVersion, baseUrl: config.squareBaseUrl });
   }
 
-  async function writeFacts(organizationId, facts, cause, window = {}) {
+  async function writeFacts(organizationId, facts, cause, window = {}, options = {}) {
     if (!facts.length) return { changed: false, revision: null };
     const persistable = facts.filter(fact => fact?.objectId && fact.version !== null && fact.version !== undefined && String(fact.version) !== '');
     const result = persistable.length
@@ -133,7 +133,7 @@ export function createWorker(dependencies) {
         if (!Number.isSafeInteger(Number(fact.quantity)) || Number(fact.quantity) <= 0) missing.push('unsupported_or_missing_quantity');
         if (fact.itemType !== 'GIFT_CARD' && (fact.grossMinor === null || fact.discountMinor === null)) missing.push('missing_square_sales_amount');
       }
-      if (fact.kind === 'payment' && (!fact.currency || fact.amountMinor === null || (fact.status === 'COMPLETED' && fact.feeMinor === null))) missing.push('missing_square_payment_or_fee_amount');
+      if (fact.kind === 'payment' && (!fact.currency || fact.amountMinor === null || (fact.status === 'COMPLETED' && fact.feeMinor === null && options.deferPaymentFees !== true))) missing.push('missing_square_payment_or_fee_amount');
       if ((fact.kind === 'payment' || fact.kind === 'refund' || fact.kind === 'gift_card_activity') && (!fact.occurredAt || !Number.isFinite(Date.parse(fact.occurredAt)))) missing.push('missing_occurred_at');
       if (fact.kind === 'refund' && (!fact.currency || fact.amountMinor === null)) missing.push('missing_square_refund_amount');
       if ((fact.kind === 'payout' || fact.kind === 'payout_entry') && (!fact.currency || fact.amountMinor === null)) missing.push('missing_square_payout_amount');
@@ -153,7 +153,7 @@ export function createWorker(dependencies) {
       await db.resolveSourceIssueRefs({ organizationId, code: 'SOURCE_GAP', sourceRefs: factRefs, resolvedAt: now().toISOString() });
       await db.resolveSourceIssueRefs({ organizationId, code: 'UNSUPPORTED_ACTIVITY', sourceRefs: factRefs, resolvedAt: now().toISOString() });
     }
-    if (result.changed) {
+    if (result.changed && options.deferProjection !== true) {
       const projection = await recomputeProjection(organizationId, result.revision, cause, window);
       if (projection?.incomplete) return { ...result, incomplete: true, problems: [projection.gap] };
     }
@@ -206,7 +206,7 @@ export function createWorker(dependencies) {
     }
     for (const gap of result.gaps) {
       await db.recordSourceHealth({ organizationId, resource: gap.resource, status: 'incomplete', lastSuccessfulSyncAt: null, gap, checkedAt: now().toISOString() });
-      await db.upsertSourceIssue({ organizationId, code: 'SOURCE_GAP', state: 'awaiting_human', revision: result.sourceRevision ?? null, details: gap, sourceRefs: [] });
+      await db.upsertSourceIssue({ organizationId, code: 'SOURCE_GAP', state: 'awaiting_human', revision: result.sourceRevision ?? null, details: gap, sourceRefs: gap.sourceRefs ?? [] });
     }
     if (!result.gaps.length) await db.resolveSourceIssue?.({ organizationId, code: 'SOURCE_GAP', resolvedAt: now().toISOString() });
     await updateFreshnessIssue(organizationId);
@@ -297,12 +297,66 @@ export function createWorker(dependencies) {
     const { startAt, endAt, locationIds = [] } = job.payload ?? {};
     const client = await getClient(job.organizationId);
     let sourceRevision = null;
+    const paymentFacts = new Map();
+    const payoutEntryFacts = new Map();
     const result = await backfillSquare({ client, startAt, endAt, locationIds, maxPages, random, sleep, persist: async facts => {
-      const stored = await writeFacts(job.organizationId, facts, `sync:${job.id}`, { startAt, endAt });
+      for (const fact of facts) {
+        if (fact.kind === 'payment') paymentFacts.set(fact.objectId, fact);
+        if (fact.kind === 'payout_entry') payoutEntryFacts.set(fact.objectId, fact);
+      }
+      // A payment can be returned before Square has attached its processing
+      // fee. Defer projection until payouts have been fetched so a linked
+      // CHARGE payout entry can provide the settled fee amount.
+      const stored = await writeFacts(job.organizationId, facts, `sync:${job.id}`, { startAt, endAt }, {
+        deferPaymentFees: true, deferProjection: true,
+      });
       if (stored.revision !== null) sourceRevision = stored.revision;
       if (stored.incomplete) throw new Error('Square normalization has incomplete financial facts');
     } });
+
+    const payoutFeesByPayment = new Map();
+    for (const entry of payoutEntryFacts.values()) {
+      if (entry.type !== 'CHARGE' || !entry.paymentId || !Number.isSafeInteger(entry.feeMinor) || entry.feeMinor < 0 || !entry.currency) continue;
+      const linked = payoutFeesByPayment.get(entry.paymentId) ?? [];
+      linked.push(entry);
+      payoutFeesByPayment.set(entry.paymentId, linked);
+    }
+    const feeEnrichedPayments = [];
+    const unresolvedPaymentFees = [];
+    for (const payment of paymentFacts.values()) {
+      if (payment.status !== 'COMPLETED' || payment.feeMinor !== null) continue;
+      const evidence = payoutFeesByPayment.get(payment.objectId) ?? [];
+      if (evidence.length === 1 && evidence[0].currency === payment.currency && evidence[0].feeCurrency === payment.currency) {
+        feeEnrichedPayments.push({
+          ...payment, version: `${payment.version}|payout-fee-1`,
+          feeMinor: evidence[0].feeMinor, feeStatus: 'provided_from_payout_entry',
+        });
+      } else {
+        unresolvedPaymentFees.push(payment.objectId);
+      }
+    }
+    if (feeEnrichedPayments.length) {
+      const stored = await writeFacts(job.organizationId, feeEnrichedPayments, `sync:${job.id}:payout-fees`, { startAt, endAt }, { deferProjection: true });
+      if (stored.revision !== null) sourceRevision = stored.revision;
+      if (stored.incomplete) throw new Error('Square payout fee normalization is incomplete');
+    }
+    if (unresolvedPaymentFees.length) {
+      const gap = {
+        resource: 'payments', code: 'PROCESSING_FEE_UNAVAILABLE',
+        message: 'Square has not provided a processing fee in the payment or its linked payout entry.',
+        sourceRefs: unresolvedPaymentFees,
+      };
+      result.gaps.push(gap);
+      result.resources.payments = { ...result.resources.payments, status: 'incomplete', error: gap.message };
+      result.freshness = 'incomplete';
+      result.lastSuccessfulSyncAt = null;
+      await db.recordSourceHealth({ organizationId: job.organizationId, resource: 'square', status: 'incomplete', lastSuccessfulSyncAt: null, gap, sourceRevision, checkedAt: now().toISOString() });
+      await db.upsertSourceIssue({ organizationId: job.organizationId, code: 'SOURCE_GAP', state: 'awaiting_human', revision: sourceRevision, details: gap, sourceRefs: unresolvedPaymentFees });
+    }
     result.sourceRevision = sourceRevision;
+    if (!result.gaps.length && sourceRevision !== null) {
+      await recomputeProjection(job.organizationId, sourceRevision, `sync:${job.id}`, { startAt, endAt });
+    }
     await recordSyncResult(job.organizationId, result);
     if (result.gaps.length) throw Object.assign(new Error('Square backfill incomplete'), { retryableGap: true });
     return result;

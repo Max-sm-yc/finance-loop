@@ -97,6 +97,32 @@ test('normalizers preserve source facts, identifiers, money, catalog IDs and pay
   assert.equal(normalizePayoutEntry({ id: 'pe1', payment_id: 'p1', amount_money: { amount: 500, currency: 'USD' } }, 'po1')[0].payoutId, 'po1');
 });
 
+test('payout normalizers accept Square payout Money fields and preserve gross, fee, net, and payment links', () => {
+  const payout = normalizePayout({
+    id: 'po-square', version: 3, amount_money: { amount: 810, currency_code: 'USD' },
+  })[0];
+  assert.equal(payout.currency, 'USD');
+  assert.equal(payout.amountMinor, 810);
+  assert.equal(payout.version, '3|normalization-2');
+
+  const entry = normalizePayoutEntry({
+    id: 'poe-square', payout_id: 'po-square', effective_at: '2026-09-30T12:00:00Z', type: 'CHARGE',
+    gross_amount_money: { amount: 1000, currency_code: 'USD' },
+    fee_amount_money: { amount: 30, currency_code: 'USD' },
+    net_amount_money: { amount: 970, currency_code: 'USD' },
+    type_charge_details: { payment_id: 'payment-square' },
+  }, 'fallback-payout')[0];
+  assert.equal(entry.payoutId, 'po-square');
+  assert.equal(entry.paymentId, 'payment-square');
+  assert.equal(entry.currency, 'USD');
+  assert.equal(entry.amountMinor, 970);
+  assert.equal(entry.grossAmountMinor, 1000);
+  assert.equal(entry.feeMinor, 30);
+  assert.equal(entry.feeCurrency, 'USD');
+  assert.equal(entry.netAmountMinor, 970);
+  assert.equal(entry.version, '2026-09-30T12:00:00Z|normalization-2');
+});
+
 test('backfill paginates, retries transient failures, persists normalized payout entries and records sync freshness', async () => {
   const calls = new Map(); const saved = []; let naps = 0;
   const client = { async request(path, options = {}) {

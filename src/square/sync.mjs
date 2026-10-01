@@ -77,6 +77,7 @@ const minor = money => {
   const parsed = Number(amount);
   return Number.isSafeInteger(parsed) ? parsed : null;
 };
+const moneyCurrency = money => money?.currency ?? money?.currency_code ?? null;
 const idOf = o => o?.id ?? null;
 export function normalizeOrder(o) {
   const id = idOf(o); if (!id) return [];
@@ -92,7 +93,7 @@ export function normalizeOrder(o) {
 }
 export function normalizePayment(p) {
   if (!p?.id) return [];
-  const currency = p.amount_money?.currency ?? null;
+  const currency = moneyCurrency(p.amount_money);
   const sourceType = p.source_type ?? null;
   const squareVersion = String(p.updated_at ?? p.created_at ?? '');
   // A normalization revision gives already-stored cash facts a new durable
@@ -101,7 +102,7 @@ export function normalizePayment(p) {
   const feesPresent = Array.isArray(p.processing_fee);
   let feeMinor = null; let feeStatus = 'missing_processing_fee';
   if (feesPresent && p.processing_fee.length > 0) {
-    const feeAmounts = p.processing_fee.map(fee => ({ amount: minor(fee.amount_money), currency: fee.amount_money?.currency ?? null }));
+    const feeAmounts = p.processing_fee.map(fee => ({ amount: minor(fee.amount_money), currency: moneyCurrency(fee.amount_money) }));
     if (feeAmounts.some(fee => fee.amount === null)) feeStatus = 'invalid_processing_fee_amount';
     else if (feeAmounts.some(fee => fee.currency !== currency)) feeStatus = 'processing_fee_currency_mismatch';
     else {
@@ -120,8 +121,36 @@ export function normalizePayment(p) {
 }
 export function normalizeRefund(r) { return r?.id ? [{ kind: 'refund', objectId: r.id, version: String(r.updated_at ?? r.created_at ?? ''), paymentId: r.payment_id ?? null, orderId: r.order_id ?? null, status: r.status ?? null, occurredAt: r.created_at ?? null, currency: r.amount_money?.currency ?? null, amountMinor: minor(r.amount_money), raw: r }] : []; }
 export function normalizeCatalog(obj) { return obj?.id ? [{ kind: 'catalog', objectId: obj.id, version: String(obj.version ?? obj.updated_at ?? ''), objectType: obj.type ?? null, name: obj.item_data?.name ?? obj.item_variation_data?.name ?? obj.category_data?.name ?? null, itemId: obj.item_variation_data?.item_id ?? null, sku: obj.item_variation_data?.sku ?? null, raw: obj }] : []; }
-export function normalizePayout(p) { return p?.id ? [{ kind: 'payout', objectId: p.id, version: String(p.updated_at ?? p.arrival_date ?? ''), status: p.status ?? null, destinationId: p.destination?.id ?? null, destinationType: p.destination?.type ?? null, arrivalDate: p.arrival_date ?? null, currency: p.amount_money?.currency ?? null, amountMinor: minor(p.amount_money), raw: p }] : []; }
-export function normalizePayoutEntry(e, payoutId) { return e?.id ? [{ kind: 'payout_entry', objectId: e.id, version: String(e.effective_at ?? e.type ?? ''), payoutId, type: e.type ?? null, paymentId: e.payment_id ?? null, refundId: e.refund_id ?? null, orderId: e.order_id ?? null, currency: e.amount_money?.currency ?? null, amountMinor: minor(e.amount_money), raw: e }] : []; }
+export function normalizePayout(p) {
+  if (!p?.id) return [];
+  return [{
+    kind: 'payout', objectId: p.id,
+    version: `${String(p.updated_at ?? p.arrival_date ?? p.version ?? '')}|normalization-2`,
+    status: p.status ?? null, destinationId: p.destination?.id ?? null,
+    destinationType: p.destination?.type ?? null, arrivalDate: p.arrival_date ?? null,
+    currency: moneyCurrency(p.amount_money), amountMinor: minor(p.amount_money), raw: p,
+  }];
+}
+export function normalizePayoutEntry(e, payoutId) {
+  if (!e?.id) return [];
+  const grossMoney = e.gross_amount_money ?? e.amount_money ?? null;
+  const feeMoney = e.fee_amount_money ?? null;
+  const netMoney = e.net_amount_money ?? e.amount_money ?? null;
+  // Square payout entries have separate gross, fee and net Money fields. The
+  // net is the payout balance impact; amount_money remains a legacy fallback.
+  return [{
+    kind: 'payout_entry', objectId: e.id,
+    version: `${String(e.effective_at ?? e.type ?? '')}|normalization-2`,
+    payoutId: e.payout_id ?? payoutId ?? null, type: e.type ?? null,
+    paymentId: e.payment_id ?? e.type_charge_details?.payment_id ?? e.type_refund_details?.payment_id ?? null,
+    refundId: e.refund_id ?? e.type_refund_details?.refund_id ?? null,
+    orderId: e.order_id ?? e.type_charge_details?.order_id ?? e.type_refund_details?.order_id ?? null,
+    currency: moneyCurrency(netMoney) ?? moneyCurrency(grossMoney) ?? moneyCurrency(feeMoney),
+    amountMinor: minor(netMoney), grossAmountMinor: minor(grossMoney),
+    feeMinor: minor(feeMoney), feeCurrency: moneyCurrency(feeMoney),
+    netAmountMinor: minor(netMoney), raw: e,
+  }];
+}
 export function normalizeGiftCardActivity(activity) {
   if (!activity?.id) return [];
   const type = activity.type ?? null;

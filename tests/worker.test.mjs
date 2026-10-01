@@ -14,7 +14,9 @@ function harness({ payload, responses = {}, health = {}, now = new Date('2026-09
       for (const f of batch) {
         const key = `${organizationId}:${f.kind}:${f.objectId}`; const current = facts.get(key);
         const ver = Number(f.version ?? 0); const currentVersion = Number(current?.version ?? -1);
-        if (!current || ver > currentVersion) { facts.set(key, f); changed = true; }
+        const newer = Number.isFinite(ver) && Number.isFinite(currentVersion)
+          ? ver > currentVersion : String(f.version ?? '') > String(current?.version ?? '');
+        if (!current || newer) { facts.set(key, f); changed = true; }
       }
       if (changed) revision++;
       events.push(['upsert', batch.map(f => f.objectId), changed]);
@@ -71,6 +73,44 @@ test('completed cash payments normalize with no processing fee instead of raisin
   assert.equal(fact.feeStatus, 'not_applicable_cash');
   assert.equal(outcome.changed, true);
   assert.equal(events.some(event => event[0] === 'issue' && event[1] === 'SOURCE_GAP'), false);
+});
+
+test('sync uses a linked Square CHARGE payout entry to fill a delayed payment processing fee', async () => {
+  const state = harness({ request: async path => {
+    if (path.includes('/orders/search')) return { orders: [] };
+    if (path.includes('/payments?')) return { payments: [{
+      id: 'pay-delayed-fee', status: 'COMPLETED', source_type: 'CARD',
+      created_at: '2026-09-30T10:00:00Z', updated_at: '2026-09-30T10:00:01Z',
+      amount_money: { amount: 1000, currency: 'USD' },
+    }] };
+    if (path.includes('/refunds?')) return { refunds: [] };
+    if (path.includes('/catalog/list')) return { objects: [] };
+    if (path.includes('/gift-cards/activities?')) return { gift_card_activities: [] };
+    if (path.includes('/payouts?')) return { payouts: [{
+      id: 'po-delayed-fee', status: 'PAID', arrival_date: '2026-09-30',
+      amount_money: { amount: 970, currency_code: 'USD' },
+    }] };
+    if (path.includes('/payout-entries?')) return { payout_entries: [{
+      id: 'entry-delayed-fee', payout_id: 'po-delayed-fee', type: 'CHARGE',
+      effective_at: '2026-09-30T10:00:02Z',
+      gross_amount_money: { amount: 1000, currency_code: 'USD' },
+      fee_amount_money: { amount: 30, currency_code: 'USD' },
+      net_amount_money: { amount: 970, currency_code: 'USD' },
+      type_charge_details: { payment_id: 'pay-delayed-fee' },
+    }] };
+    throw new Error(`Unexpected request ${path}`);
+  } });
+  const result = await state.worker.processJob({
+    id: 'sync-delayed-fee', type: 'square.sync', organizationId: org,
+    payload: { startAt: '2026-09-01T00:00:00Z', endAt: '2026-10-01T00:00:00Z', locationIds: ['loc-1'] },
+  });
+  const payment = state.facts.get(`${org}:payment:pay-delayed-fee`);
+  assert.equal(result.freshness, 'fresh');
+  assert.equal(payment.feeMinor, 30);
+  assert.equal(payment.feeStatus, 'provided_from_payout_entry');
+  assert.match(payment.version, /\|payout-fee-1$/);
+  assert.equal(state.events.filter(event => event[0] === 'projection').length, 1);
+  assert.equal(state.issues.has('SOURCE_GAP'), false);
 });
 
 test('reordered webhook notifications cannot overwrite newer authoritative Square versions', async () => {
