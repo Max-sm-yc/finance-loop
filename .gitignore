@@ -1,0 +1,17 @@
+# Dependencies and generated output
+node_modules/
+**/node_modules/
+.pnpm-store/
+.next/
+**/.next/
+.vercel/
+.wrangler/
+*.tsbuildinfo
+
+# Local credentials and environment overrides
+.env*
+!.env.example
+!.env.*.example
+web/.env*
+!web/.env.example
+!web/.env.*.example

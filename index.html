@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="theme-color" content="#f5f6f3" />
+  <title>Finance Loop — supervised accounting</title>
+  <link rel="stylesheet" href="./styles.css" />
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="sidebar">
+      <div class="brand"><span class="brand-mark">◫</span><div><strong>finance loop</strong><small>CONTROL CENTER</small></div></div>
+      <div class="workspace-switch"><span class="workspace-avatar">N</span><div><strong>Northline Market</strong><small>Demo workspace</small></div><span class="chevron">⌄</span></div>
+      <div class="nav-label">WORKSPACE</div>
+      <nav aria-label="Main navigation">
+        <button class="nav-item active" data-page="overview"><span class="nav-glyph">▦</span>Overview</button>
+        <button class="nav-item" data-page="income"><span class="nav-glyph">▥</span>Income & inventory</button>
+        <button class="nav-item" data-page="cash"><span class="nav-glyph">⇄</span>Cash flow</button>
+        <button class="nav-item" data-page="review"><span class="nav-glyph">◇</span>Review queue <span class="nav-badge" id="nav-review-count">0</span></button>
+        <button class="nav-item" data-page="ledger"><span class="nav-glyph">☷</span>Activity ledger</button>
+      </nav>
+      <div class="sidebar-bottom">
+        <div class="demo-card"><span class="tiny-dot"></span><strong>Prototype mode</strong><p>Sample data stays in this browser. No external accounts are connected.</p></div>
+        <button class="sidebar-link" id="reset-demo">↺ <span>Reset demo data</span></button>
+        <div class="profile"><span class="profile-avatar">AM</span><div><strong>Alex Morgan</strong><small>Workspace owner</small></div><span>···</span></div>
+      </div>
+    </aside>
+    <div class="content-shell">
+      <header class="topbar"><div class="breadcrumb">Northline Market <span>/</span> <strong id="breadcrumb-page">Overview</strong></div><div class="topbar-actions"><span class="live-pill"><span></span> Demo environment</span><span class="top-avatar">AM</span></div></header>
+      <main id="main-content"></main>
+    </div>
+  </div>
+  <div id="modal-root"></div>
+  <div id="toast-root" role="status" aria-live="polite"></div>
+  <script src="./app.js" defer></script>
+</body>
+</html>
