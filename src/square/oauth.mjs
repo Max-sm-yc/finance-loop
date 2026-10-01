@@ -51,15 +51,27 @@ export function createSquareOAuthHandlers({ authenticateOwner, stateStore, token
   const baseUrl = config.squareBaseUrl ?? 'https://connect.squareup.com';
   const stateTtlMs = Number.isInteger(config.oauthStateTtlMs) ? Math.max(60_000, Math.min(config.oauthStateTtlMs, 15 * 60_000)) : 10 * 60_000;
 
-  const run = handler => async request => {
+  const run = (route, handler) => async request => {
     try { return await handler(request); }
     catch (error) {
       if (error instanceof OAuthHandlerError) return fail(error.status, error.code);
+      // Keep browser errors generic, but leave enough sanitized context in the
+      // server logs to distinguish Square token exchange from Supabase storage.
+      const details = {
+        route,
+        status: Number.isInteger(error?.status) ? error.status : undefined,
+        code: typeof error?.code === 'string' && /^[A-Za-z0-9_-]{1,80}$/.test(error.code) ? error.code : undefined,
+        providerErrors: Array.isArray(error?.errors) ? error.errors.map(item => ({
+          category: typeof item?.category === 'string' ? item.category : undefined,
+          code: typeof item?.code === 'string' ? item.code : undefined
+        })) : undefined
+      };
+      console.error('Square OAuth handler failed', details);
       return fail(500, 'INTERNAL_ERROR');
     }
   };
 
-  const start = run(async request => {
+  const start = run('start', async request => {
     if (request.method !== 'POST') throw new OAuthHandlerError(405, 'METHOD_NOT_ALLOWED');
     if (!request.headers.get('content-type')?.toLowerCase().startsWith('application/json')) throw new OAuthHandlerError(415, 'JSON_REQUIRED');
     const raw = await boundedText(request, 4_000);
@@ -75,7 +87,7 @@ export function createSquareOAuthHandlers({ authenticateOwner, stateStore, token
     return json(200, { authorizationUrl });
   });
 
-  const callback = run(async request => {
+  const callback = run('callback', async request => {
     if (request.method !== 'GET') throw new OAuthHandlerError(405, 'METHOD_NOT_ALLOWED');
     const url = new URL(request.url); const state = url.searchParams.get('state'); const code = url.searchParams.get('code');
     // Consume before exchanging so a callback cannot be replayed, even if exchange fails.
