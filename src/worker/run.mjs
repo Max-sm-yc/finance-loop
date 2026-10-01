@@ -59,7 +59,11 @@ log('info', 'worker_started', { squareEnvironment, enabledJobTypes: ['square.web
 while (!stopping) {
   try {
     const result = await worker.runOne({ workerId });
-    if (result.status !== 'idle') log(result.status === 'completed' ? 'info' : 'warn', 'job_finished', { status: result.status, jobId: result.jobId, code: result.code });
+    if (result.status !== 'idle') log(result.status === 'completed' ? 'info' : 'warn', 'job_finished', {
+      status: result.status, jobId: result.jobId, code: result.code,
+      failureStatus: result.failureStatus, failureCode: result.failureCode,
+      gapWriteStatus: result.gapWriteStatus, gapWriteCode: result.gapWriteCode,
+    });
     if (result.status !== 'completed' && !stopping) await new Promise(resolve => setTimeout(resolve, pollMs));
   } catch (error) {
     log('error', 'worker_poll_failed', { status: error?.status ?? null, code: error?.code ?? 'WORKER_POLL_FAILED' });

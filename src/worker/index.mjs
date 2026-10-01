@@ -24,6 +24,14 @@ function canonical(value) {
 }
 const hash = value => createHash('sha256').update(JSON.stringify(canonical(value))).digest('hex');
 function errorMessage(error) { return error?.status ? `Square/API failure (${error.status})` : 'Worker job failed'; }
+function failureMetadata(error) {
+  const code = typeof error?.code === 'string' && /^[A-Za-z0-9_.-]{1,100}$/.test(error.code) ? error.code : null;
+  return { status: Number.isInteger(error?.status) ? error.status : null, code };
+}
+function safeFailureDescription(error) {
+  const { status, code } = failureMetadata(error);
+  return [status === null ? null : `status=${status}`, code ? `code=${code}` : null].filter(Boolean).join(' ') || 'unclassified error';
+}
 function zonedMidnightUtc(year, monthIndex, day, timeZone) {
   const target = Date.UTC(year, monthIndex, day);
   const formatter = new Intl.DateTimeFormat('en-US', { timeZone, year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit', hourCycle: 'h23' });
@@ -376,17 +384,29 @@ export function createWorker(dependencies) {
       if (error.permanent || attempts >= retryLimit || attempts >= Number(job.maxAttempts ?? retryLimit)) {
         if (job.type === 'square.webhook' || job.type === 'square.sync') {
           try { await recordGap(job.organizationId, job.type, 'SOURCE_GAP', { jobId: job.id, reason: errorMessage(error) }); }
-          catch {
-            await queue.retry({ jobId: job.id, workerId, leaseToken: job.leaseToken, delayMs: Math.round(30_000 * (0.75 + random() * 0.5)), code: 'SOURCE_GAP_WRITE_FAILED' });
-            return { status: 'retrying', jobId: job.id, code: 'SOURCE_GAP_WRITE_FAILED' };
+          catch (gapError) {
+            const failed = await queue.deadLetter({
+              jobId: job.id, workerId, leaseToken: job.leaseToken, code: 'SOURCE_GAP_WRITE_FAILED',
+              message: `Source-gap write failed (${safeFailureDescription(gapError)}); job failed (${safeFailureDescription(error)})`,
+            });
+            if (failed === false) return { status: 'lease_lost', jobId: job.id };
+            const failure = failureMetadata(error); const gapWrite = failureMetadata(gapError);
+            return {
+              status: 'dead_lettered', jobId: job.id, code: 'SOURCE_GAP_WRITE_FAILED',
+              failureStatus: failure.status, failureCode: failure.code,
+              gapWriteStatus: gapWrite.status, gapWriteCode: gapWrite.code,
+            };
           }
         }
-        await queue.deadLetter({ jobId: job.id, workerId, leaseToken: job.leaseToken, code: error.code ?? 'WORKER_JOB_FAILED', message: errorMessage(error) });
-        return { status: 'dead_lettered', jobId: job.id, code: error.code ?? 'WORKER_JOB_FAILED' };
+        const failed = await queue.deadLetter({ jobId: job.id, workerId, leaseToken: job.leaseToken, code: error.code ?? 'WORKER_JOB_FAILED', message: errorMessage(error) });
+        if (failed === false) return { status: 'lease_lost', jobId: job.id };
+        const failure = failureMetadata(error);
+        return { status: 'dead_lettered', jobId: job.id, code: error.code ?? 'WORKER_JOB_FAILED', failureStatus: failure.status, failureCode: failure.code };
       }
       const retryAfterMs = Math.min(15 * 60_000, 1000 * 2 ** Math.min(attempts - 1, 10)) * (0.75 + random() * 0.5);
       await queue.retry({ jobId: job.id, workerId, leaseToken: job.leaseToken, delayMs: Math.round(retryAfterMs), code: error.code ?? 'WORKER_JOB_FAILED' });
-      return { status: 'retrying', jobId: job.id, code: error.code ?? 'WORKER_JOB_FAILED' };
+      const failure = failureMetadata(error);
+      return { status: 'retrying', jobId: job.id, code: error.code ?? 'WORKER_JOB_FAILED', failureStatus: failure.status, failureCode: failure.code };
     }
   }
 

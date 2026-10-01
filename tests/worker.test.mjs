@@ -184,3 +184,26 @@ test('worker fails closed when queue cannot provide a fencing token', async () =
   await assert.rejects(state.worker.runOne({ workerId: 'worker-1' }), /fencing leaseToken/);
   assert.equal(state.events.some(x => x[0] === 'ack'), false);
 });
+
+test('terminal job gap-write failure dead-letters instead of retrying beyond the attempt limit', async () => {
+  const state = harness();
+  state.queue.claim = async () => ({
+    id: 'failed-webhook', type: 'square.webhook', organizationId: org,
+    payload: { notificationId: 'missing-event' }, attempts: 3, maxAttempts: 3, leaseToken: 'lease-1',
+  });
+  state.db.recordSourceHealth = async () => {
+    throw Object.assign(new Error('private response details'), { status: 503, code: 'PGRST202' });
+  };
+
+  const result = await state.worker.runOne({ workerId: 'worker-1' });
+  const dead = state.events.find(event => event[0] === 'dead')?.[1];
+
+  assert.equal(result.status, 'dead_lettered');
+  assert.equal(result.code, 'SOURCE_GAP_WRITE_FAILED');
+  assert.equal(result.gapWriteStatus, 503);
+  assert.equal(result.gapWriteCode, 'PGRST202');
+  assert.equal(state.events.some(event => event[0] === 'retry'), false);
+  assert.equal(dead.code, 'SOURCE_GAP_WRITE_FAILED');
+  assert.match(dead.message, /status=503 code=PGRST202/);
+  assert.equal(dead.message.includes('private response details'), false);
+});
