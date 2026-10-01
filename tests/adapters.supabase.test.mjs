@@ -114,7 +114,10 @@ test('worker fact upserts use the service key, preserve version ordering, and om
   });
   const result = await adapters.db.upsertSquareFacts({
     organizationId: org, cause: 'sync:job-1', enforceMonotonicVersion: true,
-    facts: [{ kind: 'payment', objectId: 'payment-1', version: '2026-09-30T12:00:00Z', status: 'COMPLETED', amountMinor: 100, raw: { card_details: { card: { last_4: '1234' } } } }],
+    facts: [
+      { kind: 'payment', objectId: 'payment-1', version: '2026-09-30T12:00:00Z', status: 'COMPLETED', amountMinor: 100, raw: { card_details: { card: { last_4: '1234' } } } },
+      { kind: 'payment', objectId: 'cash-1', version: '2026-09-30T12:00:00Z|normalization-2', status: 'COMPLETED', amountMinor: 100, feeMinor: 0, feeStatus: 'not_applicable_cash' },
+    ],
   });
   assert.deepEqual(result, { changed: true, revision: 7 });
   assert.match(call.url, /rpc\/upsert_square_facts$/);
@@ -124,6 +127,9 @@ test('worker fact upserts use the service key, preserve version ordering, and om
   assert.equal(fact.kind, 'payment');
   assert.match(fact.versionSort, /^t:\d{16}$/);
   assert.deepEqual(fact.fact, { kind: 'payment', objectId: 'payment-1', version: '2026-09-30T12:00:00Z', status: 'COMPLETED', amountMinor: 100 });
+  const cashCorrection = call.body.p_facts.find(row => row.objectId === 'cash-1');
+  assert.match(cashCorrection.versionSort, /^t:\d{16}\|normalization-2$/);
+  assert.ok(cashCorrection.versionSort > fact.versionSort, 'normalization correction sorts after its original Square version');
 });
 
 test('worker projection snapshot maps Square income, refunds, approved costs, and configured reconciliations', async () => {

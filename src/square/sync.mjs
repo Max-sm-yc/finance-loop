@@ -83,9 +83,14 @@ export function normalizeOrder(o) {
 export function normalizePayment(p) {
   if (!p?.id) return [];
   const currency = p.amount_money?.currency ?? null;
+  const sourceType = p.source_type ?? null;
+  const squareVersion = String(p.updated_at ?? p.created_at ?? '');
+  // A normalization revision gives already-stored cash facts a new durable
+  // version when their fee changes from unknown to explicitly not applicable.
+  const version = sourceType === 'CASH' ? `${squareVersion}|normalization-2` : squareVersion;
   const feesPresent = Array.isArray(p.processing_fee);
   let feeMinor = null; let feeStatus = 'missing_processing_fee';
-  if (feesPresent) {
+  if (feesPresent && p.processing_fee.length > 0) {
     const feeAmounts = p.processing_fee.map(fee => ({ amount: minor(fee.amount_money), currency: fee.amount_money?.currency ?? null }));
     if (feeAmounts.some(fee => fee.amount === null)) feeStatus = 'invalid_processing_fee_amount';
     else if (feeAmounts.some(fee => fee.currency !== currency)) feeStatus = 'processing_fee_currency_mismatch';
@@ -94,8 +99,14 @@ export function normalizePayment(p) {
       if (Number.isSafeInteger(sum)) { feeMinor = sum; feeStatus = 'provided'; }
       else feeStatus = 'processing_fee_out_of_range';
     }
+  } else if (sourceType === 'CASH') {
+    // Cash tender has no Square card-processing fee. Record the explicit zero
+    // without inventing a fee for other payment types whose fee is unavailable.
+    feeMinor = 0; feeStatus = 'not_applicable_cash';
+  } else if (feesPresent) {
+    feeMinor = 0; feeStatus = 'provided';
   }
-  return [{ kind: 'payment', objectId: p.id, version: String(p.updated_at ?? p.created_at ?? ''), orderId: p.order_id ?? null, locationId: p.location_id ?? null, status: p.status ?? null, occurredAt: p.created_at ?? null, updatedAt: p.updated_at ?? null, currency, amountMinor: minor(p.amount_money), feeMinor, feeStatus, raw: p }];
+  return [{ kind: 'payment', objectId: p.id, version, orderId: p.order_id ?? null, locationId: p.location_id ?? null, status: p.status ?? null, occurredAt: p.created_at ?? null, updatedAt: p.updated_at ?? null, currency, amountMinor: minor(p.amount_money), feeMinor, feeStatus, raw: p }];
 }
 export function normalizeRefund(r) { return r?.id ? [{ kind: 'refund', objectId: r.id, version: String(r.updated_at ?? r.created_at ?? ''), paymentId: r.payment_id ?? null, orderId: r.order_id ?? null, status: r.status ?? null, occurredAt: r.created_at ?? null, currency: r.amount_money?.currency ?? null, amountMinor: minor(r.amount_money), raw: r }] : []; }
 export function normalizeCatalog(obj) { return obj?.id ? [{ kind: 'catalog', objectId: obj.id, version: String(obj.version ?? obj.updated_at ?? ''), objectType: obj.type ?? null, name: obj.item_data?.name ?? obj.item_variation_data?.name ?? obj.category_data?.name ?? null, itemId: obj.item_variation_data?.item_id ?? null, sku: obj.item_variation_data?.sku ?? null, raw: obj }] : []; }

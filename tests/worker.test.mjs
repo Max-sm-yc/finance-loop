@@ -59,6 +59,20 @@ test('duplicate Square webhook jobs fetch authoritative state and produce only o
   assert.equal(events.filter(e => e[0] === 'fetch').length, 2);
 });
 
+test('completed cash payments normalize with no processing fee instead of raising a source gap', async () => {
+  const payload = webhook('evt-cash', 'payment.updated', { payment: { id: 'cash-1' } });
+  const { worker, facts, events } = harness({ payload, responses: {
+    '/v2/payments/cash-1': { payment: { id: 'cash-1', created_at: '2026-09-30T10:55:00Z', updated_at: '2026-09-30T11:00:00Z', source_type: 'CASH', amount_money: { amount: 100, currency: 'USD' }, status: 'COMPLETED' } }
+  } });
+  const outcome = await worker.processJob({ id: 'cash-job', type: 'square.webhook', organizationId: org, payload: { notificationId: 'evt-cash' } });
+  const fact = [...facts.values()][0];
+  assert.equal(fact.version, '2026-09-30T11:00:00Z|normalization-2');
+  assert.equal(fact.feeMinor, 0);
+  assert.equal(fact.feeStatus, 'not_applicable_cash');
+  assert.equal(outcome.changed, true);
+  assert.equal(events.some(event => event[0] === 'issue' && event[1] === 'SOURCE_GAP'), false);
+});
+
 test('reordered webhook notifications cannot overwrite newer authoritative Square versions', async () => {
   const getPayload = notificationId => notificationId === 'evt-old'
     ? webhook('evt-old', 'order.updated', { order: { id: 'order-1', version: 2 } })

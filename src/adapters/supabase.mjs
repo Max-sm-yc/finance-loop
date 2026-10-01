@@ -45,9 +45,12 @@ const stable = value => Array.isArray(value) ? value.map(stable) : value && type
 const sha256 = value => createHash('sha256').update(JSON.stringify(stable(value))).digest('hex');
 function squareVersionSort(version) {
   const value = String(version ?? '');
-  if (/^\d+$/.test(value)) return `n:${value.padStart(40, '0')}`;
-  const epoch = Date.parse(value);
-  if (Number.isFinite(epoch) && /^\d{4}-\d\d-\d\d(?:T|$)/.test(value)) return `t:${String(epoch).padStart(16, '0')}`;
+  const revisionAt = value.indexOf('|');
+  const sourceVersion = revisionAt < 0 ? value : value.slice(0, revisionAt);
+  const normalizationRevision = revisionAt < 0 ? '' : value.slice(revisionAt);
+  if (/^\d+$/.test(sourceVersion)) return `n:${sourceVersion.padStart(40, '0')}${normalizationRevision}`;
+  const epoch = Date.parse(sourceVersion);
+  if (Number.isFinite(epoch) && /^\d{4}-\d\d-\d\d(?:T|$)/.test(sourceVersion)) return `t:${String(epoch).padStart(16, '0')}${normalizationRevision}`;
   return `s:${value}`;
 }
 const safeMinor = value => value !== null && value !== undefined && value !== '' && Number.isSafeInteger(Number(value)) ? Number(value) : null;

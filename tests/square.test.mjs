@@ -62,6 +62,10 @@ test('normalizers preserve source facts, identifiers, money, catalog IDs and pay
   const redemption = normalizeGiftCardActivity({ id: 'redeem-1', type: 'REDEEM', status: 'COMPLETED', payment_id: 'payment-1', redeem_activity_details: { amount_money: { amount: 500, currency: 'USD' } } })[0];
   assert.equal(redemption.liabilityChangeMinor, -500); assert.equal(redemption.paymentId, 'payment-1');
   assert.equal(normalizePayment({ id: 'p1', order_id: 'o1', amount_money: { amount: 500, currency: 'USD' }, processing_fee: [{ amount_money: { amount: 15, currency: 'USD' } }] })[0].feeMinor, 15);
+  const cashPayment = normalizePayment({ id: 'cash-1', source_type: 'CASH', status: 'COMPLETED', created_at: '2026-10-01T13:12:25.076Z', updated_at: '2026-10-01T13:12:25.184Z', amount_money: { amount: 1, currency: 'USD' } })[0];
+  assert.equal(cashPayment.version, '2026-10-01T13:12:25.184Z|normalization-2');
+  assert.equal(cashPayment.feeMinor, 0);
+  assert.equal(cashPayment.feeStatus, 'not_applicable_cash');
   const mixedFee = normalizePayment({ id: 'p-mixed', amount_money: { amount: 500, currency: 'USD' }, processing_fee: [{ amount_money: { amount: 15, currency: 'CAD' } }] })[0];
   assert.equal(mixedFee.feeMinor, null);
   assert.equal(mixedFee.feeStatus, 'processing_fee_currency_mismatch');
