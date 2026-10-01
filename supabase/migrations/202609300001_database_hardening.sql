@@ -253,6 +253,15 @@ returns boolean language sql stable security definer set search_path = '' as $$
       and m.role = any(allowed_roles))
 $$;
 
+create table private.correction_authorities (
+  organization_id uuid not null references public.organizations(id),
+  user_id uuid not null references auth.users(id),
+  designated_by uuid not null references auth.users(id),
+  designated_at timestamptz not null default now(),
+  primary key (organization_id, user_id),
+  foreign key (organization_id, user_id) references public.memberships(organization_id, user_id)
+);
+
 create or replace function private.is_correction_authority(org uuid, actor uuid)
 returns boolean language sql stable security definer set search_path = '' as $$
   select exists (select 1 from private.correction_authorities a
@@ -540,14 +549,6 @@ create table public.organization_accounting_policies (
   reconciliation_tolerance_minor bigint not null default 0 check (reconciliation_tolerance_minor >= 0),
   configured_by uuid references auth.users(id),
   updated_at timestamptz not null default now()
-);
-create table private.correction_authorities (
-  organization_id uuid not null references public.organizations(id),
-  user_id uuid not null references auth.users(id),
-  designated_by uuid not null references auth.users(id),
-  designated_at timestamptz not null default now(),
-  primary key (organization_id, user_id),
-  foreign key (organization_id, user_id) references public.memberships(organization_id, user_id)
 );
 create table private.square_merchant_connections (
   organization_id uuid not null references public.organizations(id),
