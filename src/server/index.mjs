@@ -183,8 +183,9 @@ export function createHandlers(adapters) {
   const saleLineCost = run(async req => {
     if (req.method !== 'POST') throw new HttpError(405, 'METHOD_NOT_ALLOWED');
     const body = await readJson(req); const key = idempotency(req);
-    if (!exactObject(body, ['organizationId','saleLineId','unitCostMinor','currency','reason'])
-        || !UUID.test(body.organizationId) || !UUID.test(body.saleLineId)
+    if (!exactObject(body, ['organizationId','squareOrderId','squareLineUid','unitCostMinor','currency','reason'])
+        || !UUID.test(body.organizationId) || !text(body.squareOrderId, 200) || !text(body.squareLineUid, 200)
+        || !/^[A-Za-z0-9_-]{1,200}$/.test(body.squareOrderId) || !/^[A-Za-z0-9_-]{1,200}$/.test(body.squareLineUid)
         || !Number.isSafeInteger(body.unitCostMinor) || body.unitCostMinor < 0 || body.unitCostMinor >= 1_000_000_000_000
         || !/^[A-Z]{3}$/.test(body.currency) || !text(body.reason, 1000) || body.reason.trim().length < 10) {
       throw new HttpError(400, 'INVALID_SALE_LINE_COST');
@@ -196,7 +197,8 @@ export function createHandlers(adapters) {
     if (!issue || issue.code !== 'UNKNOWN_ITEM' || issue.state === 'resolved') throw new HttpError(404, 'UNKNOWN_ITEM_ISSUE_NOT_FOUND');
     const window = correctionWindow(issue);
     const override = await db.recordSaleLineCostOverride({ organizationId: body.organizationId, issueId: issue.id,
-      saleLineId: body.saleLineId, unitCostMinor: body.unitCostMinor, currency: body.currency,
+      squareOrderId: body.squareOrderId.trim(), squareLineUid: body.squareLineUid.trim(),
+      unitCostMinor: body.unitCostMinor, currency: body.currency,
       reason: body.reason.trim(), idempotencyKey: key, accessToken: actor.accessToken });
     const replay = await queue.enqueueProjectionReplay({ organizationId: body.organizationId, ...window,
       idempotencyKey: `line-cost:${issue.id}:${key}`, requestedBy: actor.userId });
@@ -284,7 +286,8 @@ export function createHandlers(adapters) {
     const actor = await authorize(req, organizationId, ['owner','operator','reviewer','read_only']);
     const issue = await db.getIssue({ organizationId, issueId, accessToken: actor.accessToken });
     if (!issue) throw new HttpError(404, 'ISSUE_NOT_FOUND');
-    return ok({ evidence: await db.getIssueEvidence({ organizationId, issueId, accessToken: actor.accessToken }) });
+    const result = await db.getIssueEvidence({ organizationId, issueId, accessToken: actor.accessToken });
+    return ok(Array.isArray(result) ? { evidence: result, correctionReady: result.correctionReady ?? true } : result);
   });
   const manualMovements = run(async req => {
     if (req.method !== 'GET') throw new HttpError(405, 'METHOD_NOT_ALLOWED');

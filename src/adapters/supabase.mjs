@@ -1,4 +1,6 @@
 import { SUPPORTED_DIAGNOSIS_ISSUE_TYPES } from '../agent/diagnosis.mjs';
+import { SquareApiClient } from '../square/client.mjs';
+import { normalizeCatalog, normalizeOrder, normalizeRefund } from '../square/sync.mjs';
 
 const requiredString = (value, name) => {
   if (typeof value !== 'string' || !value.trim()) throw new TypeError(`${name} is required`);
@@ -153,8 +155,126 @@ function makeProjectionSnapshot(data, { startAt, endAt }) {
   };
 }
 
+function issueEvidenceRefs(issue) {
+  const refs = [...new Set(Array.isArray(issue.source_refs) ? issue.source_refs.filter(x => typeof x === 'string' && x.length) : [])];
+  const message = String(issue.details?.message ?? '');
+  if (issue.code === 'UNKNOWN_ITEM') {
+    const messageRef = /missing for (.+?)\.\s*$/i.exec(message)?.[1];
+    if (messageRef && !refs.includes(messageRef)) refs.push(messageRef);
+  }
+  if (issue.code === 'REFUND_COGS_REVIEW') {
+    const refundIdFromMessage = /^Refund ([A-Za-z0-9_-]+)/.exec(message)?.[1];
+    if (refundIdFromMessage && !refs.includes(refundIdFromMessage)) refs.push(refundIdFromMessage);
+  }
+  return refs;
+}
+
+function issueEvidenceFromFacts(issue, facts) {
+  const refs = issueEvidenceRefs(issue);
+  const message = String(issue.details?.message ?? '');
+  const catalog = new Map(facts.filter(fact => fact.kind === 'catalog' && fact.objectId).map(fact => [fact.objectId, fact]));
+  const itemNameFor = fact => {
+    const lineName = typeof fact.name === 'string' ? fact.name.trim() : '';
+    const variation = catalog.get(fact.catalogObjectId);
+    const variationName = typeof variation?.name === 'string' ? variation.name.trim() : '';
+    const item = variation?.itemId ? catalog.get(variation.itemId) : null;
+    const itemName = typeof item?.name === 'string' ? item.name.trim() : '';
+    if (lineName) return (itemName && !lineName.toLocaleLowerCase().includes(itemName.toLocaleLowerCase())
+      ? `${itemName} — ${lineName}` : lineName).slice(0, 256);
+    if (itemName && variationName && itemName !== variationName) return `${itemName} — ${variationName}`.slice(0, 256);
+    return (itemName || variationName).slice(0, 256);
+  };
+  const lineEvidence = fact => ({
+    id: String(fact.objectId), type: 'sale_line', occurred_at: fact.occurredAt ?? undefined,
+    currency: fact.currency ?? undefined, quantity: fact.quantity ?? undefined,
+    amount_minor: fact.grossMinor ?? fact.totalMinor ?? undefined,
+    catalog_object_id: fact.catalogObjectId ?? null, item_name: itemNameFor(fact) || null,
+    provider_object_id: fact.orderId ?? undefined, line_id: fact.lineItemUid ?? undefined,
+  });
+  const lineFacts = facts.filter(fact => fact.kind === 'order_line' && fact.objectId && fact.orderId);
+
+  if (issue.code === 'REFUND_COGS_REVIEW') {
+    const refundIdFromMessage = /^Refund ([A-Za-z0-9_-]+)/.exec(message)?.[1];
+    const refund = facts.find(fact => fact.kind === 'refund' && refs.includes(String(fact.objectId)))
+      ?? facts.find(fact => fact.kind === 'refund' && fact.objectId === refundIdFromMessage);
+    const refundId = refund?.objectId ?? refundIdFromMessage;
+    const orderId = refund?.orderId ?? refs.find(ref => ref !== refundId && /^[A-Za-z0-9_-]{1,200}$/.test(ref));
+    const summary = refund && {
+      id: `refund:${refund.objectId}`, type: 'refund', occurred_at: refund.occurredAt ?? undefined,
+      currency: refund.currency ?? undefined, amount_minor: refund.amountMinor ?? undefined,
+      status: refund.status ?? undefined, refund_id: String(refund.objectId), order_id: orderId ?? undefined,
+    };
+    const orderLines = orderId ? lineFacts.filter(fact => fact.orderId === orderId).map(lineEvidence) : [];
+    return [...(summary ? [summary] : []), ...orderLines].slice(0, 21);
+  }
+
+  const refsWithLine = refs.map(ref => {
+    const separator = ref.indexOf(':');
+    return separator > 0 ? { ref, orderId: ref.slice(0, separator), lineRef: ref.slice(separator + 1) } : null;
+  }).filter(Boolean);
+  const selected = lineFacts.filter(fact => refs.includes(String(fact.objectId)) || refsWithLine.some(ref =>
+    fact.orderId === ref.orderId && (fact.lineItemUid === ref.lineRef || fact.catalogObjectId === ref.lineRef))
+    || refs.includes(String(fact.orderId)));
+  return selected.slice(0, 20).map(lineEvidence);
+}
+
+async function refreshIssueSquareEvidence({ issue, facts, tokenVault, squareBaseUrl, squareApiVersion, fetchImpl }) {
+  if (!tokenVault || !squareBaseUrl) return facts;
+  try {
+    const connection = await tokenVault.getDecrypted({ organizationId: issue.organization_id });
+    const expiry = Date.parse(connection?.expiresAt ?? '');
+    if (!connection?.accessToken || (Number.isFinite(expiry) && expiry <= Date.now() + 5 * 60_000)) return facts;
+
+    const client = new SquareApiClient({ accessToken: connection.accessToken, baseUrl: squareBaseUrl, apiVersion: squareApiVersion, fetchImpl });
+    const refs = issueEvidenceRefs(issue).filter(ref => /^[A-Za-z0-9_:-]{1,400}$/.test(ref));
+    const refreshed = [];
+    const cachedRefund = facts.find(fact => fact.kind === 'refund' && refs.includes(String(fact.objectId)));
+
+    if (issue.code === 'REFUND_COGS_REVIEW') {
+      const refundId = cachedRefund?.objectId ?? /^Refund ([A-Za-z0-9_-]+)/.exec(String(issue.details?.message ?? ''))?.[1];
+      const orderId = cachedRefund?.orderId ?? refs.find(ref => ref !== refundId && /^[A-Za-z0-9_-]{1,200}$/.test(ref));
+      const reads = await Promise.allSettled([
+        refundId ? client.request(`/v2/refunds/${encodeURIComponent(refundId)}`) : Promise.resolve(null),
+        orderId ? client.request(`/v2/orders/${encodeURIComponent(orderId)}`) : Promise.resolve(null),
+      ]);
+      const liveRefund = reads[0].status === 'fulfilled' ? reads[0].value?.refund : null;
+      const liveOrder = reads[1].status === 'fulfilled' ? reads[1].value?.order : null;
+      if (liveRefund?.id === refundId && (!orderId || liveRefund.order_id === orderId)) refreshed.push(...normalizeRefund(liveRefund));
+      if (liveOrder?.id === orderId) refreshed.push(...normalizeOrder(liveOrder));
+    } else if (issue.code === 'UNKNOWN_ITEM') {
+      const orderRefs = refs.map(ref => {
+        const separator = ref.indexOf(':');
+        return separator > 0 ? { ref, orderId: ref.slice(0, separator) } : null;
+      }).filter(Boolean);
+      const orderIds = [...new Set(orderRefs.map(ref => ref.orderId))].slice(0, 5);
+      const orders = await Promise.allSettled(orderIds.map(orderId => client.request(`/v2/orders/${encodeURIComponent(orderId)}`)));
+      for (const result of orders) {
+        if (result.status === 'fulfilled' && result.value?.order?.id && orderIds.includes(result.value.order.id)) {
+          refreshed.push(...normalizeOrder(result.value.order));
+        }
+      }
+    }
+
+    const combined = new Map(facts.map(fact => [`${fact.kind}:${fact.objectId}`, fact]));
+    for (const fact of refreshed) combined.set(`${fact.kind}:${fact.objectId}`, fact);
+    const refreshedLines = refreshed.filter(fact => fact.kind === 'order_line');
+    const catalogIds = [...new Set(refreshedLines.filter(line => !String(line.name ?? '').trim() && line.catalogObjectId)
+      .map(line => line.catalogObjectId))].slice(0, 10);
+    const catalogReads = await Promise.allSettled(catalogIds.map(id => client.request(`/v2/catalog/object/${encodeURIComponent(id)}?include_related_objects=true`)));
+    for (const result of catalogReads) {
+      if (result.status !== 'fulfilled' || !result.value?.object?.id) continue;
+      const objects = [result.value.object, ...(Array.isArray(result.value.related_objects) ? result.value.related_objects : [])];
+      for (const object of objects) for (const fact of normalizeCatalog(object)) combined.set(`${fact.kind}:${fact.objectId}`, fact);
+    }
+    return [...combined.values()];
+  } catch {
+    // The saved versioned Square facts remain the fallback when a live lookup is unavailable.
+    return facts;
+  }
+}
+
 /** Server-only Supabase adapters. Do not import this module into browser bundles. */
-export function createSupabaseAdapters({ url, publishableKey, secretKey, tokenEncryptionKey, fetchImpl = fetch }) {
+export function createSupabaseAdapters({ url, publishableKey, secretKey, tokenEncryptionKey, squareBaseUrl = 'https://connect.squareup.com', squareApiVersion, fetchImpl = fetch }) {
   const baseUrl = requiredString(url, 'Supabase URL');
   const publicKey = typeof publishableKey === 'string' && publishableKey.trim() ? requiredString(publishableKey, 'Supabase publishable key') : null;
   const serviceKey = secretKey ? requiredString(secretKey, 'Supabase secret key') : null;
@@ -455,32 +575,26 @@ export function createSupabaseAdapters({ url, publishableKey, secretKey, tokenEn
     },
     async getIssueEvidence({ organizationId, issueId, accessToken }) {
       const issue = await db.getIssue({ organizationId, issueId, accessToken });
-      if (!issue) return [];
-      const ids = Array.isArray(issue.source_refs) ? issue.source_refs.filter(x => typeof x === 'string') : [];
-      const uuids = ids.filter(x => /^[0-9a-f-]{36}$/i.test(x));
-      const providerIds = ids.filter(x => /^[A-Za-z0-9:_-]{1,200}$/.test(x) && !uuids.includes(x));
-      const orderIds = [];
-      const lineRefs = [];
-      for (const id of providerIds) {
-        const separator = id.indexOf(':');
-        if (separator > 0) {
-          const orderId = id.slice(0, separator);
-          const lineId = id.slice(separator + 1);
-          if (/^[A-Za-z0-9_-]{1,200}$/.test(orderId) && /^[A-Za-z0-9_-]{1,200}$/.test(lineId)) {
-            lineRefs.push({ orderId, lineId });
-            continue;
-          }
-        }
-        orderIds.push(id);
+      if (!issue) return { evidence: [], correctionReady: false };
+      let { data, error } = await serviceRest().rpc('get_issue_square_evidence', {
+        organization_id: organizationId, issue_code: issue.code, source_refs: issueEvidenceRefs(issue),
+      });
+      let correctionReady = !error;
+      if (error && ['PGRST202', '42883'].includes(error.code)) {
+        // Older deployments can still show evidence while waiting for the scoped evidence RPC migration.
+        const fallback = await serviceRest().rpc('get_square_projection_snapshot', {
+          organization_id: organizationId, source_revision: 0, start_at: null, end_at: null,
+        });
+        data = fallback.data;
+        error = fallback.error;
+        correctionReady = false;
       }
-      if (!uuids.length && !providerIds.length) return [];
-      const clauses = [];
-      if (uuids.length) clauses.push(`source_event_id.in.(${uuids.join(',')})`);
-      if (orderIds.length) clauses.push(`square_order_id.in.(${orderIds.join(',')})`);
-      for (const { orderId, lineId } of lineRefs) clauses.push(`and(square_order_id.eq.${orderId},square_line_uid.eq.${lineId})`);
-      const query = new URLSearchParams({ select: 'id,source_event_id,square_order_id,square_line_uid,square_catalog_object_id,item_name,quantity,gross_minor,discount_minor,refund_minor,currency,sold_at', organization_id: eq(organizationId), or: `(${clauses.join(',')})`, limit: '500' });
-      const lines = (await table(userRest(accessToken), 'sale_lines', query)).slice(0, 20);
-      return lines.map(row => ({ id: row.id, type: 'sale_line', occurred_at: row.sold_at, currency: row.currency, amount_minor: row.gross_minor, refund_minor: row.refund_minor, quantity: row.quantity, catalog_object_id: row.square_catalog_object_id, item_name: String(row.item_name ?? '').slice(0, 256), provider_object_id: String(row.square_order_id ?? '').slice(0, 200), line_id: String(row.square_line_uid ?? '').slice(0, 200) }));
+      if (error) throw error;
+      const storedFacts = Array.isArray(data?.facts) ? data.facts : [];
+      const facts = await refreshIssueSquareEvidence({ issue, facts: storedFacts, tokenVault, squareBaseUrl, squareApiVersion, fetchImpl });
+      const evidence = issueEvidenceFromFacts(issue, facts);
+      Object.defineProperty(evidence, 'correctionReady', { value: correctionReady, enumerable: false });
+      return evidence;
     },
     async recordItemDefinition(args) {
       const { data, error } = await userRest(args.accessToken).rpc('record_item_definition', {
@@ -494,9 +608,10 @@ export function createSupabaseAdapters({ url, publishableKey, secretKey, tokenEn
       return typeof data === 'string' ? { id: data } : data;
     },
     async recordSaleLineCostOverride(args) {
-      const { data, error } = await userRest(args.accessToken).rpc('record_sale_line_cost_override', {
+      const { data, error } = await userRest(args.accessToken).rpc('record_square_sale_line_cost_override', {
         organization_id: args.organizationId, issue_id: args.issueId,
-        sale_line_id: args.saleLineId, unit_cost_minor: args.unitCostMinor,
+        square_order_id: args.squareOrderId, square_line_uid: args.squareLineUid,
+        unit_cost_minor: args.unitCostMinor,
         currency: args.currency, approval_reason: args.reason, idempotency_key: args.idempotencyKey
       });
       if (error) throw error;

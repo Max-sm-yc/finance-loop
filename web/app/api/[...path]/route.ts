@@ -7,11 +7,14 @@ export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
 
 function handlers() {
+  const squareEnvironment = process.env.SQUARE_ENVIRONMENT;
   const adapters = createSupabaseAdapters({
     url: process.env.SUPABASE_URL ?? process.env.NEXT_PUBLIC_SUPABASE_URL ?? '',
     publishableKey: process.env.SUPABASE_PUBLISHABLE_KEY ?? process.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY ?? process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY ?? '',
     secretKey: process.env.SUPABASE_SECRET_KEY,
     tokenEncryptionKey: process.env.SQUARE_TOKEN_ENCRYPTION_KEY,
+    squareBaseUrl: squareEnvironment === 'sandbox' ? 'https://connect.squareupsandbox.com' : squareEnvironment === 'production' ? 'https://connect.squareup.com' : '',
+    squareApiVersion: process.env.SQUARE_API_VERSION ?? '2026-09-16',
   });
   const route = createHandlers({
     ...adapters,
