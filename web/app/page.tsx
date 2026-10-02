@@ -12,7 +12,7 @@ type AnalyticsProduct = { productId: string; productName?: string | null; unitsS
 type AnalyticsSeries = { period: string; revenueMinor: number | null; costMinor: number | null; feesMinor: number | null; netMinor: number | null; unitsSold: number };
 type AnalyticsReport = { calculationVersion: string; status: string; currency: string | null; sourceRevision?: number | null; products: AnalyticsProduct[]; totals: { revenueMinor: number | null; costMinor: number | null; netMinor: number | null; feesMinor: number | null; refundsMinor: number | null }; unallocated: { revenueMinor: number | null; refundsMinor: number | null; feesMinor: number | null; cogsReversalMinor?: number | null }; issues: Array<{ code: string; sourceRefs?: string[] }>; daily?: AnalyticsSeries[]; monthly?: AnalyticsSeries[] };
 const UUID_INPUT = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
-type Organization = { id: string; name: string; base_currency?: string; timezone?: string };
+type Organization = { id: string; name: string; base_currency?: string; timezone?: string; role?: string };
 type IssueEvidence = { id: string; type?: 'sale_line' | 'refund'; occurred_at?: string; currency?: string; quantity?: string | number; amount_minor?: string | number; gross_minor?: string | number; unit_price_minor?: string | number; discount_minor?: string | number; catalog_object_id?: string | null; item_name?: string | null; provider_object_id?: string; line_id?: string; refund_id?: string; order_id?: string; status?: string };
 const NAV: Array<{ id: Page; label: string; icon: string }> = [
   { id: 'overview', label: 'Overview', icon: '▦' }, { id: 'income', label: 'Income & inventory', icon: '▥' },
@@ -87,6 +87,9 @@ export default function Home() {
   const [features, setFeatures] = useState<Features>({ inventoryTracking: false, productAnalytics: false });
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
+  const [syncing, setSyncing] = useState(false);
+  const [syncStatus, setSyncStatus] = useState('');
+  const [syncError, setSyncError] = useState('');
   const [email, setEmail] = useState(''); const [password, setPassword] = useState('');
   const [accountId, setAccountId] = useState('');
   const [from, setFrom] = useState(() => new Date(Date.now() - 29 * 86400000).toISOString().slice(0, 10));
@@ -108,7 +111,7 @@ export default function Home() {
     void (async () => {
       const { data: { user: currentUser } } = await supabase.auth.getUser();
       if (!currentUser?.id) return;
-      const { data: memberships, error: membershipError } = await supabase.from('memberships').select('organization_id').eq('user_id', currentUser.id);
+      const { data: memberships, error: membershipError } = await supabase.from('memberships').select('organization_id,role').eq('user_id', currentUser.id);
       if (!active) return;
       if (membershipError) { setError('Could not load your workspace memberships.'); return; }
       const ids = [...new Set((memberships ?? []).map(row => row.organization_id as string))];
@@ -116,7 +119,8 @@ export default function Home() {
       const { data: orgRows, error: organizationError } = await supabase.from('organizations').select('id,name').in('id', ids);
       if (!active) return;
       if (organizationError) { setError('Could not load your organization details.'); return; }
-      const options = (orgRows ?? []) as Organization[];
+      const roleByOrganization = new Map((memberships ?? []).map(row => [row.organization_id as string, row.role as string | undefined]));
+      const options = ((orgRows ?? []) as Organization[]).map(org => ({ ...org, role: roleByOrganization.get(org.id) }));
       setOrganizations(options);
       setOrganizationId(current => options.some(org => org.id === current) ? current : options[0]?.id ?? '');
     })();
@@ -173,7 +177,39 @@ export default function Home() {
     catch { setError('Sign in could not reach the authentication service. Try again.'); }
     finally { setBusy(false); }
   }
-  async function signOut() { loadSequence.current += 1; await supabase?.auth.signOut(); setDashboard(null); setIssues([]); setMovements([]); setEvents([]); setFeatures({ inventoryTracking: false, productAnalytics: false }); }
+  async function signOut() { loadSequence.current += 1; await supabase?.auth.signOut(); setDashboard(null); setIssues([]); setMovements([]); setEvents([]); setFeatures({ inventoryTracking: false, productAnalytics: false }); setSyncStatus(''); setSyncError(''); }
+  async function syncSelectedPeriod() {
+    if (!organizationId || !from || !to || from > to) {
+      setSyncError('Choose a valid period before syncing.'); setSyncStatus(''); return;
+    }
+    setSyncing(true); setSyncError(''); setSyncStatus('');
+    try {
+      await api('/api/sync', {
+        method: 'POST',
+        headers: { 'Idempotency-Key': `square-sync:${crypto.randomUUID()}` },
+        body: JSON.stringify({
+          organizationId,
+          startAt: zonedMidnight(from, reportTimezone),
+          endAt: zonedMidnight(nextDate(to), reportTimezone),
+        }),
+      });
+      setSyncStatus(`Sync queued for ${from} through ${to} across active Square locations. When the worker finishes, click ↻ to refresh; incomplete Square data may still leave figures unavailable.`);
+    } catch (reason) {
+      const code = reason instanceof Error ? reason.message : '';
+      const messages: Record<string, string> = {
+        FORBIDDEN: 'Only workspace owners can start a Square sync.',
+        SQUARE_NOT_CONNECTED: 'Square is not connected to this workspace. Connect Square, then try again.',
+        SQUARE_RECONNECT_REQUIRED: 'Square authorization needs to be renewed. Reconnect Square, then try again.',
+        SQUARE_PERMISSION_REQUIRED: 'Square did not grant access to its locations. Reconnect Square with the requested read access.',
+        SQUARE_NO_ACTIVE_LOCATIONS: 'Square has no active locations to sync.',
+        SQUARE_LOCATION_LIMIT_EXCEEDED: 'This Square account has more locations than one sync can include. Contact support.',
+        SYNC_WINDOW_TOO_LARGE: 'A sync can cover up to 366 days. Shorten the selected period and try again.',
+        SQUARE_SYNC_UNAVAILABLE: 'Square sync is not configured for this environment.',
+        SQUARE_LOCATIONS_UNAVAILABLE: 'Square locations could not be loaded. Try again shortly.',
+      };
+      setSyncError(messages[code] ?? 'The sync could not be queued. Refresh the page and try again.');
+    } finally { setSyncing(false); }
+  }
   const currency = dashboard?.period?.currency ?? dashboard?.income?.currency ?? 'USD';
   const openIssues = issues.filter(i => !['resolved', 'approved', 'rejected'].includes(i.state));
 
@@ -195,9 +231,11 @@ export default function Home() {
       <div className="nav-caption">WORKSPACE</div><nav aria-label="Main navigation">{navItems.map(item => <button key={item.id} className={`nav-link ${page === item.id ? 'selected' : ''}`} onClick={() => setPage(item.id)} aria-current={page === item.id ? 'page' : undefined}><span aria-hidden="true">{item.icon}</span>{item.label}{item.id === 'review' && openIssues.length > 0 && <i>{openIssues.length}</i>}</button>)}</nav>
       <div className="sidebar-foot"><div className="secure-note"><span className="status-dot" /> <b>Authenticated session</b><small>Workspace data is access controlled.</small></div><div className="profile"><span className="avatar">{user.email?.slice(0, 1).toUpperCase() ?? 'U'}</span><span className="profile-info"><b>{user.email}</b><small>Signed in</small></span><button className="icon-button" onClick={signOut} title="Sign out" aria-label="Sign out">↪</button></div></div>
     </aside>
-    <section className="main-area"><header className="topbar"><div className="crumb">{dashboard?.organization?.name ?? 'Workspace'} <span>/</span> <strong>{title}</strong></div><div className="top-controls">{organizations.length > 1 && <label className="compact">Organization<select value={organizationId} onChange={e => { loadSequence.current += 1; setOrganizationId(e.target.value); setDashboard(null); setFeatures({ inventoryTracking: false, productAnalytics: false }); if (page === 'analytics') setPage('overview'); }}><option value="">Choose workspace</option>{organizations.map(org => <option key={org.id} value={org.id}>{org.name}</option>)}</select></label>}<label className="compact">Period from<input type="date" value={from} onChange={e => setFrom(e.target.value)} /></label><label className="compact">through<input type="date" value={to} onChange={e => setTo(e.target.value)} /></label><span className="timezone-note">{reportTimezone}</span><button className="icon-button refresh" onClick={() => void load()} disabled={busy} aria-label="Refresh workspace data">{busy ? '…' : '↻'}</button></div></header>
-      <main className="page"><div className="page-head"><div><p className="eyebrow">FINANCIAL OPERATIONS</p><h1>{title}</h1><p className="muted">{page === 'overview' ? 'A clear view of sales, margin, cash and items that need review.' : subhead(page)}</p></div></div>
+    <section className="main-area"><header className="topbar"><div className="crumb">{dashboard?.organization?.name ?? 'Workspace'} <span>/</span> <strong>{title}</strong></div><div className="top-controls">{organizations.length > 1 && <label className="compact">Organization<select value={organizationId} onChange={e => { loadSequence.current += 1; setOrganizationId(e.target.value); setDashboard(null); setFeatures({ inventoryTracking: false, productAnalytics: false }); setSyncStatus(''); setSyncError(''); if (page === 'analytics') setPage('overview'); }}><option value="">Choose workspace</option>{organizations.map(org => <option key={org.id} value={org.id}>{org.name}</option>)}</select></label>}<label className="compact">Period from<input type="date" value={from} onChange={e => { setFrom(e.target.value); setSyncStatus(''); setSyncError(''); }} /></label><label className="compact">through<input type="date" value={to} onChange={e => { setTo(e.target.value); setSyncStatus(''); setSyncError(''); }} /></label><span className="timezone-note">{reportTimezone}</span><button className="icon-button refresh" onClick={() => void load()} disabled={busy || syncing} aria-label="Refresh workspace data">{busy ? '…' : '↻'}</button></div></header>
+      <main className="page"><div className="page-head"><div><p className="eyebrow">FINANCIAL OPERATIONS</p><h1>{title}</h1><p className="muted">{page === 'overview' ? 'A clear view of sales, margin, cash and items that need review.' : subhead(page)}</p></div>{organizations.find(org => org.id === organizationId)?.role === 'owner' && <button className="primary" onClick={() => void syncSelectedPeriod()} disabled={syncing || busy}>{syncing ? 'Queueing sync…' : 'Sync selected period'}</button>}</div>
         {error && <div className="notice error-box" role="alert"><b>Data request needs attention</b><span>{error}</span></div>}
+        {syncError && <div className="notice error-box" role="alert"><b>Sync could not start</b><span>{syncError}</span></div>}
+        {syncStatus && <div className="notice" role="status"><b>Sync queued</b><span>{syncStatus}</span></div>}
         {!organizationId ? <section className="empty-state"><div className="empty-icon">⌁</div><h2>{organizations.length ? 'Choose a workspace' : 'No workspace membership found'}</h2><p>Ask a workspace owner to add your account, then sign in again.</p></section> : !dashboard ? <section className="empty-state"><div className="empty-icon">⌁</div><h2>{busy ? 'Loading workspace data' : 'No projection available yet'}</h2><p>Once your workspace has accounts and a completed projection, verified figures will appear here.</p><button className="secondary" onClick={() => void load()}>Retry</button></section> : <>
           {page === 'overview' && <Overview dashboard={dashboard} currency={currency} issues={openIssues} onNavigate={setPage} />}
           {page === 'income' && <Income dashboard={dashboard} currency={currency} />}

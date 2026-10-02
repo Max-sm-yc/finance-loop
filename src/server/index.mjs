@@ -7,6 +7,7 @@ import { calculateInventory } from '../engine/inventory.mjs';
 const JSON_HEADERS = { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' };
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const ISO = /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d{1,3})?Z$/;
+const MAX_SYNC_WINDOW_MS = 366 * 24 * 60 * 60 * 1000;
 const roles = new Set(['owner', 'operator', 'reviewer', 'read_only']);
 const own = (o, k) => Object.prototype.hasOwnProperty.call(o, k);
 
@@ -297,9 +298,27 @@ export function createHandlers(adapters) {
   const sync = run(async req => {
     if (req.method !== 'POST') throw new HttpError(405, 'METHOD_NOT_ALLOWED');
     const body = await readJson(req); const key = idempotency(req);
-    if (!exactObject(body, ['organizationId','startAt','endAt','locationIds']) || !UUID.test(body.organizationId) || !validDate(body.startAt) || !validDate(body.endAt) || Date.parse(body.startAt) >= Date.parse(body.endAt) || !Array.isArray(body.locationIds) || body.locationIds.length > 100 || body.locationIds.some(x => !text(x, 200))) throw new HttpError(400, 'INVALID_SYNC');
+    if (!exactObject(body, ['organizationId','startAt','endAt']) || !UUID.test(body.organizationId) || !validDate(body.startAt) || !validDate(body.endAt) || Date.parse(body.startAt) >= Date.parse(body.endAt)) throw new HttpError(400, 'INVALID_SYNC');
+    if (Date.parse(body.endAt) - Date.parse(body.startAt) > MAX_SYNC_WINDOW_MS) throw new HttpError(400, 'SYNC_WINDOW_TOO_LARGE');
     const actor = await authorize(req, body.organizationId, ['owner']);
-    return created(await queue.enqueueSquareSync({ ...body, idempotencyKey: key, requestedBy: actor.userId }));
+    if (typeof adapters.listSquareLocations !== 'function') throw new HttpError(503, 'SQUARE_SYNC_UNAVAILABLE');
+    let locations;
+    try { locations = await adapters.listSquareLocations({ organizationId: body.organizationId }); }
+    catch (error) {
+      if (error?.code === 'SQUARE_NOT_CONNECTED') throw new HttpError(409, 'SQUARE_NOT_CONNECTED');
+      if (error?.code === 'SQUARE_RECONNECT_REQUIRED' || error?.status === 401) throw new HttpError(409, 'SQUARE_RECONNECT_REQUIRED');
+      if (error?.status === 403) throw new HttpError(403, 'SQUARE_PERMISSION_REQUIRED');
+      if (error?.code === 'SQUARE_SYNC_UNAVAILABLE') throw new HttpError(503, 'SQUARE_SYNC_UNAVAILABLE');
+      throw new HttpError(502, 'SQUARE_LOCATIONS_UNAVAILABLE');
+    }
+    if (!Array.isArray(locations) || locations.some(location => !text(location?.id, 200))) throw new HttpError(502, 'SQUARE_LOCATIONS_UNAVAILABLE');
+    const locationIds = [...new Set(locations.map(location => location.id))];
+    if (!locationIds.length) throw new HttpError(409, 'SQUARE_NO_ACTIVE_LOCATIONS');
+    if (locationIds.length > 100) throw new HttpError(409, 'SQUARE_LOCATION_LIMIT_EXCEEDED');
+    return created(await queue.enqueueSquareSync({
+      organizationId: body.organizationId, startAt: body.startAt, endAt: body.endAt,
+      locationIds, idempotencyKey: key, requestedBy: actor.userId,
+    }));
   });
 
   const webhook = run(async req => {

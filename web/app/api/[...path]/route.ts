@@ -2,9 +2,81 @@ import { createHandlers } from '../../../../src/server/index.mjs';
 import { createSupabaseAdapters } from '../../../../src/adapters/supabase.mjs';
 import { replayAccounting } from '../../../../src/engine/index.mjs';
 import { createSquareOAuthHandlers } from '../../../../src/square/oauth.mjs';
+import { refreshAccessToken, SquareApiClient } from '../../../../src/square/client.mjs';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
+
+type SquareTokenRefresh = {
+  access_token?: string; refresh_token?: string; expires_at?: string;
+  merchant_id?: string; scopes?: string[]; token_type?: string;
+};
+type SquareLocationsPage = { locations?: Array<{ id?: string; status?: string }>; cursor?: string | null };
+
+function codedError(code: string) {
+  return Object.assign(new Error(code), { code });
+}
+
+async function listActiveSquareLocations(organizationId: string, adapters: ReturnType<typeof createSupabaseAdapters>) {
+  const squareEnvironment = process.env.SQUARE_ENVIRONMENT;
+  if (squareEnvironment !== 'sandbox' && squareEnvironment !== 'production') throw codedError('SQUARE_SYNC_UNAVAILABLE');
+  const squareBaseUrl = squareEnvironment === 'sandbox' ? 'https://connect.squareupsandbox.com' : 'https://connect.squareup.com';
+  let connection;
+  try { connection = await adapters.tokenVault.getDecrypted({ organizationId }); }
+  catch { throw codedError('SQUARE_LOCATIONS_UNAVAILABLE'); }
+  if (!connection?.accessToken) throw codedError('SQUARE_NOT_CONNECTED');
+
+  const expiresAt = Date.parse(connection.expiresAt ?? '');
+  if (Number.isFinite(expiresAt) && expiresAt <= Date.now() + 5 * 60_000) {
+    const clientId = process.env.SQUARE_CLIENT_ID;
+    const clientSecret = process.env.SQUARE_CLIENT_SECRET;
+    if (!connection.refreshToken || !clientId || !clientSecret) throw codedError('SQUARE_RECONNECT_REQUIRED');
+    let refreshed: SquareTokenRefresh;
+    try {
+      refreshed = await refreshAccessToken({
+        refreshToken: connection.refreshToken, clientId, clientSecret, baseUrl: squareBaseUrl,
+      }) as SquareTokenRefresh;
+    } catch (error) {
+      const status = typeof error === 'object' && error !== null && 'status' in error ? Number(error.status) : undefined;
+      if (status === 400 || status === 401) throw codedError('SQUARE_RECONNECT_REQUIRED');
+      throw error;
+    }
+    if (!refreshed.access_token || !refreshed.refresh_token || !refreshed.expires_at) throw codedError('SQUARE_RECONNECT_REQUIRED');
+    await adapters.tokenVault.storeEncrypted({
+      organizationId, connectedBy: connection.connectedBy,
+      merchantId: refreshed.merchant_id ?? connection.merchantId,
+      accessToken: refreshed.access_token, refreshToken: refreshed.refresh_token,
+      expiresAt: refreshed.expires_at, scopes: refreshed.scopes ?? connection.scopes,
+      tokenType: refreshed.token_type ?? connection.tokenType,
+    });
+    connection = { ...connection, accessToken: refreshed.access_token, expiresAt: refreshed.expires_at };
+  }
+
+  const client = new SquareApiClient({
+    accessToken: connection.accessToken, baseUrl: squareBaseUrl,
+    apiVersion: process.env.SQUARE_API_VERSION ?? '2026-09-16',
+  });
+  const locations = new Map<string, { id: string }>();
+  const cursors = new Set<string>();
+  let cursor: string | null = null;
+  for (let page = 0; page < 100; page += 1) {
+    const query = new URLSearchParams({ limit: '100' });
+    if (cursor) query.set('cursor', cursor);
+    const result = await client.request(`/v2/locations?${query.toString()}`) as SquareLocationsPage;
+    if (!Array.isArray(result.locations)) throw codedError('SQUARE_LOCATIONS_UNAVAILABLE');
+    for (const location of result.locations) {
+      if (typeof location?.id === 'string' && location.id.trim() && location.status !== 'INACTIVE') {
+        locations.set(location.id, { id: location.id });
+        if (locations.size > 100) return [...locations.values()];
+      }
+    }
+    cursor = typeof result.cursor === 'string' && result.cursor ? result.cursor : null;
+    if (!cursor) return [...locations.values()];
+    if (cursors.has(cursor)) throw codedError('SQUARE_LOCATIONS_UNAVAILABLE');
+    cursors.add(cursor);
+  }
+  throw codedError('SQUARE_LOCATIONS_UNAVAILABLE');
+}
 
 function handlers() {
   const squareEnvironment = process.env.SQUARE_ENVIRONMENT;
@@ -18,6 +90,7 @@ function handlers() {
   });
   const route = createHandlers({
     ...adapters,
+    listSquareLocations: ({ organizationId }: { organizationId: string }) => listActiveSquareLocations(organizationId, adapters),
     engine: { replayAccounting },
     config: {
       squareWebhookSignatureKey: process.env.SQUARE_WEBHOOK_SIGNATURE_KEY ?? '',
