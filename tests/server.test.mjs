@@ -7,7 +7,7 @@ const org = '11111111-1111-4111-8111-111111111111';
 const account = '22222222-2222-4222-8222-222222222222';
 const user = '33333333-3333-4333-8333-333333333333';
 
-function setup({ role = 'operator', proposalFixture = false, proposalType = 'unknown_item', proposalPolicyVersion = 'policy-v1', fetchImpl, budgetAllowed = true, inventoryFlag = false, analyticsFlag = false, inventoryServerFlag = false, analyticsServerFlag = false } = {}) {
+function setup({ role = 'operator', proposalFixture = false, proposalType = 'unknown_item', proposalPolicyVersion = 'policy-v1', fetchImpl, budgetAllowed = true, inventoryFlag = false, analyticsFlag = false, inventoryServerFlag = false, analyticsServerFlag = false, squareLocations = [{ id: 'square-location-1' }] } = {}) {
   const calls = [];
   const inboxIds = new Set();
   const db = {
@@ -37,7 +37,7 @@ function setup({ role = 'operator', proposalFixture = false, proposalType = 'unk
   const queue = { async enqueueSquareSync(arg) { calls.push(['sync', arg]); return { id: 'job-1' }; }, async enqueueSquareWebhook(arg) { calls.push(['webhook-job', arg]); }, async enqueueProjectionReplay(arg) { calls.push(['projection-replay', arg]); return { id: 'replay-1' }; } };
   const webhookInbox = { async putIfAbsent(id, record) { calls.push(['inbox', id]); const inserted = !inboxIds.has(id); inboxIds.add(id); return { inserted, record }; } };
   const supabase = { auth: { async getUser(token) { calls.push(['auth', token]); return { data: { user: { id: user } }, error: null }; } } };
-  return { handlers: createHandlers({ supabase, db, queue, webhookInbox, fetchImpl, engine: { replayAccounting: () => ({}) }, config: { squareWebhookSignatureKey: 'key', squareNotificationUrl: 'https://example.test/webhook', openRouterApiKey: 'test-key', inventoryTrackingEnabled: inventoryServerFlag, productAnalyticsEnabled: analyticsServerFlag } }), calls };
+  return { handlers: createHandlers({ supabase, db, queue, webhookInbox, fetchImpl, engine: { replayAccounting: () => ({}) }, listSquareLocations: async args => { calls.push(['square-locations', args]); return squareLocations; }, config: { squareWebhookSignatureKey: 'key', squareNotificationUrl: 'https://example.test/webhook', openRouterApiKey: 'test-key', inventoryTrackingEnabled: inventoryServerFlag, productAnalyticsEnabled: analyticsServerFlag } }), calls };
 }
 const auth = { authorization: 'Bearer valid.jwt.token' };
 const post = (path, body, headers = {}) => new Request(`https://app.test${path}`, { method: 'POST', headers: { ...auth, 'content-type': 'application/json', ...headers }, body: JSON.stringify(body) });
@@ -139,11 +139,24 @@ test('Square webhook accepts exact signed bytes once and idempotently re-enqueue
 
 test('sync is owner-only, bounded, and enqueued with idempotency key', async () => {
   const { handlers, calls } = setup();
-  const body = { organizationId: org, startAt: '2026-01-01T00:00:00Z', endAt: '2026-02-01T00:00:00Z', locationIds: [] };
+  const body = { organizationId: org, startAt: '2026-01-01T00:00:00Z', endAt: '2026-02-01T00:00:00Z' };
   assert.equal((await handlers.sync(post('/api/sync', body, { 'idempotency-key': 'sync:1' }))).status, 403);
+  assert.equal(calls.some(x => x[0] === 'square-locations'), false);
   const owner = setup({ role: 'owner' });
   assert.equal((await owner.handlers.sync(post('/api/sync', body, { 'idempotency-key': 'sync:1' }))).status, 201);
   assert.equal(owner.calls.find(x => x[0] === 'sync')[1].idempotencyKey, 'sync:1');
+  assert.deepEqual(owner.calls.find(x => x[0] === 'sync')[1].locationIds, ['square-location-1']);
+  assert.deepEqual(owner.calls.find(x => x[0] === 'square-locations')[1], { organizationId: org });
+  const noLocations = setup({ role: 'owner', squareLocations: [] });
+  const unavailable = await noLocations.handlers.sync(post('/api/sync', body, { 'idempotency-key': 'sync:empty' }));
+  assert.equal(unavailable.status, 409);
+  assert.equal((await read(unavailable)).code, 'SQUARE_NO_ACTIVE_LOCATIONS');
+  assert.equal(noLocations.calls.some(x => x[0] === 'sync'), false);
+  const tooWide = setup({ role: 'owner' });
+  const oversized = await tooWide.handlers.sync(post('/api/sync', { ...body, endAt: '2028-01-01T00:00:00Z' }, { 'idempotency-key': 'sync:wide' }));
+  assert.equal(oversized.status, 400);
+  assert.equal((await read(oversized)).code, 'SYNC_WINDOW_TOO_LARGE');
+  assert.equal(tooWide.calls.some(x => x[0] === 'square-locations'), false);
 });
 
 test('issue proposal runs a budgeted model draft, persists only the validated proposal, and never posts a ledger fact', async () => {
