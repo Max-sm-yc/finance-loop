@@ -5,7 +5,7 @@ import { api, type AuditEvent, type Dashboard, type Issue, type Movement } from 
 
 type Page = 'overview' | 'income' | 'cash' | 'review' | 'ledger' | 'settings';
 type Organization = { id: string; name: string; base_currency?: string; timezone?: string };
-type IssueEvidence = { id: string; occurred_at?: string; currency?: string; catalog_object_id?: string | null; item_name?: string | null; provider_object_id?: string; line_id?: string };
+type IssueEvidence = { id: string; occurred_at?: string; currency?: string; quantity?: string | number; amount_minor?: string | number; catalog_object_id?: string | null; item_name?: string | null; provider_object_id?: string; line_id?: string };
 const NAV: Array<{ id: Page; label: string; icon: string }> = [
   { id: 'overview', label: 'Overview', icon: '▦' }, { id: 'income', label: 'Income & inventory', icon: '▥' },
   { id: 'cash', label: 'Cash flow', icon: '⇄' }, { id: 'review', label: 'Review queue', icon: '◇' },
@@ -210,6 +210,7 @@ function Review({ issues, organizationId, currency, onSaved }: { issues: Issue[]
   const [correction, setCorrection] = useState<{ issue: Issue; kind: 'item' | 'refund' } | null>(null);
   const [reason, setReason] = useState(''); const [busyId, setBusyId] = useState(''); const [error, setError] = useState(''); const [notice, setNotice] = useState('');
   const [evidence, setEvidence] = useState<IssueEvidence[]>([]); const [evidenceLoading, setEvidenceLoading] = useState(false);
+  const [selectedSaleLineId, setSelectedSaleLineId] = useState('');
   const [catalogId, setCatalogId] = useState(''); const [itemName, setItemName] = useState(''); const [unitCost, setUnitCost] = useState('');
   const [effectiveDate, setEffectiveDate] = useState(''); const [itemCurrency, setItemCurrency] = useState(currency);
   const [refundId, setRefundId] = useState(''); const [orderId, setOrderId] = useState('');
@@ -230,7 +231,7 @@ function Review({ issues, organizationId, currency, onSaved }: { issues: Issue[]
   }
   async function openCorrection(issue: Issue, kind: 'item' | 'refund') {
     setCorrection({ issue, kind }); setError(''); setNotice(''); setReason(''); setEvidence([]); setEvidenceLoading(true);
-    setCatalogId(''); setItemName(''); setUnitCost(''); setEffectiveDate(''); setItemCurrency(currency);
+    setCatalogId(''); setItemName(''); setUnitCost(''); setEffectiveDate(''); setItemCurrency(currency); setSelectedSaleLineId('');
     const message = String(issue.details?.message ?? '');
     const refund = /^Refund ([A-Za-z0-9_-]+)/.exec(message)?.[1] ?? '';
     setRefundId(refund); setOrderId((issue.source_refs ?? []).find(ref => ref !== refund) ?? '');
@@ -241,6 +242,7 @@ function Review({ issues, organizationId, currency, onSaved }: { issues: Issue[]
       const rows = result.evidence ?? []; setEvidence(rows);
       const first = rows[0];
       if (kind === 'item' && first) {
+        setSelectedSaleLineId(first.id);
         setCatalogId(first.catalog_object_id ?? ''); setItemName(first.item_name ?? ''); setItemCurrency(first.currency ?? currency);
         setEffectiveDate((first.occurred_at ?? String(issue.details?.period_start ?? '')).slice(0, 10));
       }
@@ -254,10 +256,20 @@ function Review({ issues, organizationId, currency, onSaved }: { issues: Issue[]
     try {
       if (kind === 'item') {
         const dollars = Number(unitCost); const minor = Math.round(dollars * 100);
-        if (!catalogId.trim() || !itemName.trim() || !Number.isFinite(dollars) || dollars < 0 || Math.abs(dollars * 100 - minor) > 1e-7 || !effectiveDate) throw new Error('Enter the Square catalog ID, item name, a cost in cents, and the date the cost became effective.');
-        const effectiveFrom = new Date(`${effectiveDate}T00:00:00`).toISOString();
-        const result = await api<{ projectionJobId: string }>(`/api/issues/${encodeURIComponent(issue.id)}/item-cost`, { method: 'POST', headers: { 'Idempotency-Key': crypto.randomUUID() }, body: JSON.stringify({ organizationId, squareCatalogObjectId: catalogId.trim(), name: itemName.trim(), unitCostMinor: minor, currency: itemCurrency, effectiveFrom, reason: reason.trim() }) });
-        setNotice(`Approved cost saved. Historical projection replay ${result.projectionJobId} is queued.`);
+        if ((catalogId.trim() && !itemName.trim()) || !Number.isFinite(dollars) || dollars < 0 || Math.abs(dollars * 100 - minor) > 1e-7) throw new Error('Enter the source item name and an approved unit cost in cents.');
+        const idempotencyKey = crypto.randomUUID();
+        let result: { projectionJobId: string };
+        if (catalogId.trim()) {
+          if (!effectiveDate) throw new Error('Enter the date the catalog item cost became effective.');
+          const effectiveFrom = new Date(`${effectiveDate}T00:00:00`).toISOString();
+          result = await api<{ projectionJobId: string }>(`/api/issues/${encodeURIComponent(issue.id)}/item-cost`, { method: 'POST', headers: { 'Idempotency-Key': idempotencyKey }, body: JSON.stringify({ organizationId, squareCatalogObjectId: catalogId.trim(), name: itemName.trim(), unitCostMinor: minor, currency: itemCurrency, effectiveFrom, reason: reason.trim() }) });
+          setNotice(`Approved catalog cost saved. Historical projection replay ${result.projectionJobId} is queued.`);
+        } else {
+          const line = evidence.find(row => row.id === selectedSaleLineId);
+          if (!line?.provider_object_id || !line.line_id) throw new Error('The selected Square sale line is missing its order or line identifier.');
+          result = await api<{ projectionJobId: string }>(`/api/issues/${encodeURIComponent(issue.id)}/line-cost`, { method: 'POST', headers: { 'Idempotency-Key': idempotencyKey }, body: JSON.stringify({ organizationId, saleLineId: line.id, unitCostMinor: minor, currency: itemCurrency, reason: reason.trim() }) });
+          setNotice(`Sale-line cost saved for this transaction only. Historical projection replay ${result.projectionJobId} is queued.`);
+        }
       } else {
         const dollars = Number(reversal); const minor = Math.round(dollars * 100);
         if (!refundId || !orderId || !['returned_to_inventory', 'not_returned_to_inventory'].includes(disposition) || !Number.isFinite(dollars) || dollars < 0 || Math.abs(dollars * 100 - minor) > 1e-7) throw new Error('Choose the return disposition and confirm the linked refund, order, and approved COGS reversal in cents.');
@@ -273,6 +285,7 @@ function Review({ issues, organizationId, currency, onSaved }: { issues: Issue[]
     const pending = issue.proposals?.find(p => p.decision === 'pending');
     return (pending as Record<string, unknown> | undefined) ?? (issue.details?.proposal as Record<string, unknown> | undefined);
   }
+  const selectedSaleLine = evidence.find(row => row.id === selectedSaleLineId) ?? evidence[0];
   return <>
     <section className="panel table-panel">
       <div className="panel-heading"><div><h2>Human review queue</h2><p>Record the source-backed correction or prepare a draft for review.</p></div><span className="pill neutral">{issues.length} open</span></div>
@@ -300,20 +313,20 @@ function Review({ issues, organizationId, currency, onSaved }: { issues: Issue[]
       <form className="dialog" onSubmit={saveCorrection} role="dialog" aria-modal="true" aria-labelledby="correction-title">
         <button type="button" className="icon-button dialog-close" onClick={() => setCorrection(null)} aria-label="Close correction">×</button>
         <p className="eyebrow">SOURCE-BACKED FINANCE DECISION</p>
-        <h2 id="correction-title">{correction.kind === 'item' ? 'Approve item cost' : 'Resolve refund COGS review'}</h2>
+        <h2 id="correction-title">{correction.kind === 'item' ? (!catalogId && !evidenceLoading && selectedSaleLine ? 'Approve cost for this sale line' : 'Approve item cost') : 'Resolve refund COGS review'}</h2>
         <p className="muted">This decision is audited and triggers a replay of the issue’s historical period. Use supplier records or merchant return records for the values.</p>
         {evidenceLoading ? <p className="muted">Loading Square evidence…</p> : correction.kind === 'item' ? <>
-          {evidence.length > 1 && <label>Sale line<select value={evidence[0]?.id ?? ''} onChange={event => { const row = evidence.find(item => item.id === event.target.value); if (row) { setCatalogId(row.catalog_object_id ?? ''); setItemName(row.item_name ?? ''); setItemCurrency(row.currency ?? currency); setEffectiveDate((row.occurred_at ?? '').slice(0, 10)); } }}>{evidence.map(row => <option key={row.id} value={row.id}>{row.item_name ?? 'Unnamed item'} · {row.catalog_object_id ?? 'no catalog ID'}</option>)}</select></label>}
-          {evidence[0] && <p className="field-hint">Source: {evidence[0].item_name ?? 'Unnamed item'} · order {evidence[0].provider_object_id} · line {evidence[0].line_id}</p>}
-          <div className="form-grid"><label>Square catalog variation ID<input required value={catalogId} onChange={event => setCatalogId(event.target.value)} /></label><label>Item name<input required maxLength={200} value={itemName} onChange={event => setItemName(event.target.value)} /></label><label>Approved unit cost ({itemCurrency})<input required type="number" min="0" step="0.01" value={unitCost} onChange={event => setUnitCost(event.target.value)} /></label><label>Effective from<input required type="date" value={effectiveDate} onChange={event => setEffectiveDate(event.target.value)} /></label><label>Cost currency<input required maxLength={3} value={itemCurrency} onChange={event => setItemCurrency(event.target.value.toUpperCase())} /></label></div>
-          {!catalogId && !evidenceLoading && <p className="error">This sale line has no Square catalog variation ID. A catalog item cost cannot be safely matched; this needs a line-specific cost mapping.</p>}
+          {evidence.length > 1 && <label>Sale line<select value={selectedSaleLineId} onChange={event => { const row = evidence.find(item => item.id === event.target.value); if (row) { setSelectedSaleLineId(row.id); setCatalogId(row.catalog_object_id ?? ''); setItemName(row.item_name ?? ''); setItemCurrency(row.currency ?? currency); setEffectiveDate((row.occurred_at ?? '').slice(0, 10)); } }}>{evidence.map(row => <option key={row.id} value={row.id}>{row.item_name ?? 'Unnamed item'} · {row.catalog_object_id ?? 'no catalog ID'}</option>)}</select></label>}
+          {selectedSaleLine && <p className="field-hint">Square source: {selectedSaleLine.item_name ?? 'Unnamed item'} · order {selectedSaleLine.provider_object_id} · line {selectedSaleLine.line_id} · quantity {selectedSaleLine.quantity ?? 'unknown'} · sale total {money(Number(selectedSaleLine.amount_minor), selectedSaleLine.currency ?? itemCurrency)} · sold {selectedSaleLine.occurred_at ? new Date(selectedSaleLine.occurred_at).toLocaleDateString() : 'date unavailable'}</p>}
+          {!catalogId && selectedSaleLine && <p className="notice compact-notice">Square did not link this line to a catalog variation. Enter the merchant’s supplier acquisition cost for one unit. This cost will apply only to this exact sale line (quantity {selectedSaleLine.quantity ?? 'unknown'}), not other or future sales. The replay uses unit cost × quantity.</p>}
+          <div className="form-grid">{catalogId && <label>Square catalog variation ID<input readOnly value={catalogId} /></label>}{catalogId && <label>Item name<input readOnly value={itemName} /></label>}<label>Approved {catalogId ? 'unit cost per item' : 'acquisition cost per unit'} ({itemCurrency})<input required type="number" min="0" step="0.01" value={unitCost} onChange={event => setUnitCost(event.target.value)} /></label>{catalogId && <label>Cost effective from<input required type="date" value={effectiveDate} onChange={event => setEffectiveDate(event.target.value)} /></label>}<label>Cost currency (must match sale currency)<input readOnly value={itemCurrency} /></label></div>
         </> : <>
           <p className="field-hint">Refund {refundId || 'ID unavailable'} · order {orderId || 'ID unavailable'}</p>
           <div className="form-grid"><label>Returned disposition<select required value={disposition} onChange={event => { const value = event.target.value as typeof disposition; setDisposition(value); if (value === 'not_returned_to_inventory') setReversal('0.00'); }}><option value="">Select the merchant’s return outcome</option><option value="not_returned_to_inventory">Goods were not returned to inventory</option><option value="returned_to_inventory">Goods were returned and restocked</option></select></label><label>Approved COGS reversal ({refundCurrency})<input required type="number" min="0" step="0.01" disabled={disposition !== 'returned_to_inventory'} value={reversal} onChange={event => setReversal(event.target.value)} /></label><label>Cost currency<input required maxLength={3} value={refundCurrency} onChange={event => setRefundCurrency(event.target.value.toUpperCase())} /></label></div>
         </>}
-        <label>Decision reason<textarea required minLength={10} rows={3} maxLength={1000} value={reason} onChange={event => setReason(event.target.value)} placeholder="For example, supplier invoice 1042 confirms the unit cost…" /></label>
+        <label>Decision reason<textarea required minLength={10} rows={3} maxLength={1000} value={reason} onChange={event => setReason(event.target.value)} placeholder={correction.kind === 'item' ? 'Cite the supplier invoice/receipt and how it establishes the per-unit cost…' : 'Cite the merchant return record and the basis for this decision…'} /></label>
         {error && correction && <p className="error" role="alert">{error}</p>}
-        <div className="form-actions"><button type="button" className="secondary" onClick={() => setCorrection(null)}>Cancel</button><button className="primary" disabled={busyId === correction.issue.id || evidenceLoading || (correction.kind === 'item' && (!catalogId || !itemName)) || (correction.kind === 'refund' && (!refundId || !orderId || !disposition))}>{busyId === correction.issue.id ? 'Saving…' : 'Save and recalculate'}</button></div>
+        <div className="form-actions"><button type="button" className="secondary" onClick={() => setCorrection(null)}>Cancel</button><button className="primary" disabled={busyId === correction.issue.id || evidenceLoading || (correction.kind === 'item' && ((catalogId && !itemName) || (!catalogId && (!selectedSaleLine?.provider_object_id || !selectedSaleLine.line_id)))) || (correction.kind === 'refund' && (!refundId || !orderId || !disposition))}>{busyId === correction.issue.id ? 'Saving…' : 'Save and recalculate'}</button></div>
       </form>
     </div>}
   </>;

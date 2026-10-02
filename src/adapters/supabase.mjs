@@ -75,6 +75,8 @@ function makeProjectionSnapshot(data, { startAt, endAt }) {
     return Number.isFinite(at) && at >= Date.parse(startAt) && at < Date.parse(endAt);
   };
   const definitions = Array.isArray(data?.itemDefinitions) ? data.itemDefinitions : [];
+  const lineCostOverrides = new Map((Array.isArray(data?.lineCostOverrides) ? data.lineCostOverrides : [])
+    .map(override => [`${override.square_order_id}:${override.square_line_uid}`, override]));
   const refundReviews = new Map((Array.isArray(data?.refundReviews) ? data.refundReviews : [])
     .map(review => [review.square_refund_id, review]));
   const definitionAt = (catalogId, soldAt) => definitions.filter(d => d.square_catalog_object_id === catalogId
@@ -83,8 +85,9 @@ function makeProjectionSnapshot(data, { startAt, endAt }) {
     .sort((a, b) => Date.parse(b.effective_from) - Date.parse(a.effective_from))[0] ?? null;
   const lines = facts.filter(x => x.kind === 'order_line' && inWindow(x.occurredAt)).map(fact => {
     const order = orders.get(fact.orderId);
+    const lineOverride = lineCostOverrides.get(`${fact.orderId}:${fact.lineItemUid}`);
     const definition = definitionAt(fact.catalogObjectId, fact.occurredAt);
-    const cost = safeMinor(definition?.unit_cost_minor);
+    const cost = safeMinor(lineOverride?.unit_cost_minor ?? definition?.unit_cost_minor);
     return {
       id: fact.objectId, version: fact.version, orderId: fact.orderId, lineItemUid: fact.lineItemUid,
       status: statusText(order?.status), itemType: fact.itemType, currency: fact.currency,
@@ -92,7 +95,7 @@ function makeProjectionSnapshot(data, { startAt, endAt }) {
       discountMinor: safeMinor(fact.discountMinor), refundMinor: 0,
       taxMinor: safeMinor(fact.taxMinor) ?? 0, tipMinor: safeMinor(fact.tipMinor) ?? 0,
       unitCostMinor: Number.isSafeInteger(cost) && cost >= 0 ? cost : null,
-      costCurrency: definition?.currency ?? null,
+      costCurrency: lineOverride?.currency ?? definition?.currency ?? null,
     };
   });
   const fees = facts.filter(x => x.kind === 'payment' && inWindow(x.occurredAt)).map(fact => ({
@@ -486,6 +489,15 @@ export function createSupabaseAdapters({ url, publishableKey, secretKey, tokenEn
         unit_cost_minor: args.unitCostMinor, currency: args.currency,
         effective_from: args.effectiveFrom, approval_reason: args.reason,
         idempotency_key: args.idempotencyKey
+      });
+      if (error) throw error;
+      return typeof data === 'string' ? { id: data } : data;
+    },
+    async recordSaleLineCostOverride(args) {
+      const { data, error } = await userRest(args.accessToken).rpc('record_sale_line_cost_override', {
+        organization_id: args.organizationId, issue_id: args.issueId,
+        sale_line_id: args.saleLineId, unit_cost_minor: args.unitCostMinor,
+        currency: args.currency, approval_reason: args.reason, idempotency_key: args.idempotencyKey
       });
       if (error) throw error;
       return typeof data === 'string' ? { id: data } : data;

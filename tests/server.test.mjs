@@ -21,6 +21,7 @@ function setup({ role = 'operator', proposalFixture = false, proposalType = 'unk
     async getIssue() { return proposalFixture ? { id: '44444444-4444-4444-8444-444444444444', type: proposalType, code: proposalType === 'refund_cogs_review' ? 'REFUND_COGS_REVIEW' : 'UNKNOWN_ITEM', source_refs: proposalType === 'refund_cogs_review' ? ['refund-1','order-1'] : ['order-1:line-1'], details: { message: 'Human decision needed.', period_start: '2026-07-03T04:00:00Z', period_end: '2026-10-02T04:00:00Z' }, policyVersion: proposalPolicyVersion, allowedCategories: proposalType === 'unknown_item' ? ['inventory_item'] : [] } : null; },
     async getIssueEvidence() { return proposalFixture ? [{ id: 'source-1', type: 'sale_line', catalog_object_id: null, quantity: 1.5 }] : []; },
     async recordItemDefinition(arg) { calls.push(['item-definition', arg]); return { id: 'item-definition-1', version: 1 }; },
+    async recordSaleLineCostOverride(arg) { calls.push(['sale-line-cost', arg]); return { id: 'line-cost-override-1', orderId: 'order-1', lineUid: 'line-1' }; },
     async recordRefundCostReview(arg) { calls.push(['refund-review', arg]); return { id: 'refund-review-1' }; },
     async createProposalAtomic(arg) { calls.push(['proposal', arg]); return { id: 'proposal' }; },
     async reserveModelBudget() { return budgetAllowed; }, async recordModelUsage() {},
@@ -189,6 +190,24 @@ test('approved item cost is recorded against issue evidence and queues historica
   assert.deepEqual(calls.find(x => x[0] === 'projection-replay')[1], {
     organizationId: org, startAt: '2026-07-03T04:00:00.000Z', endAt: '2026-10-02T04:00:00.000Z',
     idempotencyKey: `item-cost:${issueId}:item-cost:1`, requestedBy: user
+  });
+});
+
+test('catalog-less Square lines receive a source-linked one-line cost override and historical replay', async () => {
+  const { handlers, calls } = setup({ role: 'reviewer', proposalFixture: true });
+  const issueId = '44444444-4444-4444-8444-444444444444';
+  const saleLineId = '66666666-6666-4666-8666-666666666666';
+  const body = { organizationId: org, saleLineId, unitCostMinor: 425, currency: 'USD',
+    reason: 'Supplier invoice confirms the cost of this line.' };
+  const response = await handlers.saleLineCost(post(`/api/issues/${issueId}/line-cost`, body, { 'idempotency-key': 'line-cost:1' }));
+  assert.equal(response.status, 201);
+  assert.deepEqual(await read(response), { id: 'line-cost-override-1', orderId: 'order-1', lineUid: 'line-1', projectionJobId: 'replay-1', projectionQueued: true });
+  const correction = calls.find(x => x[0] === 'sale-line-cost')[1];
+  assert.equal(correction.saleLineId, saleLineId);
+  assert.equal(correction.unitCostMinor, 425);
+  assert.deepEqual(calls.find(x => x[0] === 'projection-replay')[1], {
+    organizationId: org, startAt: '2026-07-03T04:00:00.000Z', endAt: '2026-10-02T04:00:00.000Z',
+    idempotencyKey: `line-cost:${issueId}:line-cost:1`, requestedBy: user
   });
 });
 

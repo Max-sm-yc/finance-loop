@@ -68,17 +68,25 @@ test('human finance corrections use caller authorization while projection replay
   await adapters.db.recordRefundCostReview({ organizationId: org, issueId: 'issue-id', squareRefundId: 'refund-1',
     squareOrderId: 'order-1', disposition: 'not_returned_to_inventory', approvedCogsReversalMinor: 0,
     currency: 'USD', reason: 'Merchant confirmed no restock.', idempotencyKey: 'refund:1', accessToken: userJwt });
+  await adapters.db.recordSaleLineCostOverride({ organizationId: org, issueId: 'issue-id', saleLineId: 'line-row-id',
+    unitCostMinor: 425, currency: 'USD', reason: 'Supplier invoice confirms this cost.',
+    idempotencyKey: 'line-cost:1', accessToken: userJwt });
   await adapters.queue.enqueueProjectionReplay({ organizationId: org, startAt: '2026-07-03T04:00:00Z',
     endAt: '2026-10-02T04:00:00Z', idempotencyKey: 'replay:1', requestedBy: 'user-id' });
   assert.deepEqual(calls.map(call => call.url.split('/').at(-1)), [
-    'record_item_definition', 'record_refund_cost_review', 'enqueue_projection_replay'
+    'record_item_definition', 'record_refund_cost_review', 'record_sale_line_cost_override', 'enqueue_projection_replay'
   ]);
-  assert.ok(calls.slice(0, 2).every(call => call.headers.get('authorization') === `Bearer ${userJwt}`));
-  assert.equal(calls[2].headers.get('authorization'), `Bearer ${serviceKey}`);
+  assert.ok(calls.slice(0, 3).every(call => call.headers.get('authorization') === `Bearer ${userJwt}`));
+  assert.equal(calls[3].headers.get('authorization'), `Bearer ${serviceKey}`);
   assert.deepEqual(calls[0].body, {
     p_organization_id: org, p_issue_id: 'issue-id', p_square_catalog_object_id: 'variation-1', p_name: 'Tea',
     p_unit_cost_minor: 425, p_currency: 'USD', p_effective_from: '2026-07-03T04:00:00Z',
     p_approval_reason: 'Supplier invoice confirmed.', p_idempotency_key: 'cost:1'
+  });
+  assert.deepEqual(calls[2].body, {
+    p_organization_id: org, p_issue_id: 'issue-id', p_sale_line_id: 'line-row-id',
+    p_unit_cost_minor: 425, p_currency: 'USD', p_approval_reason: 'Supplier invoice confirms this cost.',
+    p_idempotency_key: 'line-cost:1'
   });
 });
 
@@ -196,6 +204,7 @@ test('worker projection snapshot maps Square income, refunds, approved costs, an
           { kind: 'refund', objectId: 'refund-1', version: '1', status: 'COMPLETED', currency: 'USD', amountMinor: 250, occurredAt: '2026-09-20T12:00:00Z' },
         ],
         itemDefinitions: [{ square_catalog_object_id: 'variation-1', unit_cost_minor: '400', currency: 'USD', effective_from: '2026-01-01T00:00:00Z', effective_until: null }],
+        lineCostOverrides: [{ square_order_id: 'order-1', square_line_uid: 'line-1', unit_cost_minor: '550', currency: 'USD' }],
         refundReviews: [{ square_refund_id: 'refund-1', square_order_id: 'order-1', disposition: 'returned_to_inventory', approved_cogs_reversal_minor: 400, currency: 'USD' }],
         accounts: [{ id: 'bank-1', currency: 'USD', opening_balance_minor: 10000, opening_balance_at: '2026-09-01T00:00:00Z' }],
         observations: [{ id: 'obs-1', account_id: 'bank-1', amount_minor: 12000, currency: 'USD', observed_at: '2026-09-30T00:00:00Z' }],
@@ -206,7 +215,7 @@ test('worker projection snapshot maps Square income, refunds, approved costs, an
   const { sourceRevision, snapshot } = await adapters.db.getProjectionSnapshot({ organizationId: org, sourceRevision: 9, startAt, endAt });
   assert.equal(sourceRevision, 9);
   assert.equal(snapshot.lines[0].status, 'completed');
-  assert.equal(snapshot.lines[0].unitCostMinor, 400);
+  assert.equal(snapshot.lines[0].unitCostMinor, 550);
   assert.equal(snapshot.fees[0].amountMinor, 60);
   assert.equal(snapshot.refunds[0].amountMinor, 250);
   assert.equal(snapshot.refunds[0].reviewDisposition, 'returned_to_inventory');

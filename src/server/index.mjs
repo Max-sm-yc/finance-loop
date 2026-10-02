@@ -15,7 +15,7 @@ const created = data => response(201, data);
 const bad = (status, code) => response(status, { error: code, code });
 function requireAdapters({ supabase, db, queue, config }) {
   if (!supabase?.auth?.getUser || !db || !queue || !config) throw new TypeError('Supabase auth, durable DB/queue adapters, and config are required');
-  const required = ['getMembership', 'getDashboard', 'listIssues', 'listManualMovements', 'listObservations', 'listAuditEvents', 'getSettings', 'getIssue', 'getIssueEvidence', 'recordItemDefinition', 'recordRefundCostReview', 'createProposalAtomic', 'reserveModelBudget', 'recordModelUsage', 'getReplaySnapshot', 'saveProjectionRun', 'asUser'];
+  const required = ['getMembership', 'getDashboard', 'listIssues', 'listManualMovements', 'listObservations', 'listAuditEvents', 'getSettings', 'getIssue', 'getIssueEvidence', 'recordItemDefinition', 'recordSaleLineCostOverride', 'recordRefundCostReview', 'createProposalAtomic', 'reserveModelBudget', 'recordModelUsage', 'getReplaySnapshot', 'saveProjectionRun', 'asUser'];
   for (const method of required) if (typeof db[method] !== 'function') throw new TypeError(`db.${method} durable adapter method is required`);
   for (const method of ['enqueueSquareSync', 'enqueueSquareWebhook', 'enqueueProjectionReplay']) if (typeof queue[method] !== 'function') throw new TypeError(`queue.${method} durable adapter method is required`);
   return { supabase, db, queue, config };
@@ -180,6 +180,28 @@ export function createHandlers(adapters) {
       idempotencyKey: `item-cost:${issue.id}:${key}`, requestedBy: actor.userId });
     return created({ ...definition, projectionJobId: replay.id, projectionQueued: true });
   });
+  const saleLineCost = run(async req => {
+    if (req.method !== 'POST') throw new HttpError(405, 'METHOD_NOT_ALLOWED');
+    const body = await readJson(req); const key = idempotency(req);
+    if (!exactObject(body, ['organizationId','saleLineId','unitCostMinor','currency','reason'])
+        || !UUID.test(body.organizationId) || !UUID.test(body.saleLineId)
+        || !Number.isSafeInteger(body.unitCostMinor) || body.unitCostMinor < 0 || body.unitCostMinor >= 1_000_000_000_000
+        || !/^[A-Z]{3}$/.test(body.currency) || !text(body.reason, 1000) || body.reason.trim().length < 10) {
+      throw new HttpError(400, 'INVALID_SALE_LINE_COST');
+    }
+    const actor = await authorize(req, body.organizationId, ['owner','reviewer']);
+    const issueId = new URL(req.url).pathname.split('/').at(-2) ?? '';
+    if (!UUID.test(issueId)) throw new HttpError(400, 'INVALID_ISSUE_ID');
+    const issue = await db.getIssue({ organizationId: body.organizationId, issueId, accessToken: actor.accessToken });
+    if (!issue || issue.code !== 'UNKNOWN_ITEM' || issue.state === 'resolved') throw new HttpError(404, 'UNKNOWN_ITEM_ISSUE_NOT_FOUND');
+    const window = correctionWindow(issue);
+    const override = await db.recordSaleLineCostOverride({ organizationId: body.organizationId, issueId: issue.id,
+      saleLineId: body.saleLineId, unitCostMinor: body.unitCostMinor, currency: body.currency,
+      reason: body.reason.trim(), idempotencyKey: key, accessToken: actor.accessToken });
+    const replay = await queue.enqueueProjectionReplay({ organizationId: body.organizationId, ...window,
+      idempotencyKey: `line-cost:${issue.id}:${key}`, requestedBy: actor.userId });
+    return created({ ...override, projectionJobId: replay.id, projectionQueued: true });
+  });
   const refundReview = run(async req => {
     if (req.method !== 'POST') throw new HttpError(405, 'METHOD_NOT_ALLOWED');
     const body = await readJson(req); const key = idempotency(req);
@@ -338,5 +360,5 @@ export function createHandlers(adapters) {
     return ok(result);
   });
 
-  return Object.freeze({ dashboard, issues, issueEvidence, audit, settings, evidence, evidenceUrl, manualMovement, manualMovements, observation, observations, proposal, itemCost, refundReview, decision, replay, sync, webhook });
+  return Object.freeze({ dashboard, issues, issueEvidence, audit, settings, evidence, evidenceUrl, manualMovement, manualMovements, observation, observations, proposal, itemCost, saleLineCost, refundReview, decision, replay, sync, webhook });
 }
