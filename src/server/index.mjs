@@ -66,7 +66,7 @@ function safeThrown(error) {
     const status = error.code === 'INVALID_INPUT' ? 400 : 503;
     // DiagnosisError messages are generated from fixed validation checks and
     // contain no provider response bodies, credentials, or submitted evidence.
-    if (error.code === 'INVALID_INPUT') return response(status, { error: error.code, code: error.code, detail: error.message });
+    if (error.code === 'INVALID_INPUT' || error.code === 'BUDGET_EXCEEDED') return response(status, { error: error.code, code: error.code, detail: error.message });
     return bad(status, error.code);
   }
   // Never return adapter/provider error strings or SQL details to the client.

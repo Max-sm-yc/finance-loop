@@ -7,7 +7,7 @@ const org = '11111111-1111-4111-8111-111111111111';
 const account = '22222222-2222-4222-8222-222222222222';
 const user = '33333333-3333-4333-8333-333333333333';
 
-function setup({ role = 'operator', proposalFixture = false, proposalType = 'unknown_item', proposalPolicyVersion = 'policy-v1', fetchImpl } = {}) {
+function setup({ role = 'operator', proposalFixture = false, proposalType = 'unknown_item', proposalPolicyVersion = 'policy-v1', fetchImpl, budgetAllowed = true } = {}) {
   const calls = [];
   const inboxIds = new Set();
   const db = {
@@ -21,7 +21,7 @@ function setup({ role = 'operator', proposalFixture = false, proposalType = 'unk
     async getIssue() { return proposalFixture ? { id: '44444444-4444-4444-8444-444444444444', type: proposalType, code: proposalType === 'refund_cogs_review' ? 'REFUND_COGS_REVIEW' : 'UNKNOWN_ITEM', details: { message: 'Human decision needed.' }, policyVersion: proposalPolicyVersion, allowedCategories: proposalType === 'unknown_item' ? ['inventory_item'] : [] } : null; },
     async getIssueEvidence() { return proposalFixture ? [{ id: 'source-1', type: 'sale_line', catalog_object_id: null, quantity: 1.5 }] : []; },
     async createProposalAtomic(arg) { calls.push(['proposal', arg]); return { id: 'proposal' }; },
-    async reserveModelBudget() { return true; }, async recordModelUsage() {},
+    async reserveModelBudget() { return budgetAllowed; }, async recordModelUsage() {},
     async getReplaySnapshot() { return null; }, async saveProjectionRun() { return {}; },
     asUser(token) { calls.push(['asUser', token]); return { async rpc(name, args) { calls.push(['rpc', name, args]); return { data: 'new-id', error: null }; } }; }
   };
@@ -149,6 +149,17 @@ test('proposal input failures return a safe validation detail for diagnosis', as
   assert.equal(response.status, 400);
   assert.deepEqual(await read(response), {
     error: 'INVALID_INPUT', code: 'INVALID_INPUT', detail: 'Invalid issue or policy version'
+  });
+});
+
+test('proposal budget failures explain the organization budget and per-issue daily reservation', async () => {
+  const { handlers } = setup({ proposalFixture: true, budgetAllowed: false });
+  const issueId = '44444444-4444-4444-8444-444444444444';
+  const response = await handlers.proposal(post('/api/proposals', { organizationId: org, issueId }, { 'idempotency-key': 'proposal-budget-denied:1' }));
+  assert.equal(response.status, 503);
+  assert.deepEqual(await read(response), {
+    error: 'BUDGET_EXCEEDED', code: 'BUDGET_EXCEEDED',
+    detail: 'The organization daily token budget is exhausted, or this issue already has a reservation today'
   });
 });
 
