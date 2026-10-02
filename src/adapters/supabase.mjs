@@ -1,8 +1,17 @@
+import { SUPPORTED_DIAGNOSIS_ISSUE_TYPES } from '../agent/diagnosis.mjs';
+
 const requiredString = (value, name) => {
   if (typeof value !== 'string' || !value.trim()) throw new TypeError(`${name} is required`);
   return value.replace(/\/$/, '');
 };
 const SQUARE_FACT_BATCH_SIZE = 500;
+const ISSUE_TYPE_BY_CODE = Object.freeze({
+  UNKNOWN_ITEM: 'unknown_item',
+  AMBIGUOUS_CLASSIFICATION: 'ambiguous_transaction',
+  BALANCE_MISMATCH: 'balance_mismatch',
+  UNSUPPORTED_ACTIVITY: 'unsupported_activity',
+  REFUND_COGS_REVIEW: 'refund_cogs_review',
+});
 
 function safeError(payload, status) {
   const error = new Error(`Supabase request failed (${status})`);
@@ -361,6 +370,7 @@ export function createSupabaseAdapters({ url, publishableKey, secretKey, tokenEn
       const rows = await table(userRest(accessToken), 'issues', query);
       return rows.map(({ proposals, details, ...issue }) => ({
         ...issue,
+        proposal_supported: SUPPORTED_DIAGNOSIS_ISSUE_TYPES.includes(details?.issue_type ?? ISSUE_TYPE_BY_CODE[issue.code]),
         title: typeof details?.title === 'string' ? details.title.slice(0, 200) : undefined,
         details: { ...(typeof details?.message === 'string' ? { message: details.message.slice(0, 1000) } : {}), ...(typeof details?.description === 'string' ? { description: details.description.slice(0, 1000) } : {}) },
         proposals: (Array.isArray(proposals) ? proposals : []).filter(proposal => proposal.decision === 'pending').map(proposal => ({
@@ -419,8 +429,18 @@ export function createSupabaseAdapters({ url, publishableKey, secretKey, tokenEn
       const query = new URLSearchParams({ select: '*', organization_id: eq(organizationId), id: eq(issueId), limit: '2' });
       const row = one(await table(userRest(accessToken), 'issues', query), 'issue');
       if (!row) return null;
-      const typeByCode = { UNKNOWN_ITEM: 'unknown_item', AMBIGUOUS_CLASSIFICATION: 'ambiguous_transaction', BALANCE_MISMATCH: 'balance_mismatch', UNSUPPORTED_ACTIVITY: 'unsupported_activity', REFUND_COGS_REVIEW: 'refund_cogs_review' };
-      return { ...row, type: row.details?.issue_type ?? typeByCode[row.code], policyVersion: row.details?.policy_version ?? null, allowedCategories: row.details?.allowed_categories ?? [] };
+      const type = row.details?.issue_type ?? ISSUE_TYPE_BY_CODE[row.code];
+      return {
+        ...row,
+        type,
+        // Projection issues carry the accounting calculation version rather
+        // than a separate diagnosis policy version. Reuse it as the stable
+        // policy context for a proposal, with a safe fallback for older rows.
+        policyVersion: row.details?.policy_version ?? row.details?.calculation_version ?? 'finance-loop-accounting-v1',
+        // No category is allowed unless the issue explicitly supplies a
+        // reviewed allowlist. That keeps proposals from inventing costs.
+        allowedCategories: Array.isArray(row.details?.allowed_categories) ? row.details.allowed_categories : [],
+      };
     },
     async getIssueEvidence({ organizationId, issueId, accessToken }) {
       const issue = await db.getIssue({ organizationId, issueId, accessToken });
@@ -428,13 +448,28 @@ export function createSupabaseAdapters({ url, publishableKey, secretKey, tokenEn
       const ids = Array.isArray(issue.source_refs) ? issue.source_refs.filter(x => typeof x === 'string') : [];
       const uuids = ids.filter(x => /^[0-9a-f-]{36}$/i.test(x));
       const providerIds = ids.filter(x => /^[A-Za-z0-9:_-]{1,200}$/.test(x) && !uuids.includes(x));
+      const orderIds = [];
+      const lineRefs = [];
+      for (const id of providerIds) {
+        const separator = id.indexOf(':');
+        if (separator > 0) {
+          const orderId = id.slice(0, separator);
+          const lineId = id.slice(separator + 1);
+          if (/^[A-Za-z0-9_-]{1,200}$/.test(orderId) && /^[A-Za-z0-9_-]{1,200}$/.test(lineId)) {
+            lineRefs.push({ orderId, lineId });
+            continue;
+          }
+        }
+        orderIds.push(id);
+      }
       if (!uuids.length && !providerIds.length) return [];
       const clauses = [];
       if (uuids.length) clauses.push(`source_event_id.in.(${uuids.join(',')})`);
-      if (providerIds.length) clauses.push(`square_order_id.in.(${providerIds.join(',')})`);
+      if (orderIds.length) clauses.push(`square_order_id.in.(${orderIds.join(',')})`);
+      for (const { orderId, lineId } of lineRefs) clauses.push(`and(square_order_id.eq.${orderId},square_line_uid.eq.${lineId})`);
       const query = new URLSearchParams({ select: 'id,source_event_id,square_order_id,square_line_uid,square_catalog_object_id,item_name,quantity,gross_minor,discount_minor,refund_minor,currency,sold_at', organization_id: eq(organizationId), or: `(${clauses.join(',')})`, limit: '500' });
       const lines = (await table(userRest(accessToken), 'sale_lines', query)).slice(0, 20);
-      return lines.map(row => ({ id: row.id, type: 'sale_line', occurred_at: row.sold_at, currency: row.currency, amount_minor: row.gross_minor, catalog_object_id: row.square_catalog_object_id, item_name: String(row.item_name ?? '').slice(0, 256), provider_object_id: String(row.square_order_id ?? '').slice(0, 200), line_id: String(row.square_line_uid ?? '').slice(0, 200) }));
+      return lines.map(row => ({ id: row.id, type: 'sale_line', occurred_at: row.sold_at, currency: row.currency, amount_minor: row.gross_minor, refund_minor: row.refund_minor, quantity: row.quantity, catalog_object_id: row.square_catalog_object_id, item_name: String(row.item_name ?? '').slice(0, 256), provider_object_id: String(row.square_order_id ?? '').slice(0, 200), line_id: String(row.square_line_uid ?? '').slice(0, 200) }));
     },
     async createProposalAtomic(args) {
       const { data, error } = await userRest(args.accessToken).rpc('create_proposal_atomic', {

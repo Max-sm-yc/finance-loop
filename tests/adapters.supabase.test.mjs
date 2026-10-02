@@ -219,7 +219,7 @@ test('issue evidence uses stable unique sale-line ids and organization-scoped Sq
     url: 'https://tenant.supabase.test', publishableKey: 'publishable',
     fetchImpl: async url => {
       calls.push(String(url));
-      if (String(url).includes('/issues?')) return response([{ id: issueId, code: 'UNKNOWN_ITEM', details: {}, source_refs: [sourceId, 'order:456'] }]);
+      if (String(url).includes('/issues?')) return response([{ id: issueId, code: 'UNKNOWN_ITEM', details: {}, source_refs: [sourceId, 'order:456', 'another-order'] }]);
       if (String(url).includes('/sale_lines?')) return response([
         { id: 'line-1', source_event_id: sourceId, square_order_id: 'order:456', item_name: 'A', sold_at: '2026-01-01T00:00:00Z' },
         { id: 'line-2', source_event_id: sourceId, square_order_id: 'order:456', item_name: 'B', sold_at: '2026-01-01T00:00:00Z' }
@@ -233,6 +233,27 @@ test('issue evidence uses stable unique sale-line ids and organization-scoped Sq
   assert.equal(query.searchParams.get('organization_id'), `eq.${org}`);
   assert.match(query.searchParams.get('or'), /source_event_id\.in\./);
   assert.match(query.searchParams.get('or'), /square_order_id\.in\./);
+  assert.match(query.searchParams.get('or'), /and\(square_order_id\.eq\.order,square_line_uid\.eq\.456\)/);
+});
+
+test('projection issues use their calculation version for proposal context and support refund review drafts', async () => {
+  const issueId = '44444444-4444-4444-8444-444444444444';
+  const adapters = createSupabaseAdapters({
+    url: 'https://tenant.supabase.test', publishableKey: 'publishable',
+    fetchImpl: async url => {
+      if (String(url).includes('/issues?')) return response([{
+        id: issueId,
+        code: 'REFUND_COGS_REVIEW',
+        details: { origin: 'projection', calculation_version: 'finance-loop-accounting-v1', message: 'Confirm returned inventory.' },
+        source_refs: ['refund-1', 'order-1'],
+      }]);
+      throw new Error(`Unexpected request ${url}`);
+    }
+  });
+  const issue = await adapters.db.getIssue({ organizationId: org, issueId, accessToken: userJwt });
+  assert.equal(issue.type, 'refund_cogs_review');
+  assert.equal(issue.policyVersion, 'finance-loop-accounting-v1');
+  assert.deepEqual(issue.allowedCategories, []);
 });
 
 test('issue list carries pending review id/revision and only the bounded proposal summary', async () => {
@@ -251,6 +272,7 @@ test('issue list carries pending review id/revision and only the bounded proposa
   assert.equal(issue.proposals[0].payload.rationale, 'Source does not include approved cost.');
   assert.equal(issue.proposals[0].payload.secret, undefined);
   assert.equal(issue.proposals[0].modelId, undefined);
+  assert.equal(issue.proposal_supported, true);
   assert.equal(issue.details.secretDebug, undefined);
   const url = new URL(requestUrl);
   assert.equal(url.searchParams.get('organization_id'), `eq.${org}`);

@@ -5,9 +5,12 @@ export const PROMPT_VERSION = 'diagnosis-v1';
 export const MAX_PROMPT_CHARS = 8_000;
 const ENDPOINT = 'https://openrouter.ai/api/v1/chat/completions';
 const CATEGORIES = new Set(['inventory_item', 'service_revenue', 'cash_deposit', 'purchase', 'pay', 'misc_spend', 'transfer', 'refund', 'exclude']);
-const ISSUE_TYPES = new Set(['unknown_item', 'ambiguous_transaction', 'balance_mismatch', 'unsupported_activity']);
+export const SUPPORTED_DIAGNOSIS_ISSUE_TYPES = Object.freeze([
+  'unknown_item', 'ambiguous_transaction', 'balance_mismatch', 'unsupported_activity', 'refund_cogs_review'
+]);
+const ISSUE_TYPES = new Set(SUPPORTED_DIAGNOSIS_ISSUE_TYPES);
 const FIELDS = ['issue_type', 'candidate_source_ids', 'proposed_category', 'confidence', 'rationale', 'missing_evidence', 'question', 'policy_version'];
-const SAFE_RECORD_FIELDS = ['id', 'type', 'occurred_at', 'currency', 'amount_minor', 'catalog_object_id', 'sku', 'item_name', 'account_id', 'provider_object_id'];
+const SAFE_RECORD_FIELDS = ['id', 'type', 'occurred_at', 'currency', 'amount_minor', 'refund_minor', 'quantity', 'catalog_object_id', 'sku', 'item_name', 'account_id', 'provider_object_id', 'line_id'];
 
 export class DiagnosisError extends Error {
   constructor(code, message) { super(message); this.name = 'DiagnosisError'; this.code = code; }
@@ -43,8 +46,9 @@ export function redactEvidence(records) {
     if (!record || !isText(record.id, 1, 200)) throw new DiagnosisError('INVALID_INPUT', 'Evidence requires a stable ID');
     return Object.fromEntries(SAFE_RECORD_FIELDS.filter(key => record[key] !== undefined).map(key => {
       const value = record[key];
+      if (value === null) return [key, null];
       if (typeof value === 'string') return [key, value.slice(0, 200)];
-      if (typeof value === 'number' && Number.isSafeInteger(value)) return [key, value];
+      if (typeof value === 'number' && (Number.isSafeInteger(value) || (key === 'quantity' && Number.isFinite(value) && Math.abs(value) <= 1_000_000))) return [key, value];
       throw new DiagnosisError('INVALID_INPUT', `Invalid evidence field ${key}`);
     }));
   });
@@ -73,7 +77,7 @@ export async function diagnoseIssue({ issue, records, policyVersion, allowedCate
     response_format: { type: 'json_schema', json_schema: { name: 'finance_loop_diagnosis', strict: true, schema } },
     messages: [
       { role: 'system', content: 'Draft an evidence-bound investigation proposal. Cite only supplied stable IDs. Never calculate money, invent transactions, or assume missing facts. Use null category and ask a question when evidence is insufficient. Return only JSON matching the schema.' },
-      { role: 'user', content: JSON.stringify({ issue: { id: issue.id, type: issue.type, code: String(issue.code ?? '').slice(0, 100) }, evidence, policy_version: policyVersion, allowed_categories: [...categorySet] }) }
+      { role: 'user', content: JSON.stringify({ issue: { id: issue.id, type: issue.type, code: String(issue.code ?? '').slice(0, 100), summary: String(issue.details?.message ?? '').slice(0, 1_000) }, evidence, policy_version: policyVersion, allowed_categories: [...categorySet] }) }
     ]
   };
   if (body.messages[1].content.length > MAX_PROMPT_CHARS) throw new DiagnosisError('INVALID_INPUT', 'Evidence is too large for bounded diagnosis');

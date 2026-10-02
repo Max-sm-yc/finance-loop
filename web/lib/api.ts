@@ -32,6 +32,6 @@ export type Dashboard = {
   accounts?: Array<{ id: string; name: string; currency: string; kind?: string }>;
   flags?: Array<{ code: string; message: string; severity?: string }>;
 };
-export type Issue = { id: string; code?: string; state: string; title?: string; details?: Record<string, unknown>; source_refs?: string[]; updated_at?: string; revision?: number; proposals?: Array<{ id: string; decision: string; revision?: number; proposal?: unknown; payload?: unknown }> };
+export type Issue = { id: string; code?: string; state: string; title?: string; details?: Record<string, unknown>; source_refs?: string[]; updated_at?: string; revision?: number; proposal_supported?: boolean; proposals?: Array<{ id: string; decision: string; revision?: number; proposal?: unknown; payload?: unknown }> };
 export type Movement = { id: string; kind: string; amount_minor: number; currency: string; occurred_at: string; description: string; evidence_ref?: string | null; account_id: string };
 export type AuditEvent = { id: string; event_type?: string; action?: string; actor_id?: string; actor_user_id?: string | null; actor_kind?: string; entity_type?: string; entity_id?: string | null; created_at: string; reason?: string; payload?: Record<string, unknown>; details?: Record<string, unknown>; source_refs?: string[]; revision?: number };

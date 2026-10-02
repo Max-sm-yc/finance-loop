@@ -16,7 +16,7 @@
   "properties": {
     "issue_type": {
       "type": "string",
-      "enum": ["unknown_item", "ambiguous_transaction", "balance_mismatch", "unsupported_activity"]
+      "enum": ["unknown_item", "ambiguous_transaction", "balance_mismatch", "unsupported_activity", "refund_cogs_review"]
     },
     "candidate_source_ids": {
       "type": "array",

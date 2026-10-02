@@ -17,6 +17,20 @@ test('rejects invented evidence, unauthorized category, extra arithmetic, and wr
   assert.deepEqual(validateDiagnosis(proposal, context), proposal);
 });
 
+test('accepts a refund COGS review draft that asks for human evidence without deciding a category', () => {
+  const draft = {
+    issue_type: 'refund_cogs_review', candidate_source_ids: ['refund-1'], proposed_category: null,
+    confidence: 0.8, rationale: 'The linked refund does not show whether goods returned to inventory.',
+    missing_evidence: ['Return and restock disposition'],
+    question: 'Were the refunded goods returned to inventory, and should COGS be reversed?',
+    policy_version: 'finance-loop-accounting-v1'
+  };
+  assert.deepEqual(validateDiagnosis(draft, {
+    issueType: 'refund_cogs_review', sourceIds: new Set(['refund-1']),
+    policyVersion: 'finance-loop-accounting-v1', allowedCategories: new Set()
+  }), draft);
+});
+
 test('sends only allowlisted evidence and returns an unposted draft', async () => {
   let requestBody;
   const result = await diagnoseIssue({
@@ -46,4 +60,7 @@ test('budget denial prevents model call and invalid JSON fails closed', async ()
 
 test('redacts unsupported fields', () => {
   assert.deepEqual(redactEvidence([{ id: 'r', amount_minor: 2, email: 'private' }]), [{ id: 'r', amount_minor: 2 }]);
+  assert.deepEqual(redactEvidence([{ id: 'line', catalog_object_id: null, quantity: 1.25, refund_minor: null }]), [
+    { id: 'line', refund_minor: null, quantity: 1.25, catalog_object_id: null }
+  ]);
 });

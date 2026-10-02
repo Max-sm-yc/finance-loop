@@ -1,5 +1,5 @@
 import { acceptSquareWebhook } from '../square/webhooks.mjs';
-import { diagnoseIssue, DiagnosisError } from '../agent/diagnosis.mjs';
+import { diagnoseIssue, DiagnosisError, SUPPORTED_DIAGNOSIS_ISSUE_TYPES } from '../agent/diagnosis.mjs';
 import { createHash, randomUUID } from 'node:crypto';
 
 const JSON_HEADERS = { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' };
@@ -131,6 +131,7 @@ export function createHandlers(adapters) {
     const actor = await authorize(req, body.organizationId, ['owner','operator']);
     const issue = await db.getIssue({ organizationId: body.organizationId, issueId: body.issueId, accessToken: actor.accessToken });
     if (!issue) throw new HttpError(404, 'ISSUE_NOT_FOUND');
+    if (!SUPPORTED_DIAGNOSIS_ISSUE_TYPES.includes(issue.type)) throw new HttpError(422, 'PROPOSAL_UNAVAILABLE');
     const evidence = await db.getIssueEvidence({ organizationId: body.organizationId, issueId: body.issueId, accessToken: actor.accessToken });
     const draft = await diagnoseIssue({ issue: { id: issue.id, type: issue.type, code: issue.code, details: issue.details }, records: evidence, policyVersion: issue.policyVersion, allowedCategories: issue.allowedCategories }, {
       apiKey: config.openRouterApiKey,

@@ -7,7 +7,7 @@ const org = '11111111-1111-4111-8111-111111111111';
 const account = '22222222-2222-4222-8222-222222222222';
 const user = '33333333-3333-4333-8333-333333333333';
 
-function setup({ role = 'operator', proposalFixture = false, fetchImpl } = {}) {
+function setup({ role = 'operator', proposalFixture = false, proposalType = 'unknown_item', fetchImpl } = {}) {
   const calls = [];
   const inboxIds = new Set();
   const db = {
@@ -18,8 +18,8 @@ function setup({ role = 'operator', proposalFixture = false, fetchImpl } = {}) {
     async listObservations(arg) { calls.push(['observations', arg]); return []; },
     async listAuditEvents(arg) { calls.push(['audit', arg]); return []; },
     async getSettings(arg) { calls.push(['settings', arg]); return {}; },
-    async getIssue() { return proposalFixture ? { id: '44444444-4444-4444-8444-444444444444', type: 'unknown_item', code: 'UNKNOWN_ITEM', details: {}, policyVersion: 'policy-v1', allowedCategories: ['inventory_item'] } : null; },
-    async getIssueEvidence() { return proposalFixture ? [{ id: 'source-1', type: 'catalog', catalog_object_id: 'v1' }] : []; },
+    async getIssue() { return proposalFixture ? { id: '44444444-4444-4444-8444-444444444444', type: proposalType, code: proposalType === 'refund_cogs_review' ? 'REFUND_COGS_REVIEW' : 'UNKNOWN_ITEM', details: { message: 'Human decision needed.' }, policyVersion: 'policy-v1', allowedCategories: proposalType === 'unknown_item' ? ['inventory_item'] : [] } : null; },
+    async getIssueEvidence() { return proposalFixture ? [{ id: 'source-1', type: 'sale_line', catalog_object_id: null, quantity: 1.5 }] : []; },
     async createProposalAtomic(arg) { calls.push(['proposal', arg]); return { id: 'proposal' }; },
     async reserveModelBudget() { return true; }, async recordModelUsage() {},
     async getReplaySnapshot() { return null; }, async saveProjectionRun() { return {}; },
@@ -116,6 +116,30 @@ test('issue proposal runs a budgeted model draft, persists only the validated pr
   assert.deepEqual(persisted.proposal, proposal);
   assert.equal(persisted.decision, 'pending');
   assert.equal(calls.some(x => x[0] === 'rpc'), false);
+});
+
+test('refund COGS review proposal can ask for a human decision while unsupported issue types are rejected clearly', async () => {
+  const proposal = {
+    issue_type: 'refund_cogs_review', candidate_source_ids: ['source-1'], proposed_category: null,
+    confidence: 0.8, rationale: 'Evidence does not establish whether the returned goods were restocked.',
+    missing_evidence: ['Return and restock disposition'],
+    question: 'Were the refunded goods returned to inventory, and should COGS be reversed?',
+    policy_version: 'policy-v1'
+  };
+  const fetchImpl = async (_url, init) => new Response(JSON.stringify({
+    choices: [{ message: { content: JSON.stringify(proposal) } }], usage: { total_tokens: 12 }
+  }), { status: 200 });
+  const refund = setup({ proposalFixture: true, proposalType: 'refund_cogs_review', fetchImpl });
+  const issueId = '44444444-4444-4444-8444-444444444444';
+  const response = await refund.handlers.proposal(post('/api/proposals', { organizationId: org, issueId }, { 'idempotency-key': 'refund-proposal:1' }));
+  assert.equal(response.status, 201);
+  assert.equal((await read(response)).id, 'proposal');
+  assert.equal(refund.calls.find(x => x[0] === 'proposal')[1].proposal.issue_type, 'refund_cogs_review');
+
+  const unsupported = setup({ proposalFixture: true, proposalType: 'source_gap' });
+  const rejected = await unsupported.handlers.proposal(post('/api/proposals', { organizationId: org, issueId }, { 'idempotency-key': 'unsupported-proposal:1' }));
+  assert.equal(rejected.status, 422);
+  assert.deepEqual(await read(rejected), { error: 'PROPOSAL_UNAVAILABLE', code: 'PROPOSAL_UNAVAILABLE' });
 });
 
 test('read endpoints expose issues, audit, and settings in a data envelope', async () => {
