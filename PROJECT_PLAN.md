@@ -89,6 +89,8 @@ operational_margin = net_sales - COGS - actual Square processing fees
 
 Exact tax, tip, service charge and fee treatment is a merchant policy fixed before production. Reconcile order totals to payment totals and flag any unexplained difference. If an item cost or currency is missing, show an **incomplete** margin rather than zero cost.
 
+For a Square sale line with neither an item name nor a catalog variation, the merchant-approved pass-through policy sets that exact line's unit COGS to the unit price supported by Square sale evidence. If only an extended line amount is available, derive a unit amount only when it divides evenly by a positive whole quantity; otherwise leave the cost unresolved. Record the assumption in the audited line-specific approval. This rule does not create a cost for other or future sales.
+
 For a named account `A`, cutoff `T`, and opening balance observation `B0`:
 
 ```text
@@ -115,6 +117,7 @@ The agent receives only necessary records with stable IDs and redacted sensitive
 `monitoring → diagnosing → [item_proposed | awaiting_clarification | resolved | failed] → monitoring`
 
 - Unknown Square catalog variation: locate exact catalog ID and candidate metadata. If approved cost is absent, hold COGS for affected sales. The agent may draft an item definition; the reviewer supplies cost and effective date.
+- Unnamed sale line with no catalog variation: offer the Square-supported unit price as a pass-through cost for that exact line, with the assumption recorded in the human approval reason. If source amounts do not support an exact per-unit value, leave the cost unresolved.
 - Ambiguous transaction: ask a targeted question showing the source record and why classification matters. After human response, recompute affected projections.
 - Invalid or missing source facts: fail with a reason code and retry policy. Do not fabricate an item or classify from a plausible name alone.
 

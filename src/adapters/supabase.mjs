@@ -184,13 +184,19 @@ function issueEvidenceFromFacts(issue, facts) {
     if (itemName && variationName && itemName !== variationName) return `${itemName} — ${variationName}`.slice(0, 256);
     return (itemName || variationName).slice(0, 256);
   };
-  const lineEvidence = fact => ({
-    id: String(fact.objectId), type: 'sale_line', occurred_at: fact.occurredAt ?? undefined,
-    currency: fact.currency ?? undefined, quantity: fact.quantity ?? undefined,
-    amount_minor: fact.grossMinor ?? fact.totalMinor ?? undefined,
-    catalog_object_id: fact.catalogObjectId ?? null, item_name: itemNameFor(fact) || null,
-    provider_object_id: fact.orderId ?? undefined, line_id: fact.lineItemUid ?? undefined,
-  });
+  const lineEvidence = fact => {
+    const basePrice = fact.raw?.base_price_money;
+    const unitPriceMinor = basePrice?.currency === fact.currency ? safeMinor(basePrice.amount) : null;
+    return {
+      id: String(fact.objectId), type: 'sale_line', occurred_at: fact.occurredAt ?? undefined,
+      currency: fact.currency ?? undefined, quantity: fact.quantity ?? undefined,
+      amount_minor: fact.grossMinor ?? fact.totalMinor ?? undefined,
+      gross_minor: fact.grossMinor ?? undefined,
+      unit_price_minor: unitPriceMinor ?? undefined, discount_minor: fact.discountMinor ?? undefined,
+      catalog_object_id: fact.catalogObjectId ?? null, item_name: itemNameFor(fact) || null,
+      provider_object_id: fact.orderId ?? undefined, line_id: fact.lineItemUid ?? undefined,
+    };
+  };
   const lineFacts = facts.filter(fact => fact.kind === 'order_line' && fact.objectId && fact.orderId);
 
   if (issue.code === 'REFUND_COGS_REVIEW') {

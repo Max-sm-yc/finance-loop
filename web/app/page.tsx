@@ -13,7 +13,7 @@ type AnalyticsSeries = { period: string; revenueMinor: number | null; costMinor:
 type AnalyticsReport = { calculationVersion: string; status: string; currency: string | null; sourceRevision?: number | null; products: AnalyticsProduct[]; totals: { revenueMinor: number | null; costMinor: number | null; netMinor: number | null; feesMinor: number | null; refundsMinor: number | null }; unallocated: { revenueMinor: number | null; refundsMinor: number | null; feesMinor: number | null; cogsReversalMinor?: number | null }; issues: Array<{ code: string; sourceRefs?: string[] }>; daily?: AnalyticsSeries[]; monthly?: AnalyticsSeries[] };
 const UUID_INPUT = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 type Organization = { id: string; name: string; base_currency?: string; timezone?: string };
-type IssueEvidence = { id: string; type?: 'sale_line' | 'refund'; occurred_at?: string; currency?: string; quantity?: string | number; amount_minor?: string | number; catalog_object_id?: string | null; item_name?: string | null; provider_object_id?: string; line_id?: string; refund_id?: string; order_id?: string; status?: string };
+type IssueEvidence = { id: string; type?: 'sale_line' | 'refund'; occurred_at?: string; currency?: string; quantity?: string | number; amount_minor?: string | number; gross_minor?: string | number; unit_price_minor?: string | number; discount_minor?: string | number; catalog_object_id?: string | null; item_name?: string | null; provider_object_id?: string; line_id?: string; refund_id?: string; order_id?: string; status?: string };
 const NAV: Array<{ id: Page; label: string; icon: string }> = [
   { id: 'overview', label: 'Overview', icon: '▦' }, { id: 'income', label: 'Income & inventory', icon: '▥' },
   { id: 'cash', label: 'Cash flow', icon: '⇄' }, { id: 'analytics', label: 'Business analytics', icon: '▤' }, { id: 'review', label: 'Review queue', icon: '◇' },
@@ -24,6 +24,31 @@ const money = (minor?: number | null, currency = 'USD') => {
   const fractionDigits = new Intl.NumberFormat(undefined, { style: 'currency', currency }).resolvedOptions().maximumFractionDigits;
   return new Intl.NumberFormat(undefined, { style: 'currency', currency }).format(minor / (10 ** (fractionDigits ?? 2)));
 };
+function sourceMinor(value: string | number | null | undefined) {
+  if (value === null || value === undefined || value === '') return null;
+  const parsed = Number(value);
+  return Number.isSafeInteger(parsed) ? parsed : null;
+}
+function passThroughUnitPriceMinor(line: IssueEvidence) {
+  const quantity = Number(line.quantity);
+  if (!Number.isSafeInteger(quantity) || quantity < 1) return null;
+  const gross = sourceMinor(line.gross_minor), discount = sourceMinor(line.discount_minor);
+  if (gross !== null && discount !== null) {
+    const chargedLineAmount = gross - discount;
+    return chargedLineAmount >= 0 && chargedLineAmount % quantity === 0 ? chargedLineAmount / quantity : null;
+  }
+  const sourceUnitPrice = sourceMinor(line.unit_price_minor);
+  if (sourceUnitPrice !== null && sourceUnitPrice >= 0) return sourceUnitPrice;
+  return gross !== null && gross >= 0 && gross % quantity === 0 ? gross / quantity : null;
+}
+function minorInput(value: number, currency: string) {
+  const digits = new Intl.NumberFormat(undefined, { style: 'currency', currency }).resolvedOptions().maximumFractionDigits ?? 2;
+  const amount = value / (10 ** digits);
+  return digits ? amount.toFixed(digits) : String(amount);
+}
+function passThroughReason(unitPriceMinor: number, currency: string) {
+  return `Square provided no item name or catalog variation. Per merchant pass-through policy, use the unit price supported by Square sale evidence (${money(unitPriceMinor, currency)}) as COGS for this exact sale line because the item cannot be matched to a supplier-backed cost.`;
+}
 function parseMinor(value: string, currency: string) {
   if (!/^\d+(?:\.\d+)?$/.test(value)) return null;
   const digits = new Intl.NumberFormat(undefined, { style: 'currency', currency }).resolvedOptions().maximumFractionDigits ?? 2;
@@ -411,6 +436,20 @@ function Review({ issues, organizationId, currency, onSaved }: { issues: Issue[]
   const selectedSaleLine = evidence.find(row => row.type === 'sale_line' && row.id === selectedSaleLineId) ?? evidence.find(row => row.type === 'sale_line');
   const refundEvidence = evidence.find(row => row.type === 'refund');
   const refundItems = evidence.filter(row => row.type === 'sale_line');
+  const passThroughLine = correction?.kind === 'item' && !!selectedSaleLine && !catalogId && !selectedSaleLine.item_name?.trim();
+  const passThroughPriceMinor = passThroughLine && selectedSaleLine ? passThroughUnitPriceMinor(selectedSaleLine) : null;
+  const saleCostNotice = passThroughLine
+    ? passThroughPriceMinor === null
+      ? 'Square did not provide a reliable per-unit price, so no pass-through cost is prefilled.'
+      : `Square also did not provide an item name. Per merchant policy, the prefilled pass-through cost equals the supported unit price of ${money(passThroughPriceMinor, itemCurrency)}. This approval applies only to this exact sale line (quantity ${selectedSaleLine?.quantity ?? 'unknown'}); replay uses unit cost × quantity.`
+    : `This approval applies only to this exact sale line (quantity ${selectedSaleLine?.quantity ?? 'unknown'}). Enter a supplier-backed acquisition cost; replay uses unit cost × quantity.`;
+  useEffect(() => {
+    if (!passThroughLine || !selectedSaleLine) return;
+    const unitPriceMinor = passThroughUnitPriceMinor(selectedSaleLine);
+    if (unitPriceMinor === null) return;
+    setUnitCost(minorInput(unitPriceMinor, itemCurrency));
+    setReason(passThroughReason(unitPriceMinor, itemCurrency));
+  }, [correction?.kind, correction?.issue.id, selectedSaleLine, passThroughLine, itemCurrency]);
   return <>
     <section className="panel table-panel">
       <div className="panel-heading"><div><h2>Human review queue</h2><p>Record the source-backed correction or prepare a draft for review.</p></div><span className="pill neutral">{issues.length} open</span></div>
@@ -444,9 +483,9 @@ function Review({ issues, organizationId, currency, onSaved }: { issues: Issue[]
         <button type="button" className="icon-button dialog-close" onClick={() => setCorrection(null)} aria-label="Close correction">×</button>
         <p className="eyebrow">SOURCE-BACKED FINANCE DECISION</p>
         <h2 id="correction-title">{correction.kind === 'item' ? (selectedSaleLine?.item_name?.trim() ? `Approve cost for ${selectedSaleLine.item_name.trim()}` : 'Approve item cost') : (refundEvidence?.amount_minor != null ? `Review refund of ${money(Number(refundEvidence.amount_minor), refundEvidence.currency ?? refundCurrency)}` : 'Review refund and returned items')}</h2>
-        <p className="muted">This decision is audited and triggers a replay of the issue’s historical period. Use supplier records or merchant return records for the values.</p>
+        <p className="muted">This decision is audited and triggers a replay of the issue’s historical period. {passThroughLine ? 'For an unidentified sale line with no catalog variation, merchant policy uses Square’s supported unit price as pass-through COGS.' : correction.kind === 'item' ? 'Use supplier acquisition records to establish the unit cost.' : 'Use merchant return records to establish the refund disposition and any supported COGS reversal.'}</p>
         {evidenceLoading ? <p className="muted">Loading Square evidence…</p> : correction.kind === 'item' ? <>
-          {evidence.filter(row => row.type === 'sale_line').length > 1 && <label>Sale item<select value={selectedSaleLineId} onChange={event => { const row = evidence.find(item => item.type === 'sale_line' && item.id === event.target.value); if (row) { setSelectedSaleLineId(row.id); setCatalogId(row.catalog_object_id ?? ''); setItemName(row.item_name ?? ''); setItemCurrency(row.currency ?? currency); setEffectiveDate((row.occurred_at ?? '').slice(0, 10)); } }}>{evidence.filter(row => row.type === 'sale_line').map(row => <option key={row.id} value={row.id}>{row.item_name?.trim() || 'Unidentified item'} · {row.occurred_at ? new Date(row.occurred_at).toLocaleDateString() : 'Date unavailable'} · {row.quantity ?? '—'} units · {row.amount_minor == null ? 'Amount unavailable' : money(Number(row.amount_minor), row.currency ?? currency)}</option>)}</select></label>}
+          {evidence.filter(row => row.type === 'sale_line').length > 1 && <label>Sale item<select value={selectedSaleLineId} onChange={event => { const row = evidence.find(item => item.type === 'sale_line' && item.id === event.target.value); if (row) { setSelectedSaleLineId(row.id); setCatalogId(row.catalog_object_id ?? ''); setItemName(row.item_name ?? ''); setItemCurrency(row.currency ?? currency); setEffectiveDate((row.occurred_at ?? '').slice(0, 10)); setUnitCost(''); setReason(''); } }}>{evidence.filter(row => row.type === 'sale_line').map(row => <option key={row.id} value={row.id}>{row.item_name?.trim() || 'Unidentified item'} · {row.occurred_at ? new Date(row.occurred_at).toLocaleDateString() : 'Date unavailable'} · {row.quantity ?? '—'} units · {row.amount_minor == null ? 'Amount unavailable' : money(Number(row.amount_minor), row.currency ?? currency)}</option>)}</select></label>}
           {selectedSaleLine ? <section className="decision-context" aria-label="Sale item being reviewed">
             <div className="decision-context-heading"><span>ITEM ON THIS SALE</span><strong>{selectedSaleLine.item_name?.trim() || 'Item name unavailable in Square'}</strong></div>
             <dl className="decision-context-grid"><div><dt>Sold</dt><dd>{selectedSaleLine.occurred_at ? new Date(selectedSaleLine.occurred_at).toLocaleDateString() : 'Date unavailable'}</dd></div><div><dt>Quantity</dt><dd>{selectedSaleLine.quantity ?? 'Unavailable'}</dd></div><div><dt>Gross sale</dt><dd>{selectedSaleLine.amount_minor == null ? 'Not provided' : money(Number(selectedSaleLine.amount_minor), selectedSaleLine.currency ?? itemCurrency)}</dd></div></dl>
@@ -454,8 +493,8 @@ function Review({ issues, organizationId, currency, onSaved }: { issues: Issue[]
             <div className="decision-context-heading"><span>SOURCE DETAILS UNAVAILABLE</span><strong>Sale item not identified</strong></div>
             <p>No matching Square sale line was found for this cost issue. The approval stays disabled until the item and transaction can be identified.</p>
           </section>}
-          {!catalogId && selectedSaleLine && <p className="notice compact-notice">Square did not link this line to a catalog variation. {selectedSaleLine.item_name?.trim() ? '' : 'Square also did not provide an item name; the approval will be tied to this identified sale line.'} Enter the merchant’s supplier acquisition cost for one unit. This cost will apply only to this exact sale line (quantity {selectedSaleLine.quantity ?? 'unknown'}), not other or future sales. The replay uses unit cost × quantity.</p>}
-          <div className="form-grid"><label>Approved {catalogId ? 'unit cost per item' : 'acquisition cost per unit'} ({itemCurrency})<input required type="number" min="0" step="0.01" value={unitCost} onChange={event => setUnitCost(event.target.value)} /></label>{catalogId && <label>Cost effective from<input required type="date" value={effectiveDate} onChange={event => setEffectiveDate(event.target.value)} /></label>}<label>Cost currency (must match sale currency)<input readOnly value={itemCurrency} /></label></div>
+          {!catalogId && selectedSaleLine && <p className="notice compact-notice">Square did not link this line to a catalog variation. {saleCostNotice}</p>}
+          <div className="form-grid"><label>Approved {passThroughLine ? 'pass-through unit cost' : catalogId ? 'unit cost per item' : 'acquisition cost per unit'} ({itemCurrency})<input required type="number" min="0" step="0.01" value={unitCost} onChange={event => { setUnitCost(event.target.value); if (passThroughLine && passThroughPriceMinor !== null && parseMinor(event.target.value, itemCurrency) !== passThroughPriceMinor) setReason(''); }} /></label>{catalogId && <label>Cost effective from<input required type="date" value={effectiveDate} onChange={event => setEffectiveDate(event.target.value)} /></label>}<label>Cost currency (must match sale currency)<input readOnly value={itemCurrency} /></label></div>
         </> : <>
           {refundEvidence ? <section className="decision-context" aria-label="Refund and original order details">
             <div className="decision-context-heading"><span>REFUND AMOUNT</span><strong>{refundEvidence.amount_minor == null ? 'Amount unavailable' : money(Number(refundEvidence.amount_minor), refundEvidence.currency ?? refundCurrency)} refunded</strong></div>
@@ -470,7 +509,7 @@ function Review({ issues, organizationId, currency, onSaved }: { issues: Issue[]
           <div className="form-grid"><label>Returned disposition<select required value={disposition} onChange={event => { const value = event.target.value as typeof disposition; setDisposition(value); if (value === 'not_returned_to_inventory') setReversal('0.00'); }}><option value="">Select the merchant’s return outcome</option><option value="not_returned_to_inventory">Goods were not returned to inventory</option><option value="returned_to_inventory">Goods were returned and restocked</option></select></label><label>Approved COGS reversal ({refundCurrency})<input required type="number" min="0" step="0.01" disabled={disposition !== 'returned_to_inventory'} value={reversal} onChange={event => setReversal(event.target.value)} /></label><label>Cost currency<input required maxLength={3} value={refundCurrency} onChange={event => setRefundCurrency(event.target.value.toUpperCase())} /></label></div>
         </>}
         {!evidenceLoading && !correctionReady && <section className="decision-context decision-context-warning" role="status"><div className="decision-context-heading"><span>DECISION SAVING UNAVAILABLE</span><strong>A required system update is pending</strong></div><p>The Square evidence is shown for review, but this decision cannot be recorded until the finance review update is available.</p></section>}
-        <label>Decision reason<textarea required minLength={10} rows={3} maxLength={1000} value={reason} onChange={event => setReason(event.target.value)} placeholder={correction.kind === 'item' ? 'Cite the supplier invoice/receipt and how it establishes the per-unit cost…' : 'Cite the merchant return record and the basis for this decision…'} /></label>
+        <label>Decision reason<textarea required minLength={10} rows={3} maxLength={1000} value={reason} onChange={event => setReason(event.target.value)} placeholder={passThroughLine ? 'Explain the pass-through assumption and unit price basis…' : correction.kind === 'item' ? 'Cite the supplier invoice/receipt and how it establishes the per-unit cost…' : 'Cite the merchant return record and the basis for this decision…'} /></label>
         {error && correction && <p className="error" role="alert">{error}</p>}
         <div className="form-actions"><button type="button" className="secondary" onClick={() => setCorrection(null)}>Cancel</button><button className="primary" disabled={busyId === correction.issue.id || evidenceLoading || !correctionReady || (correction.kind === 'item' && (!selectedSaleLine || (catalogId ? !itemName.trim() : (!selectedSaleLine.provider_object_id || !selectedSaleLine.line_id)))) || (correction.kind === 'refund' && (!refundEvidence || !refundId || !orderId || !disposition))}>{busyId === correction.issue.id ? 'Saving…' : 'Save and recalculate'}</button></div>
       </form>
