@@ -14,8 +14,9 @@ export async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
     headers,
     cache: 'no-store',
   });
-  const body = await response.json().catch(() => ({})) as { data?: T; error?: string | { code?: string }; code?: string };
+  const body = await response.json().catch(() => ({})) as { data?: T; error?: string | { code?: string }; code?: string; detail?: string };
   if (!response.ok) {
+    if (typeof body.detail === 'string') throw new Error(body.detail);
     const detail = typeof body.error === 'string' ? body.error : body.error?.code;
     throw new Error(detail || `Request failed (${response.status}).`);
   }

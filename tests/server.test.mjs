@@ -7,7 +7,7 @@ const org = '11111111-1111-4111-8111-111111111111';
 const account = '22222222-2222-4222-8222-222222222222';
 const user = '33333333-3333-4333-8333-333333333333';
 
-function setup({ role = 'operator', proposalFixture = false, proposalType = 'unknown_item', fetchImpl } = {}) {
+function setup({ role = 'operator', proposalFixture = false, proposalType = 'unknown_item', proposalPolicyVersion = 'policy-v1', fetchImpl } = {}) {
   const calls = [];
   const inboxIds = new Set();
   const db = {
@@ -18,7 +18,7 @@ function setup({ role = 'operator', proposalFixture = false, proposalType = 'unk
     async listObservations(arg) { calls.push(['observations', arg]); return []; },
     async listAuditEvents(arg) { calls.push(['audit', arg]); return []; },
     async getSettings(arg) { calls.push(['settings', arg]); return {}; },
-    async getIssue() { return proposalFixture ? { id: '44444444-4444-4444-8444-444444444444', type: proposalType, code: proposalType === 'refund_cogs_review' ? 'REFUND_COGS_REVIEW' : 'UNKNOWN_ITEM', details: { message: 'Human decision needed.' }, policyVersion: 'policy-v1', allowedCategories: proposalType === 'unknown_item' ? ['inventory_item'] : [] } : null; },
+    async getIssue() { return proposalFixture ? { id: '44444444-4444-4444-8444-444444444444', type: proposalType, code: proposalType === 'refund_cogs_review' ? 'REFUND_COGS_REVIEW' : 'UNKNOWN_ITEM', details: { message: 'Human decision needed.' }, policyVersion: proposalPolicyVersion, allowedCategories: proposalType === 'unknown_item' ? ['inventory_item'] : [] } : null; },
     async getIssueEvidence() { return proposalFixture ? [{ id: 'source-1', type: 'sale_line', catalog_object_id: null, quantity: 1.5 }] : []; },
     async createProposalAtomic(arg) { calls.push(['proposal', arg]); return { id: 'proposal' }; },
     async reserveModelBudget() { return true; }, async recordModelUsage() {},
@@ -140,6 +140,16 @@ test('refund COGS review proposal can ask for a human decision while unsupported
   const rejected = await unsupported.handlers.proposal(post('/api/proposals', { organizationId: org, issueId }, { 'idempotency-key': 'unsupported-proposal:1' }));
   assert.equal(rejected.status, 422);
   assert.deepEqual(await read(rejected), { error: 'PROPOSAL_UNAVAILABLE', code: 'PROPOSAL_UNAVAILABLE' });
+});
+
+test('proposal input failures return a safe validation detail for diagnosis', async () => {
+  const { handlers } = setup({ proposalFixture: true, proposalPolicyVersion: null });
+  const issueId = '44444444-4444-4444-8444-444444444444';
+  const response = await handlers.proposal(post('/api/proposals', { organizationId: org, issueId }, { 'idempotency-key': 'proposal-invalid-context:1' }));
+  assert.equal(response.status, 400);
+  assert.deepEqual(await read(response), {
+    error: 'INVALID_INPUT', code: 'INVALID_INPUT', detail: 'Invalid issue or policy version'
+  });
 });
 
 test('read endpoints expose issues, audit, and settings in a data envelope', async () => {

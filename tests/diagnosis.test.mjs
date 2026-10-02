@@ -50,6 +50,34 @@ test('sends only allowlisted evidence and returns an unposted draft', async () =
   assert.equal(requestBody.response_format.type, 'json_schema');
 });
 
+test('trims oversized evidence to the prompt bound and marks omitted context', async () => {
+  let sentContext;
+  const records = Array.from({ length: 20 }, (_, index) => ({
+    id: `source-${index}`, type: 'sale_line', occurred_at: '2026-01-01T00:00:00Z', currency: 'USD',
+    amount_minor: 100, refund_minor: 0, quantity: 1, catalog_object_id: `catalog-${index}`,
+    item_name: 'x'.repeat(200), provider_object_id: `order-${index}`, line_id: `line-${index}`
+  }));
+  const result = await diagnoseIssue({
+    issue: { id: 'issue-1', type: 'unknown_item', code: 'UNKNOWN_ITEM', details: { message: 'x'.repeat(1_000) } },
+    records, policyVersion: 'p1', allowedCategories: []
+  }, {
+    apiKey: 'fake', reserveBudget: async () => true,
+    fetchImpl: async (_url, options) => {
+      sentContext = JSON.parse(JSON.parse(options.body).messages[1].content);
+      const draft = {
+        issue_type: 'unknown_item', candidate_source_ids: [sentContext.evidence[0].id], proposed_category: null,
+        confidence: 0.5, rationale: 'The bounded evidence does not include every related sale line.',
+        missing_evidence: ['Additional related sale lines'], question: 'Please provide the approved item cost.', policy_version: 'p1'
+      };
+      return { ok: true, json: async () => ({ choices: [{ message: { content: JSON.stringify(draft) } }] }) };
+    }
+  });
+  assert.equal(result.status, 'draft');
+  assert.equal(sentContext.issue.evidence_truncated, true);
+  assert.ok(sentContext.evidence.length < records.length);
+  assert.ok(JSON.stringify(sentContext).length <= 8_000);
+});
+
 test('budget denial prevents model call and invalid JSON fails closed', async () => {
   let called = false;
   const input = { issue: { id: 'i', type: 'balance_mismatch' }, records: [], policyVersion: 'p1' };
