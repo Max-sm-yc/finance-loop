@@ -1,14 +1,22 @@
 'use client';
-import { useEffect, useMemo, useState, type FormEvent } from 'react';
+import { useEffect, useMemo, useRef, useState, type FormEvent } from 'react';
 import { browserSupabase } from '@/lib/browser-supabase';
 import { api, type AuditEvent, type Dashboard, type Issue, type Movement } from '@/lib/api';
 
-type Page = 'overview' | 'income' | 'cash' | 'review' | 'ledger' | 'settings';
+type Page = 'overview' | 'income' | 'cash' | 'review' | 'ledger' | 'settings' | 'analytics';
+type Features = { inventoryTracking: boolean; productAnalytics: boolean };
+type InventoryMovement = { id: string; item_id: string; item_name: string; quantity_delta: number; occurred_at: string; movement_type?: string; reason?: string };
+type InventorySnapshot = { asOf: string; status?: string; issues?: Array<{ code: string }>; sourceCoverage?: unknown; sourceHealth?: unknown[]; items?: Array<{ id: string; name: string; currency: string; item_kind?: string }>; balances?: Array<{ itemDefinitionId: string; itemName: string; currency: string; quantity: number | null }> };
+type PurchaseLineInput = { itemId: string; quantity: string; unitCost: string };
+type AnalyticsProduct = { productId: string; productName?: string | null; unitsSold: number; revenueMinor: number | null; costMinor: number | null; feesMinor: number | null; netMinor: number | null; grossMinor?: number | null; discountMinor?: number | null; refundsMinor?: number | null; revenueRank?: number | null; netRank?: number | null; revenueShareBps?: number | null; marginBps?: number | null; sourceRefs?: string[] };
+type AnalyticsSeries = { period: string; revenueMinor: number | null; costMinor: number | null; feesMinor: number | null; netMinor: number | null; unitsSold: number };
+type AnalyticsReport = { calculationVersion: string; status: string; currency: string | null; sourceRevision?: number | null; products: AnalyticsProduct[]; totals: { revenueMinor: number | null; costMinor: number | null; netMinor: number | null; feesMinor: number | null; refundsMinor: number | null }; unallocated: { revenueMinor: number | null; refundsMinor: number | null; feesMinor: number | null; cogsReversalMinor?: number | null }; issues: Array<{ code: string; sourceRefs?: string[] }>; daily?: AnalyticsSeries[]; monthly?: AnalyticsSeries[] };
+const UUID_INPUT = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 type Organization = { id: string; name: string; base_currency?: string; timezone?: string };
-type IssueEvidence = { id: string; type?: 'sale_line' | 'refund'; occurred_at?: string; currency?: string; quantity?: string | number; amount_minor?: string | number; catalog_object_id?: string | null; item_name?: string | null; provider_object_id?: string; line_id?: string; refund_id?: string; order_id?: string; status?: string };
+type IssueEvidence = { id: string; type?: 'sale_line' | 'refund'; occurred_at?: string; currency?: string; quantity?: string | number; amount_minor?: string | number; gross_minor?: string | number; unit_price_minor?: string | number; discount_minor?: string | number; catalog_object_id?: string | null; item_name?: string | null; provider_object_id?: string; line_id?: string; refund_id?: string; order_id?: string; status?: string };
 const NAV: Array<{ id: Page; label: string; icon: string }> = [
   { id: 'overview', label: 'Overview', icon: '▦' }, { id: 'income', label: 'Income & inventory', icon: '▥' },
-  { id: 'cash', label: 'Cash flow', icon: '⇄' }, { id: 'review', label: 'Review queue', icon: '◇' },
+  { id: 'cash', label: 'Cash flow', icon: '⇄' }, { id: 'analytics', label: 'Business analytics', icon: '▤' }, { id: 'review', label: 'Review queue', icon: '◇' },
   { id: 'ledger', label: 'Activity ledger', icon: '☷' }, { id: 'settings', label: 'Settings', icon: '⚙' },
 ];
 const money = (minor?: number | null, currency = 'USD') => {
@@ -16,6 +24,40 @@ const money = (minor?: number | null, currency = 'USD') => {
   const fractionDigits = new Intl.NumberFormat(undefined, { style: 'currency', currency }).resolvedOptions().maximumFractionDigits;
   return new Intl.NumberFormat(undefined, { style: 'currency', currency }).format(minor / (10 ** (fractionDigits ?? 2)));
 };
+function sourceMinor(value: string | number | null | undefined) {
+  if (value === null || value === undefined || value === '') return null;
+  const parsed = Number(value);
+  return Number.isSafeInteger(parsed) ? parsed : null;
+}
+function passThroughUnitPriceMinor(line: IssueEvidence) {
+  const quantity = Number(line.quantity);
+  if (!Number.isSafeInteger(quantity) || quantity < 1) return null;
+  const gross = sourceMinor(line.gross_minor), discount = sourceMinor(line.discount_minor);
+  if (gross !== null && discount !== null) {
+    const chargedLineAmount = gross - discount;
+    return chargedLineAmount >= 0 && chargedLineAmount % quantity === 0 ? chargedLineAmount / quantity : null;
+  }
+  const sourceUnitPrice = sourceMinor(line.unit_price_minor);
+  if (sourceUnitPrice !== null && sourceUnitPrice >= 0) return sourceUnitPrice;
+  return gross !== null && gross >= 0 && gross % quantity === 0 ? gross / quantity : null;
+}
+function minorInput(value: number, currency: string) {
+  const digits = new Intl.NumberFormat(undefined, { style: 'currency', currency }).resolvedOptions().maximumFractionDigits ?? 2;
+  const amount = value / (10 ** digits);
+  return digits ? amount.toFixed(digits) : String(amount);
+}
+function passThroughReason(unitPriceMinor: number, currency: string) {
+  return `Square provided no item name or catalog variation. Per merchant pass-through policy, use the unit price supported by Square sale evidence (${money(unitPriceMinor, currency)}) as COGS for this exact sale line because the item cannot be matched to a supplier-backed cost.`;
+}
+function parseMinor(value: string, currency: string) {
+  if (!/^\d+(?:\.\d+)?$/.test(value)) return null;
+  const digits = new Intl.NumberFormat(undefined, { style: 'currency', currency }).resolvedOptions().maximumFractionDigits ?? 2;
+  const [whole, fraction = ''] = value.split('.');
+  if (fraction.length > digits) return null;
+  const places = digits, scale = 10 ** places;
+  const total = Number(whole) * scale + Number((fraction + '0'.repeat(places)).slice(0, places) || '0');
+  return Number.isSafeInteger(total) ? total : null;
+}
 const date = (value?: string | null) => value ? new Date(value).toLocaleString() : '—';
 function zonedMidnight(dateText: string, timezone = 'UTC') {
   const [year, month, day] = dateText.split('-').map(Number);
@@ -30,6 +72,7 @@ function zonedMidnight(dateText: string, timezone = 'UTC') {
   return new Date(instant).toISOString();
 }
 const nextDate = (dateText: string) => new Date(Date.parse(`${dateText}T00:00:00Z`) + 86400000).toISOString().slice(0, 10);
+const localDateTimeNow = () => { const now = new Date(); return new Date(now.getTime() - now.getTimezoneOffset() * 60000).toISOString().slice(0, 16); };
 
 export default function Home() {
   const [user, setUser] = useState<{ email?: string | null } | null>(null);
@@ -41,19 +84,21 @@ export default function Home() {
   const [issues, setIssues] = useState<Issue[]>([]);
   const [movements, setMovements] = useState<Movement[]>([]);
   const [events, setEvents] = useState<AuditEvent[]>([]);
+  const [features, setFeatures] = useState<Features>({ inventoryTracking: false, productAnalytics: false });
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
   const [email, setEmail] = useState(''); const [password, setPassword] = useState('');
   const [accountId, setAccountId] = useState('');
   const [from, setFrom] = useState(() => new Date(Date.now() - 29 * 86400000).toISOString().slice(0, 10));
   const [to, setTo] = useState(() => new Date().toISOString().slice(0, 10));
+  const loadSequence = useRef(0);
   const supabase = useMemo(() => { try { return browserSupabase(); } catch { return null; } }, []);
   const reportTimezone = dashboard?.organization?.timezone ?? 'UTC';
 
   useEffect(() => {
     if (!supabase) { setError('Supabase is not configured. Add the project URL and publishable key to the web environment.'); setLoadingAuth(false); return; }
     supabase.auth.getUser().then(({ data }) => { setUser(data.user); setLoadingAuth(false); }).catch(() => { setError('Could not validate your sign-in session. Try again.'); setLoadingAuth(false); });
-    const { data: listener } = supabase.auth.onAuthStateChange((_event, session) => setUser(session?.user ?? null));
+    const { data: listener } = supabase.auth.onAuthStateChange((_event, session) => { loadSequence.current += 1; setFeatures({ inventoryTracking: false, productAnalytics: false }); setUser(session?.user ?? null); });
     return () => listener.subscription.unsubscribe();
   }, [supabase]);
 
@@ -80,13 +125,20 @@ export default function Home() {
 
   async function load() {
     if (!user || !organizationId) return;
+    const sequence = ++loadSequence.current;
     setBusy(true); setError('');
     const query = new URLSearchParams({ organizationId, from: zonedMidnight(from, reportTimezone), to: zonedMidnight(nextDate(to), reportTimezone), ...(accountId ? { accountId } : {}) });
     const orgQuery = new URLSearchParams({ organizationId });
-    const tasks: Promise<unknown>[] = [api<Record<string, unknown>>(`/api/dashboard?${query}`), api<{ issues: Issue[] }>(`/api/issues?${orgQuery}&state=open`), api<{ movements: Movement[] }>(`/api/manual-movements?${query}`), api<{ events: AuditEvent[] }>(`/api/audit?${orgQuery}&limit=200`), api<{ settings: { organization?: Organization; accounts?: Dashboard['accounts'] } }>(`/api/settings?${orgQuery}`)];
+    const tasks: Promise<unknown>[] = [api<Record<string, unknown>>(`/api/dashboard?${query}`), api<{ issues: Issue[] }>(`/api/issues?${orgQuery}&state=open`), api<{ movements: Movement[] }>(`/api/manual-movements?${query}`), api<{ events: AuditEvent[] }>(`/api/audit?${orgQuery}&limit=200`), api<{ settings: { organization?: Organization; accounts?: Dashboard['accounts']; features?: Features } }>(`/api/settings?${orgQuery}`)];
     const results = await Promise.allSettled(tasks);
+    if (sequence !== loadSequence.current) return;
+    if (results[4].status === 'fulfilled') {
+      const settings = (results[4].value as { settings: { features?: Features } }).settings;
+      const enabled = { inventoryTracking: settings.features?.inventoryTracking === true, productAnalytics: settings.features?.productAnalytics === true };
+      setFeatures(enabled); if (page === 'analytics' && !enabled.productAnalytics) setPage('overview');
+    } else setFeatures({ inventoryTracking: false, productAnalytics: false });
     if (results[0].status === 'fulfilled' && results[4].status === 'fulfilled') {
-      const raw = results[0].value as Record<string, unknown>; const settings = (results[4].value as { settings: { organization?: Organization; accounts?: Dashboard['accounts'] } }).settings;
+      const raw = results[0].value as Record<string, unknown>; const settings = (results[4].value as { settings: { organization?: Organization; accounts?: Dashboard['accounts']; features?: Features } }).settings;
       const projection = (raw.projection ?? raw.run ?? {}) as Record<string, any>; const result = (projection.result ?? raw.result ?? {}) as Record<string, any>;
       const accountRows = Array.isArray(result.accounts) ? result.accounts as Array<Record<string, unknown>> : [];
       const accountCash = accountRows.find(x => x.accountId === accountId) ?? accountRows[0];
@@ -107,6 +159,7 @@ export default function Home() {
     if (results[1].status === 'fulfilled') setIssues((results[1].value as { issues: Issue[] }).issues ?? []);
     if (results[2].status === 'fulfilled') setMovements((results[2].value as { movements: Movement[] }).movements ?? []);
     if (results[3].status === 'fulfilled') setEvents((results[3].value as { events: AuditEvent[] }).events ?? []);
+    if (results[4].status === 'rejected' && page === 'analytics') setPage('overview');
     const rejected = results.find(x => x.status === 'rejected') as PromiseRejectedResult | undefined;
     if (rejected) setError(rejected.reason instanceof Error ? rejected.reason.message : 'Some workspace data could not be loaded.');
     setBusy(false);
@@ -120,7 +173,7 @@ export default function Home() {
     catch { setError('Sign in could not reach the authentication service. Try again.'); }
     finally { setBusy(false); }
   }
-  async function signOut() { await supabase?.auth.signOut(); setDashboard(null); setIssues([]); setMovements([]); setEvents([]); }
+  async function signOut() { loadSequence.current += 1; await supabase?.auth.signOut(); setDashboard(null); setIssues([]); setMovements([]); setEvents([]); setFeatures({ inventoryTracking: false, productAnalytics: false }); }
   const currency = dashboard?.period?.currency ?? dashboard?.income?.currency ?? 'USD';
   const openIssues = issues.filter(i => !['resolved', 'approved', 'rejected'].includes(i.state));
 
@@ -134,21 +187,23 @@ export default function Home() {
     <p className="tiny muted">Access is provided by your workspace administrator.</p>
   </form></main>;
 
-  const title = NAV.find(x => x.id === page)?.label ?? 'Overview';
+  const navItems = NAV.filter(x => x.id !== 'analytics' || features.productAnalytics);
+  const title = navItems.find(x => x.id === page)?.label ?? 'Overview';
   return <div className="shell">
     <aside className="sidebar"><div className="brand-lockup"><span className="brand-icon">↗</span><span><b>finance loop</b><small>WORKSPACE</small></span></div>
       <div className="workspace"><span className="workspace-mark">{dashboard?.organization?.name?.slice(0, 1) ?? 'O'}</span><span><b>{dashboard?.organization?.name ?? 'Your workspace'}</b><small>Authenticated account</small></span></div>
-      <div className="nav-caption">WORKSPACE</div><nav aria-label="Main navigation">{NAV.map(item => <button key={item.id} className={`nav-link ${page === item.id ? 'selected' : ''}`} onClick={() => setPage(item.id)} aria-current={page === item.id ? 'page' : undefined}><span aria-hidden="true">{item.icon}</span>{item.label}{item.id === 'review' && openIssues.length > 0 && <i>{openIssues.length}</i>}</button>)}</nav>
+      <div className="nav-caption">WORKSPACE</div><nav aria-label="Main navigation">{navItems.map(item => <button key={item.id} className={`nav-link ${page === item.id ? 'selected' : ''}`} onClick={() => setPage(item.id)} aria-current={page === item.id ? 'page' : undefined}><span aria-hidden="true">{item.icon}</span>{item.label}{item.id === 'review' && openIssues.length > 0 && <i>{openIssues.length}</i>}</button>)}</nav>
       <div className="sidebar-foot"><div className="secure-note"><span className="status-dot" /> <b>Authenticated session</b><small>Workspace data is access controlled.</small></div><div className="profile"><span className="avatar">{user.email?.slice(0, 1).toUpperCase() ?? 'U'}</span><span className="profile-info"><b>{user.email}</b><small>Signed in</small></span><button className="icon-button" onClick={signOut} title="Sign out" aria-label="Sign out">↪</button></div></div>
     </aside>
-    <section className="main-area"><header className="topbar"><div className="crumb">{dashboard?.organization?.name ?? 'Workspace'} <span>/</span> <strong>{title}</strong></div><div className="top-controls">{organizations.length > 1 && <label className="compact">Organization<select value={organizationId} onChange={e => { setOrganizationId(e.target.value); setDashboard(null); }}><option value="">Choose workspace</option>{organizations.map(org => <option key={org.id} value={org.id}>{org.name}</option>)}</select></label>}<label className="compact">Period from<input type="date" value={from} onChange={e => setFrom(e.target.value)} /></label><label className="compact">through<input type="date" value={to} onChange={e => setTo(e.target.value)} /></label><span className="timezone-note">{reportTimezone}</span><button className="icon-button refresh" onClick={() => void load()} disabled={busy} aria-label="Refresh workspace data">{busy ? '…' : '↻'}</button></div></header>
+    <section className="main-area"><header className="topbar"><div className="crumb">{dashboard?.organization?.name ?? 'Workspace'} <span>/</span> <strong>{title}</strong></div><div className="top-controls">{organizations.length > 1 && <label className="compact">Organization<select value={organizationId} onChange={e => { loadSequence.current += 1; setOrganizationId(e.target.value); setDashboard(null); setFeatures({ inventoryTracking: false, productAnalytics: false }); if (page === 'analytics') setPage('overview'); }}><option value="">Choose workspace</option>{organizations.map(org => <option key={org.id} value={org.id}>{org.name}</option>)}</select></label>}<label className="compact">Period from<input type="date" value={from} onChange={e => setFrom(e.target.value)} /></label><label className="compact">through<input type="date" value={to} onChange={e => setTo(e.target.value)} /></label><span className="timezone-note">{reportTimezone}</span><button className="icon-button refresh" onClick={() => void load()} disabled={busy} aria-label="Refresh workspace data">{busy ? '…' : '↻'}</button></div></header>
       <main className="page"><div className="page-head"><div><p className="eyebrow">FINANCIAL OPERATIONS</p><h1>{title}</h1><p className="muted">{page === 'overview' ? 'A clear view of sales, margin, cash and items that need review.' : subhead(page)}</p></div></div>
         {error && <div className="notice error-box" role="alert"><b>Data request needs attention</b><span>{error}</span></div>}
         {!organizationId ? <section className="empty-state"><div className="empty-icon">⌁</div><h2>{organizations.length ? 'Choose a workspace' : 'No workspace membership found'}</h2><p>Ask a workspace owner to add your account, then sign in again.</p></section> : !dashboard ? <section className="empty-state"><div className="empty-icon">⌁</div><h2>{busy ? 'Loading workspace data' : 'No projection available yet'}</h2><p>Once your workspace has accounts and a completed projection, verified figures will appear here.</p><button className="secondary" onClick={() => void load()}>Retry</button></section> : <>
           {page === 'overview' && <Overview dashboard={dashboard} currency={currency} issues={openIssues} onNavigate={setPage} />}
           {page === 'income' && <Income dashboard={dashboard} currency={currency} />}
           {page === 'income' && <GiftCardSummary income={dashboard.income} currency={currency} />}
-          {page === 'cash' && <Cash dashboard={dashboard} currency={currency} movements={movements} accounts={dashboard.accounts ?? []} accountId={accountId} organizationId={organizationId} onAccount={setAccountId} onSaved={() => void load()} />}
+          {page === 'cash' && <Cash key={organizationId} dashboard={dashboard} currency={currency} movements={movements} accounts={dashboard.accounts ?? []} accountId={accountId} organizationId={organizationId} inventoryEnabled={features.inventoryTracking} onAccount={setAccountId} onSaved={() => void load()} />}
+          {page === 'analytics' && features.productAnalytics && <Analytics key={organizationId} organizationId={organizationId} from={zonedMidnight(from, reportTimezone)} to={zonedMidnight(nextDate(to), reportTimezone)} currency={currency} />}
           {page === 'review' && <Review issues={openIssues} organizationId={organizationId} currency={currency} onSaved={() => void load()} />}
           {page === 'ledger' && <Ledger events={events} />}
           {page === 'settings' && <Settings dashboard={dashboard} accountId={accountId} onAccount={setAccountId} />}
@@ -159,7 +214,7 @@ export default function Home() {
   </div>;
 }
 
-function subhead(page: Page) { return ({ income: 'Completed sales, approved unit costs, fees and margin status.', cash: 'Account movements and balance reconciliation for the selected period.', review: 'Human decisions for unresolved source and reconciliation exceptions.', ledger: 'Read-only history of recorded decisions and financial activity.', settings: 'Accounts, reporting scope and workspace configuration.' } as Record<string, string>)[page] ?? ''; }
+function subhead(page: Page) { return ({ income: 'Completed sales, approved unit costs, fees and margin status.', cash: 'Account movements and balance reconciliation for the selected period.', analytics: 'Deterministic product revenue, cost and net results for the selected period.', review: 'Human decisions for unresolved source and reconciliation exceptions.', ledger: 'Read-only history of recorded decisions and financial activity.', settings: 'Accounts, reporting scope and workspace configuration.' } as Record<string, string>)[page] ?? ''; }
 function Card({ label, value, hint, tone = '' }: { label: string; value: string; hint: string; tone?: string }) { return <article className="metric"><span>{label}</span><strong className={tone}>{value}</strong><small>{hint}</small></article>; }
 function GiftCardSummary({ income, currency }: { income: Dashboard['income']; currency: string }) {
   if (!income || income.giftCardLiabilityChangeMinor === undefined) return null;
@@ -177,7 +232,7 @@ function Overview({ dashboard: d, currency: c, issues, onNavigate }: { dashboard
 function Income({ dashboard: d, currency: c }: { dashboard: Dashboard; currency: string }) {
   return <><div className="metric-grid three"><Card label="Gross item sales" value={money(d.income?.grossItemSalesMinor, c)} hint="Before discounts" /><Card label="Net sales" value={money(d.income?.netSalesMinor, c)} hint="After discounts and refunds" /><Card label="Square fees" value={money(d.income?.squareFeesMinor, c)} hint="Completed processing fees" /></div><section className="panel table-panel"><div className="panel-heading"><div><h2>Sales and inventory</h2><p>Line item details from the selected calculation run</p></div><span className={`pill ${d.income?.status === 'complete' ? 'good' : 'warn'}`}>{d.income?.status ?? 'Not calculated'}</span></div>{d.income?.lines?.length ? <div className="table-wrap"><table><thead><tr><th>Item</th><th>Units</th><th>Sales</th><th>Unit cost</th><th>COGS</th><th>Margin</th></tr></thead><tbody>{d.income.lines.map((line, i) => <tr key={String(line.id ?? i)}><td>{String(line.itemName ?? line.name ?? 'Unidentified item')}<small className="cell-sub">{String(line.catalogId ?? line.sourceId ?? '')}</small></td><td>{String(line.quantity ?? '—')}</td><td>{money(Number(line.netSalesMinor), c)}</td><td>{line.unitCostMinor == null ? <span className="pill warn">Needs cost</span> : money(Number(line.unitCostMinor), c)}</td><td>{money(line.cogsMinor == null ? null : Number(line.cogsMinor), c)}</td><td>{money(line.marginMinor == null ? null : Number(line.marginMinor), c)}</td></tr>)}</tbody></table></div> : <div className="inline-empty">No line details were included in this projection response.</div>}</section><div className="notice"><b>Policy treatment</b><span>Tax, tips, discounts and refunds follow the calculation policy attached to the projection. Missing approved item cost keeps margin incomplete.</span></div></>;
 }
-function Cash({ dashboard: d, currency: c, movements, accounts, accountId, organizationId, onAccount, onSaved }: { dashboard: Dashboard; currency: string; movements: Movement[]; accounts: NonNullable<Dashboard['accounts']>; accountId: string; organizationId: string; onAccount: (v: string) => void; onSaved: () => void }) {
+function Cash({ dashboard: d, currency: c, movements, accounts, accountId, organizationId, inventoryEnabled, onAccount, onSaved }: { dashboard: Dashboard; currency: string; movements: Movement[]; accounts: NonNullable<Dashboard['accounts']>; accountId: string; organizationId: string; inventoryEnabled: boolean; onAccount: (v: string) => void; onSaved: () => void }) {
   const [mode, setMode] = useState<'movement' | 'observation' | null>(null); const [kind, setKind] = useState('purchase'); const [amount, setAmount] = useState(''); const [description, setDescription] = useState(''); const [evidenceFile, setEvidenceFile] = useState<File | null>(null); const [occurredAt, setOccurredAt] = useState(() => new Date().toISOString().slice(0, 16)); const [saving, setSaving] = useState(false); const [formError, setFormError] = useState('');
   async function save(e: FormEvent) { e.preventDefault(); const acct = accounts.find(x => x.id === accountId); if (!acct || !amount || !evidenceFile) return; const minor = Math.round(Number(amount) * 100); if (!Number.isSafeInteger(minor) || minor <= 0) { setFormError('Enter a positive amount with at most two decimal places.'); return; } setSaving(true); setFormError('');
     const key = crypto.randomUUID(); const isObservation = mode === 'observation';
@@ -190,7 +245,7 @@ function Cash({ dashboard: d, currency: c, movements, accounts, accountId, organ
       <div className="form-grid"><label>Amount ({accounts.find(x => x.id === accountId)?.currency ?? c})<input inputMode="decimal" type="number" min="0.01" step="0.01" required value={amount} onChange={e => setAmount(e.target.value)} /></label><label>{mode === 'observation' ? 'Observed at' : 'Occurred at'}<input type="datetime-local" required value={occurredAt} onChange={e => setOccurredAt(e.target.value)} /></label>{mode === 'movement' && <label className="wide">Description<input maxLength={500} required value={description} onChange={e => setDescription(e.target.value)} /></label>}<label className="wide">Supporting evidence<input type="file" accept="application/pdf,image/jpeg,image/png" required onChange={e => setEvidenceFile(e.target.files?.[0] ?? null)} /><small className="field-hint">Private PDF, JPEG, or PNG; maximum 10 MB.</small></label></div>
       {formError && <p className="error" role="alert">{formError}</p>}<div className="form-actions"><button type="button" className="secondary" onClick={() => setMode(null)}>Cancel</button><button className="primary" disabled={saving}>{saving ? 'Saving…' : 'Save record'}</button></div>
     </form>}
-    <section className="metric-grid three"><Card label="Expected balance" value={money(d.cash?.expectedBalanceMinor, d.cash?.currency ?? c)} hint="Opening balance + posted movements" /><Card label="Observed balance" value={money(d.cash?.observedBalanceMinor, d.cash?.currency ?? c)} hint="Most recent human observation" /><Card label="Difference" value={money(d.cash?.discrepancyMinor, d.cash?.currency ?? c)} hint="Observed minus expected" tone={d.cash?.discrepancyMinor ? 'warn-text' : ''} /></section><section className="panel table-panel"><div className="panel-heading"><div><h2>Account movements</h2><p>Cash activity for the selected account and period</p></div></div>{movements.length ? <div className="table-wrap"><table><thead><tr><th>Date</th><th>Activity</th><th>Category</th><th>Evidence</th><th>Amount</th></tr></thead><tbody>{movements.filter(m => !accountId || m.account_id === accountId).map(m => <tr key={m.id}><td>{date(m.occurred_at)}</td><td>{m.description}</td><td>{m.kind.replaceAll('_', ' ')}</td><td><EvidenceLink organizationId={organizationId} evidenceId={m.evidence_ref ?? ''} /></td><td className={m.amount_minor < 0 ? 'negative' : 'positive'}>{money(m.amount_minor, m.currency)}</td></tr>)}</tbody></table></div> : <div className="inline-empty">No confirmed account movements were returned for this period.</div>}</section><p className="tiny muted">COGS is an analytical margin measure and is not deducted again from the account balance. Transfers require linked account legs.</p></>;
+    <section className="metric-grid three"><Card label="Expected balance" value={money(d.cash?.expectedBalanceMinor, d.cash?.currency ?? c)} hint="Opening balance + posted movements" /><Card label="Observed balance" value={money(d.cash?.observedBalanceMinor, d.cash?.currency ?? c)} hint="Most recent human observation" /><Card label="Difference" value={money(d.cash?.discrepancyMinor, d.cash?.currency ?? c)} hint="Observed minus expected" tone={d.cash?.discrepancyMinor ? 'warn-text' : ''} /></section><section className="panel table-panel"><div className="panel-heading"><div><h2>Account movements</h2><p>Cash activity for the selected account and period</p></div></div>{movements.length ? <div className="table-wrap"><table><thead><tr><th>Date</th><th>Activity</th><th>Category</th><th>Evidence</th><th>Amount</th></tr></thead><tbody>{movements.filter(m => !accountId || m.account_id === accountId).map(m => <tr key={m.id}><td>{date(m.occurred_at)}</td><td>{m.description}</td><td>{m.kind.replaceAll('_', ' ')}</td><td><EvidenceLink organizationId={organizationId} evidenceId={m.evidence_ref ?? ''} /></td><td className={m.amount_minor < 0 ? 'negative' : 'positive'}>{money(m.amount_minor, m.currency)}</td></tr>)}</tbody></table></div> : <div className="inline-empty">No confirmed account movements were returned for this period.</div>}</section>{inventoryEnabled && <InventoryPanel organizationId={organizationId} accountId={accountId} currency={c} accounts={accounts} from={d.period?.from ?? ''} to={d.period?.to ?? ''} onSaved={onSaved} />}<p className="tiny muted">COGS is an analytical margin measure and is not deducted again from the account balance. Transfers require linked account legs.</p></>;
 }
 function EvidenceLink({ organizationId, evidenceId }: { organizationId: string; evidenceId: string }) {
   const [error, setError] = useState('');
@@ -204,6 +259,90 @@ function EvidenceLink({ organizationId, evidenceId }: { organizationId: string; 
     } catch { setError('Could not open evidence.'); }
   }
   return <><button type="button" className="text-button" onClick={() => void openEvidence()}>View file</button>{error && <small className="error" role="alert">{error}</small>}</>;
+}
+function InventoryPanel({ organizationId, accountId, currency, accounts, from, to, onSaved }: { organizationId: string; accountId: string; currency: string; accounts: NonNullable<Dashboard['accounts']>; from: string; to: string; onSaved: () => void }) {
+  const [rows, setRows] = useState<InventoryMovement[]>([]), [snapshot, setSnapshot] = useState<InventorySnapshot | null>(null), [loading, setLoading] = useState(false), [mode, setMode] = useState<'purchase' | 'correction' | 'opening' | 'item' | null>(null);
+  const [itemId, setItemId] = useState(''), [name, setName] = useState(''), [sku, setSku] = useState(''), [quantity, setQuantity] = useState('1'), [purchaseLines, setPurchaseLines] = useState<PurchaseLineInput[]>([{ itemId: '', quantity: '1', unitCost: '' }]), [amountPaid, setAmountPaid] = useState(''), [reason, setReason] = useState(''), [direction, setDirection] = useState<'add' | 'remove'>('add'), [occurredAt, setOccurredAt] = useState(localDateTimeNow);
+  const [evidence, setEvidence] = useState<File | null>(null), [evidenceRefInput, setEvidenceRefInput] = useState(''), [error, setError] = useState(''), [saving, setSaving] = useState(false);
+  const pending = useRef<null | { fingerprint: string; key: string; evidenceId?: string; occurredAt: string }>(null);
+  async function refresh() {
+    if (!from || !to) return;
+    setLoading(true); setSnapshot(null); setRows([]);
+    try { const query = new URLSearchParams({ organizationId, from, to, currency: accounts.find(x => x.id === accountId)?.currency ?? currency }); const result = await api<{ movements: InventoryMovement[]; snapshot: InventorySnapshot }>(`/api/inventory?${query}`); setRows(result.movements ?? []); setSnapshot(result.snapshot ?? null); }
+    catch (err) { setError(err instanceof Error ? err.message : 'Inventory could not be loaded.'); }
+    finally { setLoading(false); }
+  }
+  useEffect(() => { void refresh(); }, [organizationId, from, to, accountId]);
+  const items = snapshot?.items ?? [...new Map(rows.map(row => [row.item_id, { id: row.item_id, name: row.item_name, currency }])).values()];
+  async function save(e: FormEvent) {
+    e.preventDefault(); setError('');
+    if (!evidence && !UUID_INPUT.test(evidenceRefInput.trim())) { setError('Attach a receipt or enter an existing evidence ID.'); return; }
+    const receiptLines = purchaseLines.map(line => ({ itemId: line.itemId, itemName: items.find(item => item.id === line.itemId)?.name ?? '', quantity: Number(line.quantity), unitCostMinor: parseMinor(line.unitCost, accounts.find(x => x.id === accountId)?.currency ?? currency) }));
+    if (mode === 'purchase' && (!receiptLines.length || receiptLines.some(line => !UUID_INPUT.test(line.itemId) || !line.itemName || !Number.isSafeInteger(line.quantity) || line.quantity < 1 || line.quantity > 1_000_000 || line.unitCostMinor === null || line.unitCostMinor < 0))) { setError('Each receipt line needs an item, whole quantity, and valid unit acquisition cost.'); return; }
+    if (mode !== 'purchase' && mode !== 'item' && (!itemId || reason.trim().length < 10)) { setError('Choose an item and explain the inventory record in at least 10 characters.'); return; }
+    if (mode === 'item' && (sku.trim().length < 1 || name.trim().length < 1 || reason.trim().length < 10)) { setError('Enter an item name, SKU, and reason of at least 10 characters.'); return; }
+    const qty = Number(quantity), transactionCurrency = accounts.find(x => x.id === accountId)?.currency ?? currency;
+    const paidMinor = parseMinor(amountPaid, transactionCurrency);
+    if (mode !== 'item' && mode !== 'purchase' && (!Number.isSafeInteger(qty) || qty < (mode === 'opening' ? 0 : 1) || qty > 1_000_000) || (mode === 'purchase' && (paidMinor === null || paidMinor <= 0))) { setError('Enter a valid quantity and total amount paid.'); return; }
+    const acquisitionSubtotal = receiptLines.reduce((sum, line) => sum + (line.unitCostMinor ?? 0) * line.quantity, 0);
+    if (mode === 'purchase' && paidMinor !== null && (!Number.isSafeInteger(acquisitionSubtotal) || paidMinor < acquisitionSubtotal)) { setError('Total paid cannot be below the recorded inventory acquisition subtotal.'); return; }
+    const account = accounts.find(x => x.id === accountId); if (mode === 'purchase' && !account) { setError('Choose a cash account before recording this purchase.'); return; }
+    setSaving(true);
+    try {
+      const fingerprint = JSON.stringify([organizationId, mode, accountId, itemId, name.trim(), sku.trim(), mode === 'purchase' ? receiptLines : null, qty, paidMinor, direction, reason.trim(), occurredAt, evidence?.name, evidence?.size, evidence?.lastModified, evidenceRefInput]);
+      if (!pending.current || pending.current.fingerprint !== fingerprint) pending.current = { fingerprint, key: crypto.randomUUID(), occurredAt: new Date(occurredAt).toISOString() };
+      if (!pending.current.evidenceId) {
+        if (evidence) { const upload = new FormData(); upload.set('organizationId', organizationId); upload.set('file', evidence); const stored = await api<{ evidence: { id: string } }>('/api/evidence', { method: 'POST', body: upload }); pending.current.evidenceId = stored.evidence.id; }
+        else pending.current.evidenceId = evidenceRefInput.trim();
+      }
+      const evidenceRef = pending.current.evidenceId, eventTime = pending.current.occurredAt, key = pending.current.key;
+      if (mode === 'item') { const result = await api<{ itemId: string }>('/api/inventory/items', { method: 'POST', headers: { 'Idempotency-Key': key }, body: JSON.stringify({ organizationId, sku: sku.trim(), name: name.trim(), currency: transactionCurrency, evidenceRef, reason: reason.trim() }) }); pending.current = null; setMode(null); setEvidence(null); setEvidenceRefInput(''); setReason(''); setName(''); setSku(''); await refresh(); setItemId(result.itemId); return; }
+      if (mode === 'purchase') await api('/api/inventory/purchases', { method: 'POST', headers: { 'Idempotency-Key': key }, body: JSON.stringify({ organizationId, accountId, amountMinor: -paidMinor!, occurredAt: eventTime, currency: account!.currency, description: 'Supply purchase', evidenceRef, lines: receiptLines.map(line => ({ ...line, unitCostMinor: line.unitCostMinor! })) }) });
+      else if (mode === 'opening') await api('/api/inventory/openings', { method: 'POST', headers: { 'Idempotency-Key': key }, body: JSON.stringify({ organizationId, itemId, quantity: qty, occurredAt: eventTime, reason: reason.trim(), evidenceRef }) });
+      else await api('/api/inventory/corrections', { method: 'POST', headers: { 'Idempotency-Key': key }, body: JSON.stringify({ organizationId, itemId, quantityDelta: direction === 'add' ? qty : -qty, occurredAt: eventTime, reason: reason.trim(), evidenceRef }) });
+      pending.current = null; setMode(null); setEvidence(null); setEvidenceRefInput(''); setName(''); setSku(''); setQuantity('1'); setPurchaseLines([{ itemId: '', quantity: '1', unitCost: '' }]); setAmountPaid(''); setReason(''); await refresh(); onSaved();
+    } catch (err) { setError(err instanceof Error ? err.message : 'Inventory record could not be saved.'); }
+    finally { setSaving(false); }
+  }
+  return <section className="panel table-panel"><div className="panel-heading"><div><h2>Inventory and supply purchases</h2><p>Purchases post cash and stock together. Opening counts and corrections keep their evidence and reason.</p></div><div className="form-actions"><button className="secondary" onClick={() => { setMode('item'); setError(''); setName(''); setSku(''); setItemId(''); }}>Add supply item</button><button className="secondary" onClick={() => { setMode('opening'); setError(''); setItemId(items[0]?.id ?? ''); }}>Set opening count</button><button className="secondary" onClick={() => { setMode('correction'); setError(''); setItemId(items[0]?.id ?? ''); }}>Correct stock</button><button className="primary" onClick={() => { setMode('purchase'); setError(''); setPurchaseLines([{ itemId: items[0]?.id ?? '', quantity: '1', unitCost: '' }]); }}>＋ Purchase supplies</button></div></div>
+    {mode && <form className="entry-form" onSubmit={save}><div className="form-grid">
+      {(mode === 'opening' || mode === 'correction') && <label>Inventory item<select required value={itemId} onChange={e => setItemId(e.target.value)}><option value="">Choose item</option>{items.map(item => <option key={item.id} value={item.id}>{item.name} · {item.currency}</option>)}</select></label>}
+      {mode === 'item' && <><label>Item name<input required maxLength={200} value={name} onChange={e => setName(e.target.value)} /></label><label>SKU or stock code<input required maxLength={100} value={sku} onChange={e => setSku(e.target.value)} /></label><label>Currency<select value={accounts.find(x => x.id === accountId)?.currency ?? currency} onChange={() => {}} disabled><option>{accounts.find(x => x.id === accountId)?.currency ?? currency}</option></select></label><label className="wide">Reason<textarea minLength={10} maxLength={1000} required value={reason} onChange={e => setReason(e.target.value)} placeholder="Explain the source for this new supply item" /></label></>}
+      {mode === 'purchase' && <div className="wide"><h3>Receipt items</h3>{purchaseLines.map((line, index) => <div className="form-grid" key={`receipt-line-${index}`}><label>Item<select required value={line.itemId} onChange={e => setPurchaseLines(current => current.map((row, i) => i === index ? { ...row, itemId: e.target.value } : row))}><option value="">Choose item</option>{items.map(item => <option key={item.id} value={item.id}>{item.name}</option>)}</select></label><label>Quantity<input type="number" min="1" step="1" required value={line.quantity} onChange={e => setPurchaseLines(current => current.map((row, i) => i === index ? { ...row, quantity: e.target.value } : row))} /></label><label>Unit acquisition cost ({accounts.find(x => x.id === accountId)?.currency ?? currency})<input type="number" min="0" step="any" required value={line.unitCost} onChange={e => setPurchaseLines(current => current.map((row, i) => i === index ? { ...row, unitCost: e.target.value } : row))} /></label><button type="button" className="secondary" disabled={purchaseLines.length === 1} onClick={() => setPurchaseLines(current => current.filter((_, i) => i !== index))}>Remove line</button></div>)}<button type="button" className="secondary" onClick={() => setPurchaseLines(current => [...current, { itemId: '', quantity: '1', unitCost: '' }])}>＋ Add receipt item</button><p className="field-hint">Enter the amount paid once for the whole receipt; include taxes and shipping.</p><label>Total paid ({accounts.find(x => x.id === accountId)?.currency ?? currency})<input type="number" min="0.01" step="any" required value={amountPaid} onChange={e => setAmountPaid(e.target.value)} /></label></div>}
+      {mode !== 'item' && <label>Occurred at (your local time)<input type="datetime-local" required value={occurredAt} onChange={e => setOccurredAt(e.target.value)} /></label>}
+      {mode === 'correction' && <><label>Correction<select value={direction} onChange={e => setDirection(e.target.value as 'add' | 'remove')}><option value="add">Add units</option><option value="remove">Remove units</option></select></label><label>Units<input type="number" min="1" step="1" required value={quantity} onChange={e => setQuantity(e.target.value)} /></label><label className="wide">Reason<textarea minLength={10} maxLength={1000} required value={reason} onChange={e => setReason(e.target.value)} /></label></>}
+      {mode === 'opening' && <><label>Physical on-hand count<input type="number" min="0" step="1" required value={quantity} onChange={e => setQuantity(e.target.value)} /></label><label className="wide">Reason<textarea minLength={10} maxLength={1000} required value={reason} onChange={e => setReason(e.target.value)} placeholder="Describe the count and its source" /></label></>}
+      <label className="wide">Receipt / evidence file<input type="file" accept="application/pdf,image/jpeg,image/png" onChange={e => setEvidence(e.target.files?.[0] ?? null)} /></label><label className="wide">Or existing evidence ID<input value={evidenceRefInput} onChange={e => setEvidenceRefInput(e.target.value)} maxLength={36} placeholder="UUID for a file already uploaded by a workspace member" /></label>
+    </div>{error && <p className="error" role="alert">{error}</p>}<div className="form-actions"><button type="button" className="secondary" onClick={() => setMode(null)}>Cancel</button><button className="primary" disabled={saving}>{saving ? 'Saving…' : 'Save inventory record'}</button></div></form>}
+    {snapshot?.balances?.length ? <section className="panel"><div className="panel-heading"><div><h3>Stock on hand</h3><p>Calculated from recorded openings, purchases, corrections, and completed sales.</p></div><span className={`pill ${snapshot.status === 'complete' ? 'good' : 'warn'}`}>{snapshot.status ?? 'incomplete'}</span></div>{snapshot.issues?.length ? <div className="notice compact-notice">Inventory needs review: {Array.from(new Set(snapshot.issues.map(issue => issue.code))).join(', ')}</div> : null}<div className="table-wrap"><table><thead><tr><th>Item</th><th>Currency</th><th>Units</th></tr></thead><tbody>{snapshot.balances.map(balance => <tr key={balance.itemDefinitionId}><td>{balance.itemName}</td><td>{balance.currency}</td><td>{balance.quantity ?? 'Unknown'}</td></tr>)}</tbody></table></div></section> : null}{error && !mode && <p className="error" role="alert">{error}</p>}{loading ? <div className="inline-empty">Loading inventory…</div> : rows.length ? <div className="table-wrap"><table><thead><tr><th>Date</th><th>Item</th><th>Change</th><th>Type</th><th>Reason</th></tr></thead><tbody>{rows.map(row => <tr key={row.id}><td>{date(row.occurred_at)}</td><td>{row.item_name}</td><td>{row.quantity_delta > 0 ? '+' : ''}{row.quantity_delta}</td><td>{(row.movement_type ?? 'movement').replaceAll('_', ' ')}</td><td>{row.reason ?? '—'}</td></tr>)}</tbody></table></div> : !loading && <div className="inline-empty">No inventory movements in this period. Existing item definitions appear here after their first recorded movement.</div>}
+  </section>;
+}
+function Analytics({ organizationId, from, to, currency }: { organizationId: string; from: string; to: string; currency: string }) {
+  const [report, setReport] = useState<AnalyticsReport | null>(null), [error, setError] = useState(''), [loading, setLoading] = useState(false), [search, setSearch] = useState(''), [sortBy, setSortBy] = useState<'revenue' | 'cost' | 'net' | 'units'>('revenue'), [seriesView, setSeriesView] = useState<'monthly' | 'daily'>('monthly');
+  useEffect(() => {
+    let active = true; setLoading(true); setError(''); setReport(null);
+    const query = new URLSearchParams({ organizationId, from, to, currency });
+    api<{ analytics: AnalyticsReport }>(`/api/analytics?${query}`).then(result => { if (active) setReport(result.analytics); })
+      .catch(err => { if (active) setError(err instanceof Error ? err.message : 'Analytics could not be loaded.'); })
+      .finally(() => { if (active) setLoading(false); });
+    return () => { active = false; };
+  }, [organizationId, from, to, currency]);
+  const visibleProducts = (report?.products ?? []).filter(product => `${product.productName ?? ''} ${product.productId}`.toLowerCase().includes(search.toLowerCase())).sort((a, b) => {
+    const value = (p: AnalyticsProduct) => sortBy === 'cost' ? p.costMinor : sortBy === 'net' ? p.netMinor : sortBy === 'units' ? p.unitsSold : p.revenueMinor;
+    const av = value(a), bv = value(b); return av == null ? 1 : bv == null ? -1 : bv - av || a.productId.localeCompare(b.productId);
+  });
+  function exportCsv() {
+    if (!report) return;
+    const rows: unknown[][] = [['Period from', from], ['Period to', to], ['Requested currency', currency], ['Reported currency', report.currency ?? 'Mixed or unavailable'], ['Calculation version', report.calculationVersion], ['Calculation status', report.status], ['Source revision', report.sourceRevision ?? 'unavailable'], [], ['Product','Product ID','Units sold','Revenue minor','Cost minor','Fees minor','Net minor','Revenue rank','Net rank','Margin bps','Source refs','Status'], ...report.products.map(p => [p.productName ?? 'Unidentified product', p.productId, p.unitsSold, p.revenueMinor, p.costMinor ?? '', p.feesMinor, p.netMinor ?? '', p.revenueRank ?? '', p.netRank ?? '', p.marginBps ?? '', p.sourceRefs?.join('|') ?? '', p.netMinor == null ? 'incomplete' : 'complete']), ['Unallocated revenue','','',report.unallocated.revenueMinor,'','','','','','','','review'], ['Unallocated refunds','','',report.unallocated.refundsMinor,'','','','','','','','review'], ['Unallocated fees','','','', '',report.unallocated.feesMinor,'','','','','','review'], ['Unallocated COGS reversals','','','','',report.unallocated.cogsReversalMinor ?? '','','','','','','review']];
+    const csv = rows.map(row => row.map(value => { const raw = String(value ?? ''); const safe = /^[\s=+\-@]/.test(raw) ? `'${raw}` : raw; return `"${safe.replaceAll('"', '""')}"`; }).join(',')).join('\r\n');
+    const href = URL.createObjectURL(new Blob([csv], { type: 'text/csv;charset=utf-8' })); const link = document.createElement('a'); link.href = href; link.download = `product-analytics-${from.slice(0,10)}-${to.slice(0,10)}.csv`; link.click(); URL.revokeObjectURL(href);
+  }
+  return <><section className="metric-grid three"><Card label="Product revenue" value={money(report?.totals?.revenueMinor, currency)} hint="After known discounts and refunds" /><Card label="Product cost" value={money(report?.totals?.costMinor, currency)} hint={report?.status === 'incomplete' ? 'Incomplete where cost evidence is missing' : 'Effective approved acquisition costs'} tone={report?.totals?.costMinor == null ? 'warn-text' : ''} /><Card label="Net after fees" value={money(report?.totals?.netMinor, currency)} hint="Revenue − COGS − processing fees" tone={report?.totals?.netMinor == null ? 'warn-text' : ''} /></section>
+    <section className="panel table-panel"><div className="panel-heading"><div><h2>Product performance</h2><p>Deterministic source fact calculation · {report?.calculationVersion ?? 'loading'} · source revision {report?.sourceRevision ?? 'unavailable'}</p></div><div className="form-actions"><span className={`pill ${report?.status === 'complete' ? 'good' : report?.status === 'failed' ? 'warn' : 'neutral'}`}>{report?.status ?? (loading ? 'Loading' : 'Unavailable')}</span><button className="secondary" onClick={exportCsv} disabled={!report}>Export CSV</button></div></div>
+      {loading && <div className="inline-empty">Calculating product results…</div>}{error && <div className="notice error-box" role="alert">{error}</div>}{report?.currency == null && report?.status === 'failed' && <div className="notice error-box" role="alert">Mixed or invalid source currencies prevented a single-currency report.</div>}
+      <div className="filter-panel"><label>Find product<input type="search" value={search} onChange={e => setSearch(e.target.value)} placeholder="Name or product ID" /></label><label>Rank by<select value={sortBy} onChange={e => setSortBy(e.target.value as typeof sortBy)}><option value="revenue">Revenue</option><option value="cost">Cost</option><option value="net">Net</option><option value="units">Units sold</option></select></label></div>
+      {visibleProducts.length ? <div className="table-wrap"><table><thead><tr><th>Rank</th><th>Product</th><th>Units</th><th>Revenue</th><th>Cost</th><th>Fees</th><th>Allocated net</th><th>Margin</th><th>Revenue share</th></tr></thead><tbody>{visibleProducts.map(product => <tr key={product.productId}><td>R{product.revenueRank ?? '—'} / N{product.netRank ?? '—'}</td><td>{product.productName ?? 'Unidentified product'}<small className="cell-sub">{product.productId}</small></td><td>{product.unitsSold}</td><td>{money(product.revenueMinor, currency)}</td><td>{money(product.costMinor, currency)}</td><td>{money(product.feesMinor, currency)}</td><td>{product.netMinor == null ? <span className="pill warn">Incomplete</span> : money(product.netMinor, currency)}</td><td>{product.marginBps == null ? '—' : `${(product.marginBps / 100).toFixed(1)}%`}</td><td>{product.revenueShareBps == null ? '—' : `${(product.revenueShareBps / 100).toFixed(1)}%`}</td></tr>)}</tbody></table></div> : !loading && !error && <div className="inline-empty">No product sales match this period and filter.</div>}
+    </section>{(seriesView === 'monthly' ? report?.monthly : report?.daily)?.length ? <section className="panel table-panel"><div className="panel-heading"><div><h2>{seriesView === 'monthly' ? 'Monthly' : 'Daily'} trend</h2><p>UTC reporting buckets for revenue, known cost, fees, and net.</p></div><label>View<select value={seriesView} onChange={e => setSeriesView(e.target.value as 'monthly' | 'daily')}><option value="monthly">Monthly</option><option value="daily">Daily</option></select></label></div><div className="table-wrap"><table><thead><tr><th>Period (UTC)</th><th>Revenue</th><th>Cost</th><th>Fees</th><th>Net</th><th>Units</th></tr></thead><tbody>{(seriesView === 'monthly' ? report?.monthly : report?.daily)?.map(series => <tr key={series.period}><td>{series.period}</td><td>{money(series.revenueMinor, currency)}</td><td>{money(series.costMinor, currency)}</td><td>{money(series.feesMinor, currency)}</td><td>{money(series.netMinor, currency)}</td><td>{series.unitsSold}</td></tr>)}</tbody></table></div></section> : null}<section className="panel"><div className="panel-heading"><div><h2>Unallocated activity</h2><p>Amounts without defensible product-level attribution remain separate.</p></div></div><div className="status-row"><span>Unallocated revenue</span><b>{money(report?.unallocated?.revenueMinor, currency)}</b></div><div className="status-row"><span>Unallocated refunds</span><b>{money(report?.unallocated?.refundsMinor, currency)}</b></div><div className="status-row"><span>Unallocated processing fees</span><b>{money(report?.unallocated?.feesMinor, currency)}</b></div><div className="status-row"><span>Unallocated COGS reversals</span><b>{money(report?.unallocated?.cogsReversalMinor, currency)}</b></div>{report?.issues?.length ? <div className="notice compact-notice">Incomplete data: {Array.from(new Set(report.issues.map(issue => issue.code))).join(', ')}</div> : null}</section></>;
 }
 function Review({ issues, organizationId, currency, onSaved }: { issues: Issue[]; organizationId: string; currency: string; onSaved: () => void }) {
   const [selected, setSelected] = useState<Issue | null>(null);
@@ -265,7 +404,7 @@ function Review({ issues, organizationId, currency, onSaved }: { issues: Issue[]
     try {
       if (kind === 'item') {
         const dollars = Number(unitCost); const minor = Math.round(dollars * 100);
-        if ((catalogId.trim() && !itemName.trim()) || !Number.isFinite(dollars) || dollars < 0 || Math.abs(dollars * 100 - minor) > 1e-7) throw new Error('Enter the source item name and an approved unit cost in cents.');
+        if ((catalogId.trim() && !itemName.trim()) || !Number.isFinite(dollars) || dollars < 0 || Math.abs(dollars * 100 - minor) > 1e-7) throw new Error(catalogId.trim() && !itemName.trim() ? 'Enter the source item name and an approved unit cost in cents.' : 'Enter an approved unit cost in cents.');
         const idempotencyKey = crypto.randomUUID();
         let result: { projectionJobId: string };
         if (catalogId.trim()) {
@@ -297,6 +436,20 @@ function Review({ issues, organizationId, currency, onSaved }: { issues: Issue[]
   const selectedSaleLine = evidence.find(row => row.type === 'sale_line' && row.id === selectedSaleLineId) ?? evidence.find(row => row.type === 'sale_line');
   const refundEvidence = evidence.find(row => row.type === 'refund');
   const refundItems = evidence.filter(row => row.type === 'sale_line');
+  const passThroughLine = correction?.kind === 'item' && !!selectedSaleLine && !catalogId && !selectedSaleLine.item_name?.trim();
+  const passThroughPriceMinor = passThroughLine && selectedSaleLine ? passThroughUnitPriceMinor(selectedSaleLine) : null;
+  const saleCostNotice = passThroughLine
+    ? passThroughPriceMinor === null
+      ? 'Square did not provide a reliable per-unit price, so no pass-through cost is prefilled.'
+      : `Square also did not provide an item name. Per merchant policy, the prefilled pass-through cost equals the supported unit price of ${money(passThroughPriceMinor, itemCurrency)}. This approval applies only to this exact sale line (quantity ${selectedSaleLine?.quantity ?? 'unknown'}); replay uses unit cost × quantity.`
+    : `This approval applies only to this exact sale line (quantity ${selectedSaleLine?.quantity ?? 'unknown'}). Enter a supplier-backed acquisition cost; replay uses unit cost × quantity.`;
+  useEffect(() => {
+    if (!passThroughLine || !selectedSaleLine) return;
+    const unitPriceMinor = passThroughUnitPriceMinor(selectedSaleLine);
+    if (unitPriceMinor === null) return;
+    setUnitCost(minorInput(unitPriceMinor, itemCurrency));
+    setReason(passThroughReason(unitPriceMinor, itemCurrency));
+  }, [correction?.kind, correction?.issue.id, selectedSaleLine, passThroughLine, itemCurrency]);
   return <>
     <section className="panel table-panel">
       <div className="panel-heading"><div><h2>Human review queue</h2><p>Record the source-backed correction or prepare a draft for review.</p></div><span className="pill neutral">{issues.length} open</span></div>
@@ -330,9 +483,9 @@ function Review({ issues, organizationId, currency, onSaved }: { issues: Issue[]
         <button type="button" className="icon-button dialog-close" onClick={() => setCorrection(null)} aria-label="Close correction">×</button>
         <p className="eyebrow">SOURCE-BACKED FINANCE DECISION</p>
         <h2 id="correction-title">{correction.kind === 'item' ? (selectedSaleLine?.item_name?.trim() ? `Approve cost for ${selectedSaleLine.item_name.trim()}` : 'Approve item cost') : (refundEvidence?.amount_minor != null ? `Review refund of ${money(Number(refundEvidence.amount_minor), refundEvidence.currency ?? refundCurrency)}` : 'Review refund and returned items')}</h2>
-        <p className="muted">This decision is audited and triggers a replay of the issue’s historical period. Use supplier records or merchant return records for the values.</p>
+        <p className="muted">This decision is audited and triggers a replay of the issue’s historical period. {passThroughLine ? 'For an unidentified sale line with no catalog variation, merchant policy uses Square’s supported unit price as pass-through COGS.' : correction.kind === 'item' ? 'Use supplier acquisition records to establish the unit cost.' : 'Use merchant return records to establish the refund disposition and any supported COGS reversal.'}</p>
         {evidenceLoading ? <p className="muted">Loading Square evidence…</p> : correction.kind === 'item' ? <>
-          {evidence.filter(row => row.type === 'sale_line').length > 1 && <label>Sale item<select value={selectedSaleLineId} onChange={event => { const row = evidence.find(item => item.type === 'sale_line' && item.id === event.target.value); if (row) { setSelectedSaleLineId(row.id); setCatalogId(row.catalog_object_id ?? ''); setItemName(row.item_name ?? ''); setItemCurrency(row.currency ?? currency); setEffectiveDate((row.occurred_at ?? '').slice(0, 10)); } }}>{evidence.filter(row => row.type === 'sale_line').map(row => <option key={row.id} value={row.id}>{row.item_name?.trim() || 'Unidentified item'} · {row.occurred_at ? new Date(row.occurred_at).toLocaleDateString() : 'Date unavailable'} · {row.quantity ?? '—'} units · {row.amount_minor == null ? 'Amount unavailable' : money(Number(row.amount_minor), row.currency ?? currency)}</option>)}</select></label>}
+          {evidence.filter(row => row.type === 'sale_line').length > 1 && <label>Sale item<select value={selectedSaleLineId} onChange={event => { const row = evidence.find(item => item.type === 'sale_line' && item.id === event.target.value); if (row) { setSelectedSaleLineId(row.id); setCatalogId(row.catalog_object_id ?? ''); setItemName(row.item_name ?? ''); setItemCurrency(row.currency ?? currency); setEffectiveDate((row.occurred_at ?? '').slice(0, 10)); setUnitCost(''); setReason(''); } }}>{evidence.filter(row => row.type === 'sale_line').map(row => <option key={row.id} value={row.id}>{row.item_name?.trim() || 'Unidentified item'} · {row.occurred_at ? new Date(row.occurred_at).toLocaleDateString() : 'Date unavailable'} · {row.quantity ?? '—'} units · {row.amount_minor == null ? 'Amount unavailable' : money(Number(row.amount_minor), row.currency ?? currency)}</option>)}</select></label>}
           {selectedSaleLine ? <section className="decision-context" aria-label="Sale item being reviewed">
             <div className="decision-context-heading"><span>ITEM ON THIS SALE</span><strong>{selectedSaleLine.item_name?.trim() || 'Item name unavailable in Square'}</strong></div>
             <dl className="decision-context-grid"><div><dt>Sold</dt><dd>{selectedSaleLine.occurred_at ? new Date(selectedSaleLine.occurred_at).toLocaleDateString() : 'Date unavailable'}</dd></div><div><dt>Quantity</dt><dd>{selectedSaleLine.quantity ?? 'Unavailable'}</dd></div><div><dt>Gross sale</dt><dd>{selectedSaleLine.amount_minor == null ? 'Not provided' : money(Number(selectedSaleLine.amount_minor), selectedSaleLine.currency ?? itemCurrency)}</dd></div></dl>
@@ -340,8 +493,8 @@ function Review({ issues, organizationId, currency, onSaved }: { issues: Issue[]
             <div className="decision-context-heading"><span>SOURCE DETAILS UNAVAILABLE</span><strong>Sale item not identified</strong></div>
             <p>No matching Square sale line was found for this cost issue. The approval stays disabled until the item and transaction can be identified.</p>
           </section>}
-          {!catalogId && selectedSaleLine && <p className="notice compact-notice">Square did not link this line to a catalog variation. Enter the merchant’s supplier acquisition cost for one unit. This cost will apply only to this exact sale line (quantity {selectedSaleLine.quantity ?? 'unknown'}), not other or future sales. The replay uses unit cost × quantity.</p>}
-          <div className="form-grid"><label>Approved {catalogId ? 'unit cost per item' : 'acquisition cost per unit'} ({itemCurrency})<input required type="number" min="0" step="0.01" value={unitCost} onChange={event => setUnitCost(event.target.value)} /></label>{catalogId && <label>Cost effective from<input required type="date" value={effectiveDate} onChange={event => setEffectiveDate(event.target.value)} /></label>}<label>Cost currency (must match sale currency)<input readOnly value={itemCurrency} /></label></div>
+          {!catalogId && selectedSaleLine && <p className="notice compact-notice">Square did not link this line to a catalog variation. {saleCostNotice}</p>}
+          <div className="form-grid"><label>Approved {passThroughLine ? 'pass-through unit cost' : catalogId ? 'unit cost per item' : 'acquisition cost per unit'} ({itemCurrency})<input required type="number" min="0" step="0.01" value={unitCost} onChange={event => { setUnitCost(event.target.value); if (passThroughLine && passThroughPriceMinor !== null && parseMinor(event.target.value, itemCurrency) !== passThroughPriceMinor) setReason(''); }} /></label>{catalogId && <label>Cost effective from<input required type="date" value={effectiveDate} onChange={event => setEffectiveDate(event.target.value)} /></label>}<label>Cost currency (must match sale currency)<input readOnly value={itemCurrency} /></label></div>
         </> : <>
           {refundEvidence ? <section className="decision-context" aria-label="Refund and original order details">
             <div className="decision-context-heading"><span>REFUND AMOUNT</span><strong>{refundEvidence.amount_minor == null ? 'Amount unavailable' : money(Number(refundEvidence.amount_minor), refundEvidence.currency ?? refundCurrency)} refunded</strong></div>
@@ -356,9 +509,9 @@ function Review({ issues, organizationId, currency, onSaved }: { issues: Issue[]
           <div className="form-grid"><label>Returned disposition<select required value={disposition} onChange={event => { const value = event.target.value as typeof disposition; setDisposition(value); if (value === 'not_returned_to_inventory') setReversal('0.00'); }}><option value="">Select the merchant’s return outcome</option><option value="not_returned_to_inventory">Goods were not returned to inventory</option><option value="returned_to_inventory">Goods were returned and restocked</option></select></label><label>Approved COGS reversal ({refundCurrency})<input required type="number" min="0" step="0.01" disabled={disposition !== 'returned_to_inventory'} value={reversal} onChange={event => setReversal(event.target.value)} /></label><label>Cost currency<input required maxLength={3} value={refundCurrency} onChange={event => setRefundCurrency(event.target.value.toUpperCase())} /></label></div>
         </>}
         {!evidenceLoading && !correctionReady && <section className="decision-context decision-context-warning" role="status"><div className="decision-context-heading"><span>DECISION SAVING UNAVAILABLE</span><strong>A required system update is pending</strong></div><p>The Square evidence is shown for review, but this decision cannot be recorded until the finance review update is available.</p></section>}
-        <label>Decision reason<textarea required minLength={10} rows={3} maxLength={1000} value={reason} onChange={event => setReason(event.target.value)} placeholder={correction.kind === 'item' ? 'Cite the supplier invoice/receipt and how it establishes the per-unit cost…' : 'Cite the merchant return record and the basis for this decision…'} /></label>
+        <label>Decision reason<textarea required minLength={10} rows={3} maxLength={1000} value={reason} onChange={event => setReason(event.target.value)} placeholder={passThroughLine ? 'Explain the pass-through assumption and unit price basis…' : correction.kind === 'item' ? 'Cite the supplier invoice/receipt and how it establishes the per-unit cost…' : 'Cite the merchant return record and the basis for this decision…'} /></label>
         {error && correction && <p className="error" role="alert">{error}</p>}
-        <div className="form-actions"><button type="button" className="secondary" onClick={() => setCorrection(null)}>Cancel</button><button className="primary" disabled={busyId === correction.issue.id || evidenceLoading || !correctionReady || (correction.kind === 'item' && (!selectedSaleLine?.item_name?.trim() || (catalogId && !itemName.trim()) || (!catalogId && (!selectedSaleLine?.provider_object_id || !selectedSaleLine.line_id)))) || (correction.kind === 'refund' && (!refundEvidence || !refundId || !orderId || !disposition))}>{busyId === correction.issue.id ? 'Saving…' : 'Save and recalculate'}</button></div>
+        <div className="form-actions"><button type="button" className="secondary" onClick={() => setCorrection(null)}>Cancel</button><button className="primary" disabled={busyId === correction.issue.id || evidenceLoading || !correctionReady || (correction.kind === 'item' && (!selectedSaleLine || (catalogId ? !itemName.trim() : (!selectedSaleLine.provider_object_id || !selectedSaleLine.line_id)))) || (correction.kind === 'refund' && (!refundEvidence || !refundId || !orderId || !disposition))}>{busyId === correction.issue.id ? 'Saving…' : 'Save and recalculate'}</button></div>
       </form>
     </div>}
   </>;

@@ -89,6 +89,8 @@ operational_margin = net_sales - COGS - actual Square processing fees
 
 Exact tax, tip, service charge and fee treatment is a merchant policy fixed before production. Reconcile order totals to payment totals and flag any unexplained difference. If an item cost or currency is missing, show an **incomplete** margin rather than zero cost.
 
+For a Square sale line with neither an item name nor a catalog variation, the merchant-approved pass-through policy sets that exact line's unit COGS to the unit price supported by Square sale evidence. If only an extended line amount is available, derive a unit amount only when it divides evenly by a positive whole quantity; otherwise leave the cost unresolved. Record the assumption in the audited line-specific approval. This rule does not create a cost for other or future sales.
+
 For a named account `A`, cutoff `T`, and opening balance observation `B0`:
 
 ```text
@@ -115,6 +117,7 @@ The agent receives only necessary records with stable IDs and redacted sensitive
 `monitoring → diagnosing → [item_proposed | awaiting_clarification | resolved | failed] → monitoring`
 
 - Unknown Square catalog variation: locate exact catalog ID and candidate metadata. If approved cost is absent, hold COGS for affected sales. The agent may draft an item definition; the reviewer supplies cost and effective date.
+- Unnamed sale line with no catalog variation: offer the Square-supported unit price as a pass-through cost for that exact line, with the assumption recorded in the human approval reason. If source amounts do not support an exact per-unit value, leave the cost unresolved.
 - Ambiguous transaction: ask a targeted question showing the source record and why classification matters. After human response, recompute affected projections.
 - Invalid or missing source facts: fail with a reason code and retry policy. Do not fabricate an item or classify from a plausible name alone.
 
@@ -156,6 +159,19 @@ Key invariants:
 - Supabase RLS isolates organizations; all browser access uses a publishable key with authenticated policies. Service keys and external API keys remain server-side.
 
 ## 8. Screens and workflow
+
+### Staged next update (October 2, 2026)
+
+Inventory quantity tracking and product analytics are being prepared behind
+disabled server and organization feature gates. They must remain inactive while
+the current product is being debugged. Supply receipts link to one actual
+purchase cash outflow; evidence-backed opening stock and manual corrections
+append quantity records without changing cash. Product reports show revenue,
+approved COGS, and operational net, preserving missing-data exceptions and
+unallocated refunds/fees. These capabilities are deterministic and do not use
+agent loops. See [the staged update contract](docs/STAGED_INVENTORY_ANALYTICS.md)
+for boundaries and the future rollout gate. Quantity tracking does not establish
+formal inventory valuation or an accounting net-income statement.
 
 1. **Overview:** income, cash, sync freshness, unresolved issues, period and account selector; each metric links to its calculation.
 2. **Income & inventory:** Square sales by item, unit cost status, fees, margin, item definition review.

@@ -7,7 +7,7 @@ const org = '11111111-1111-4111-8111-111111111111';
 const account = '22222222-2222-4222-8222-222222222222';
 const user = '33333333-3333-4333-8333-333333333333';
 
-function setup({ role = 'operator', proposalFixture = false, proposalType = 'unknown_item', proposalPolicyVersion = 'policy-v1', fetchImpl, budgetAllowed = true } = {}) {
+function setup({ role = 'operator', proposalFixture = false, proposalType = 'unknown_item', proposalPolicyVersion = 'policy-v1', fetchImpl, budgetAllowed = true, inventoryFlag = false, analyticsFlag = false, inventoryServerFlag = false, analyticsServerFlag = false } = {}) {
   const calls = [];
   const inboxIds = new Set();
   const db = {
@@ -18,6 +18,12 @@ function setup({ role = 'operator', proposalFixture = false, proposalType = 'unk
     async listObservations(arg) { calls.push(['observations', arg]); return []; },
     async listAuditEvents(arg) { calls.push(['audit', arg]); return []; },
     async getSettings(arg) { calls.push(['settings', arg]); return {}; },
+    async getOrganizationFeatureFlags(arg) { calls.push(['features', arg]); return { inventoryTracking: inventoryFlag, productAnalytics: analyticsFlag }; },
+    async listInventoryMovements(arg) { calls.push(['inventory-list', arg]); return []; },
+    async getInventorySnapshot(arg) { calls.push(['inventory-snapshot', arg]); return { from: arg.from, to: arg.to, currency: arg.currency, items: [], movements: [], lines: [] }; },
+    async listProductAnalyticsFacts(arg) { calls.push(['analytics-facts', arg]); return { facts: [], sourceHealth: [], policy: {} }; },
+    async recordInventoryPurchase(arg) { calls.push(['inventory-purchase', arg]); return { cashMovementId: 'cash-1', inventoryMovementIds: ['stock-1'] }; },
+    async recordInventoryCorrection(arg) { calls.push(['inventory-correction', arg]); return { movementId: 'stock-2' }; },
     async getIssue() { return proposalFixture ? { id: '44444444-4444-4444-8444-444444444444', type: proposalType, code: proposalType === 'refund_cogs_review' ? 'REFUND_COGS_REVIEW' : 'UNKNOWN_ITEM', source_refs: proposalType === 'refund_cogs_review' ? ['refund-1','order-1'] : ['order-1:line-1'], details: { message: 'Human decision needed.', period_start: '2026-07-03T04:00:00Z', period_end: '2026-10-02T04:00:00Z' }, policyVersion: proposalPolicyVersion, allowedCategories: proposalType === 'unknown_item' ? ['inventory_item'] : [] } : null; },
     async getIssueEvidence() { return proposalFixture ? [{ id: 'source-1', type: 'sale_line', catalog_object_id: null, quantity: 1.5 }] : []; },
     async recordItemDefinition(arg) { calls.push(['item-definition', arg]); return { id: 'item-definition-1', version: 1 }; },
@@ -31,7 +37,7 @@ function setup({ role = 'operator', proposalFixture = false, proposalType = 'unk
   const queue = { async enqueueSquareSync(arg) { calls.push(['sync', arg]); return { id: 'job-1' }; }, async enqueueSquareWebhook(arg) { calls.push(['webhook-job', arg]); }, async enqueueProjectionReplay(arg) { calls.push(['projection-replay', arg]); return { id: 'replay-1' }; } };
   const webhookInbox = { async putIfAbsent(id, record) { calls.push(['inbox', id]); const inserted = !inboxIds.has(id); inboxIds.add(id); return { inserted, record }; } };
   const supabase = { auth: { async getUser(token) { calls.push(['auth', token]); return { data: { user: { id: user } }, error: null }; } } };
-  return { handlers: createHandlers({ supabase, db, queue, webhookInbox, fetchImpl, engine: { replayAccounting: () => ({}) }, config: { squareWebhookSignatureKey: 'key', squareNotificationUrl: 'https://example.test/webhook', openRouterApiKey: 'test-key' } }), calls };
+  return { handlers: createHandlers({ supabase, db, queue, webhookInbox, fetchImpl, engine: { replayAccounting: () => ({}) }, config: { squareWebhookSignatureKey: 'key', squareNotificationUrl: 'https://example.test/webhook', openRouterApiKey: 'test-key', inventoryTrackingEnabled: inventoryServerFlag, productAnalyticsEnabled: analyticsServerFlag } }), calls };
 }
 const auth = { authorization: 'Bearer valid.jwt.token' };
 const post = (path, body, headers = {}) => new Request(`https://app.test${path}`, { method: 'POST', headers: { ...auth, 'content-type': 'application/json', ...headers }, body: JSON.stringify(body) });
@@ -44,6 +50,43 @@ test('dashboard enforces bearer auth, organization membership, and returns no-st
   assert.equal((await read(res)).freshness, 'fresh');
   assert.ok(calls.some(x => x[0] === 'membership' && x[1].userId === user));
   assert.equal((await handlers.dashboard(new Request('https://app.test/api/dashboard'))).status, 401);
+});
+
+test('staged inventory and analytics routes stay unavailable and settings hide both capabilities by default', async () => {
+  const { handlers, calls } = setup();
+  const settings = await handlers.settings(new Request(`https://app.test/api/settings?organizationId=${org}`, { headers: auth }));
+  assert.deepEqual((await read(settings)).settings.features, { inventoryTracking: false, productAnalytics: false });
+  const inventory = await handlers.inventory(new Request(`https://app.test/api/inventory?organizationId=${org}&from=2026-01-01T00:00:00Z&to=2026-02-01T00:00:00Z&currency=USD`, { headers: auth }));
+  const analytics = await handlers.analytics(new Request(`https://app.test/api/analytics?organizationId=${org}&from=2026-01-01T00:00:00Z&to=2026-02-01T00:00:00Z&currency=USD`, { headers: auth }));
+  assert.equal(inventory.status, 404); assert.equal(analytics.status, 404);
+  assert.equal(calls.some(x => x[0] === 'features'), false);
+  assert.equal(calls.some(x => x[0] === 'inventory-list' || x[0] === 'analytics-facts'), false);
+});
+
+test('inventory purchase requires both deployment and organization opt-in and records actual cash outflow atomically', async () => {
+  const disabled = setup({ inventoryFlag: true });
+  const body = { organizationId: org, accountId: account, amountMinor: -2500, currency: 'USD', occurredAt: '2026-01-05T10:00:00Z', description: 'Supply invoice', evidenceRef: '44444444-4444-4444-8444-444444444444', lines: [{ itemId: '55555555-5555-4555-8555-555555555555', itemName: 'Coffee', quantity: 2, unitCostMinor: 1000 }] };
+  assert.equal((await disabled.handlers.inventoryPurchase(post('/api/inventory/purchases', body, { 'idempotency-key': 'inventory:disabled' }))).status, 404);
+  const enabled = setup({ role: 'owner', inventoryFlag: true, inventoryServerFlag: true });
+  const res = await enabled.handlers.inventoryPurchase(post('/api/inventory/purchases', body, { 'idempotency-key': 'inventory:purchase' }));
+  assert.equal(res.status, 201); assert.deepEqual(await read(res), { cashMovementId: 'cash-1', inventoryMovementIds: ['stock-1'] });
+  const recorded = enabled.calls.find(x => x[0] === 'inventory-purchase')[1];
+  assert.equal(recorded.amountMinor, -2500); assert.equal(recorded.lines[0].quantity, 2); assert.equal(recorded.accessToken, 'valid.jwt.token');
+  const invalid = await enabled.handlers.inventoryPurchase(post('/api/inventory/purchases', { ...body, amountMinor: -1000 }, { 'idempotency-key': 'inventory:too-small' }));
+  assert.equal(invalid.status, 400);
+});
+
+test('inventory correction and analytics routes enforce feature flags, bounds, and correction roles', async () => {
+  const operator = setup({ role: 'operator', inventoryFlag: true, analyticsFlag: true, inventoryServerFlag: true, analyticsServerFlag: true });
+  const correction = { organizationId: org, itemId: '55555555-5555-4555-8555-555555555555', quantityDelta: -2, occurredAt: '2026-01-05T10:00:00Z', reason: 'Physical count variance', evidenceRef: '44444444-4444-4444-8444-444444444444' };
+  assert.equal((await operator.handlers.inventoryCorrection(post('/api/inventory/corrections', correction, { 'idempotency-key': 'inventory:correction' }))).status, 403);
+  const reviewer = setup({ role: 'reviewer', inventoryFlag: true, analyticsFlag: true, inventoryServerFlag: true, analyticsServerFlag: true });
+  const corrected = await reviewer.handlers.inventoryCorrection(post('/api/inventory/corrections', correction, { 'idempotency-key': 'inventory:correction' }));
+  assert.equal(corrected.status, 201); assert.deepEqual((await read(corrected)), { movementId: 'stock-2' });
+  const report = await reviewer.handlers.analytics(new Request(`https://app.test/api/analytics?organizationId=${org}&from=2026-01-01T00:00:00Z&to=2026-02-01T00:00:00Z&currency=USD`, { headers: auth }));
+  assert.equal(report.status, 200); assert.equal((await read(report)).analytics.status, 'incomplete');
+  const tooLong = await reviewer.handlers.analytics(new Request(`https://app.test/api/analytics?organizationId=${org}&from=2025-01-01T00:00:00Z&to=2026-02-01T00:00:00Z&currency=USD`, { headers: auth }));
+  assert.equal(tooLong.status, 400);
 });
 
 test('manual movement validates strict shape/idempotency and calls authenticated transactional RPC', async () => {
@@ -196,14 +239,14 @@ test('approved item cost is recorded against issue evidence and queues historica
 test('catalog-less Square lines receive a source-linked one-line cost override and historical replay', async () => {
   const { handlers, calls } = setup({ role: 'reviewer', proposalFixture: true });
   const issueId = '44444444-4444-4444-8444-444444444444';
-  const saleLineId = '66666666-6666-4666-8666-666666666666';
-  const body = { organizationId: org, saleLineId, unitCostMinor: 425, currency: 'USD',
+  const body = { organizationId: org, squareOrderId: 'order-1', squareLineUid: 'line-1', unitCostMinor: 425, currency: 'USD',
     reason: 'Supplier invoice confirms the cost of this line.' };
   const response = await handlers.saleLineCost(post(`/api/issues/${issueId}/line-cost`, body, { 'idempotency-key': 'line-cost:1' }));
   assert.equal(response.status, 201);
   assert.deepEqual(await read(response), { id: 'line-cost-override-1', orderId: 'order-1', lineUid: 'line-1', projectionJobId: 'replay-1', projectionQueued: true });
   const correction = calls.find(x => x[0] === 'sale-line-cost')[1];
-  assert.equal(correction.saleLineId, saleLineId);
+  assert.equal(correction.squareOrderId, 'order-1');
+  assert.equal(correction.squareLineUid, 'line-1');
   assert.equal(correction.unitCostMinor, 425);
   assert.deepEqual(calls.find(x => x[0] === 'projection-replay')[1], {
     organizationId: org, startAt: '2026-07-03T04:00:00.000Z', endAt: '2026-10-02T04:00:00.000Z',
