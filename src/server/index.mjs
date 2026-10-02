@@ -1,6 +1,8 @@
 import { acceptSquareWebhook } from '../square/webhooks.mjs';
 import { diagnoseIssue, DiagnosisError, SUPPORTED_DIAGNOSIS_ISSUE_TYPES } from '../agent/diagnosis.mjs';
 import { createHash, randomUUID } from 'node:crypto';
+import { calculateProductAnalytics } from '../engine/analytics.mjs';
+import { calculateInventory } from '../engine/inventory.mjs';
 
 const JSON_HEADERS = { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' };
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -25,6 +27,27 @@ function exactObject(value, keys, required = keys) {
 }
 function text(value, max = 500) { return typeof value === 'string' && value.trim().length > 0 && value.length <= max; }
 function validDate(value) { return typeof value === 'string' && ISO.test(value) && Number.isFinite(Date.parse(value)); }
+const utc = value => Number.isFinite(Date.parse(value)) ? new Date(value).toISOString() : value;
+function windowCovered(windows, from, to) {
+  const instantMs = value => typeof value === 'string' && Number.isFinite(Date.parse(value)) ? Date.parse(value) : NaN;
+  const intervals = (windows ?? []).filter(w => Number.isFinite(instantMs(w?.from)) && Number.isFinite(instantMs(w?.to)) && instantMs(w.to) > instantMs(w.from))
+    .map(w => [Date.parse(w.from), Date.parse(w.to)]).sort((a, b) => a[0] - b[0]);
+  let cursor = instantMs(from), end = instantMs(to);
+  if (!Number.isFinite(cursor) || !Number.isFinite(end) || cursor >= end) return false;
+  for (const [start, stop] of intervals) {
+    if (start > cursor) return false;
+    if (stop > cursor) cursor = stop;
+    if (cursor >= end) return true;
+  }
+  return false;
+}
+function sourceHealthIncomplete(health, requiredResources) {
+  const fresh = row => row?.status === 'fresh' && row.gap == null
+    && Number.isFinite(Date.parse(row.lastSuccessfulSyncAt ?? ''))
+    && Date.now() - Date.parse(row.lastSuccessfulSyncAt) <= 24 * 60 * 60 * 1000;
+  return requiredResources.some(resource => !fresh(health.find(row => row?.resource === resource)))
+    || health.some(row => !fresh(row));
+}
 function validMoney(value) { return Number.isSafeInteger(value) && value !== 0; }
 function idempotency(req) {
   const key = req.headers.get('idempotency-key');
@@ -90,6 +113,24 @@ export function createHandlers(adapters) {
     if (!membership || !roles.has(membership.role)) throw new HttpError(403, 'FORBIDDEN');
     if (allowedRoles && !allowedRoles.includes(membership.role)) throw new HttpError(403, 'FORBIDDEN');
     return { userId: user.id, role: membership.role, accessToken: token };
+  };
+  const featureAvailability = async (organizationId, accessToken) => {
+    // Each capability needs both an explicit server-only deployment opt-in and
+    // an organization row. Missing flags/adapters always fail closed.
+    const serverInventory = config.inventoryTrackingEnabled === true;
+    const serverAnalytics = config.productAnalyticsEnabled === true;
+    let organizationFlags = {};
+    if ((serverInventory || serverAnalytics) && typeof db.getOrganizationFeatureFlags === 'function') {
+      organizationFlags = await db.getOrganizationFeatureFlags({ organizationId, accessToken }) ?? {};
+    }
+    return {
+      inventoryTracking: serverInventory && organizationFlags.inventoryTracking === true,
+      productAnalytics: serverAnalytics && organizationFlags.productAnalytics === true,
+    };
+  };
+  const requireFeature = async (organizationId, accessToken, feature) => {
+    const available = await featureAvailability(organizationId, accessToken);
+    if (!available[feature]) throw new HttpError(404, 'FEATURE_UNAVAILABLE');
   };
   const run = handler => async req => { try { return await handler(req); } catch (error) { return safeThrown(error); } };
 
@@ -317,7 +358,182 @@ export function createHandlers(adapters) {
     if (req.method !== 'GET') throw new HttpError(405, 'METHOD_NOT_ALLOWED');
     const u = new URL(req.url); const organizationId = u.searchParams.get('organizationId');
     const actor = await authorize(req, organizationId);
-    return ok({ settings: await db.getSettings({ organizationId, accessToken: actor.accessToken }) });
+    const settingsData = await db.getSettings({ organizationId, accessToken: actor.accessToken });
+    const availability = await featureAvailability(organizationId, actor.accessToken);
+    return ok({ settings: { ...settingsData, features: availability } });
+  });
+
+  const inventory = run(async req => {
+    if (req.method !== 'GET') throw new HttpError(405, 'METHOD_NOT_ALLOWED');
+    const u = new URL(req.url), organizationId = u.searchParams.get('organizationId');
+    const from = u.searchParams.get('from'), to = u.searchParams.get('to');
+    if (!validDate(from) || !validDate(to) || Date.parse(from) >= Date.parse(to) || Date.parse(to) - Date.parse(from) > 366 * 86400000) throw new HttpError(400, 'INVALID_QUERY');
+    const actor = await authorize(req, organizationId);
+    await requireFeature(organizationId, actor.accessToken, 'inventoryTracking');
+    if (typeof db.listInventoryMovements !== 'function' || typeof db.getInventorySnapshot !== 'function') throw new HttpError(503, 'INVENTORY_UNAVAILABLE');
+    const currency = u.searchParams.get('currency');
+    if (!/^[A-Z]{3}$/.test(currency ?? '')) throw new HttpError(400, 'INVALID_QUERY');
+    const [movements, snapshot] = await Promise.all([
+      db.listInventoryMovements({ organizationId, from, to, accessToken: actor.accessToken }),
+      db.getInventorySnapshot({ organizationId, from, to, currency, accessToken: actor.accessToken }),
+    ]);
+    const normalizedMovements = (snapshot.movements ?? []).map(m => ({ id: m.id, version: m.version ?? 1,
+      itemId: m.item_definition_id ?? m.inventory_item_id ?? m.itemId, squareCatalogObjectId: m.square_catalog_object_id ?? null,
+      itemName: m.item_name ?? m.itemName, quantityDelta: Number(m.quantity_delta ?? m.quantityDelta),
+      currency: m.currency, occurredAt: utc(m.occurred_at ?? m.occurredAt),
+      kind: ['opening_balance','opening'].includes(m.movement_type ?? m.kind) ? 'opening' : ['purchase','purchase_receipt'].includes(m.movement_type ?? m.kind) ? 'purchase' : 'adjustment',
+      evidenceId: m.evidence_file_id ?? m.evidenceId, reason: m.reason }));
+    const normalizedLines = (snapshot.lines ?? []).map(line => ({ ...line, id: line.id ?? line.objectId,
+      version: line.version ?? 1, occurredAt: utc(line.occurredAt ?? line.occurred_at),
+      itemName: line.itemName ?? line.name, status: line.status ?? 'completed' }));
+    const report = calculateInventory({ movements: normalizedMovements, lines: normalizedLines, from, to, currency,
+      itemDefinitions: (snapshot.items ?? []).map(item => ({ id: item.id, squareCatalogObjectId: item.square_catalog_object_id ?? item.squareCatalogObjectId, name: item.name })) });
+    const coverageFrom = snapshot.sourceCoverage?.requiredFrom ?? from;
+    const snapshotHealth = snapshot.sourceHealth ?? [];
+    const inventoryHealthIncomplete = sourceHealthIncomplete(snapshotHealth, ['square', 'orders', 'catalog']);
+    const missingInventoryParents = (snapshot.sourceGaps?.missingParentOrderLineCount ?? 0) > 0;
+    if (!windowCovered(snapshot.sourceCoverage?.windows, coverageFrom, to) || inventoryHealthIncomplete || missingInventoryParents) {
+      if (report.status !== 'failed') report.status = 'incomplete';
+      report.issues.push({ code: missingInventoryParents ? 'SOURCE_PARENT_MISSING' : inventoryHealthIncomplete ? 'SOURCE_HEALTH_INCOMPLETE' : 'SOURCE_WINDOW_UNVERIFIED', sourceRefs: [] });
+      for (const item of report.items) item.onHandQuantity = null;
+    }
+    const currentItems = (snapshot.items ?? []).map(item => ({ id: item.id, name: item.name, currency: item.currency }));
+    const displayMovements = (movements ?? []).map(m => ({ id: m.id, item_id: m.item_definition_id ?? m.inventory_item_id, item_name: m.item_name,
+      quantity_delta: Number(m.quantity_delta), occurred_at: m.occurred_at, movement_type: m.movement_type,
+      reason: m.reason, evidence_file_id: m.evidence_file_id, currency: m.currency }));
+    return ok({ movements: displayMovements, snapshot: { asOf: to, items: currentItems,
+      balances: report.items.map(item => ({ itemDefinitionId: item.itemId, itemName: item.itemName, currency, quantity: item.onHandQuantity })),
+      status: report.status, issues: report.issues, sourceCoverage: snapshot.sourceCoverage ?? null, sourceHealth: snapshot.sourceHealth ?? [] }, inventory: report });
+  });
+  const inventoryPurchase = run(async req => {
+    if (req.method !== 'POST') throw new HttpError(405, 'METHOD_NOT_ALLOWED');
+    const body = await readJson(req), key = idempotency(req);
+    const fields = ['organizationId','accountId','amountMinor','occurredAt','currency','description','evidenceRef','lines'];
+    if (!exactObject(body, fields) || !UUID.test(body.organizationId) || !UUID.test(body.accountId) || !validDate(body.occurredAt)
+        || !/^[A-Z]{3}$/.test(body.currency) || !text(body.description, 500) || !UUID.test(body.evidenceRef ?? '')
+        || !Array.isArray(body.lines) || body.lines.length < 1 || body.lines.length > 100) throw new HttpError(400, 'INVALID_INVENTORY_PURCHASE');
+    let totalMinor = 0;
+    for (const line of body.lines) {
+      if (!exactObject(line, ['itemId','itemName','quantity','unitCostMinor']) || !UUID.test(line.itemId ?? '') || !text(line.itemName, 200)
+          || !Number.isSafeInteger(line.quantity) || line.quantity < 1 || line.quantity > 1_000_000
+          || !Number.isSafeInteger(line.unitCostMinor) || line.unitCostMinor < 0 || line.unitCostMinor >= 1_000_000_000_000) throw new HttpError(400, 'INVALID_INVENTORY_PURCHASE');
+      const lineTotal = line.quantity * line.unitCostMinor;
+      if (!Number.isSafeInteger(lineTotal) || !Number.isSafeInteger(totalMinor + lineTotal)) throw new HttpError(400, 'INVALID_INVENTORY_PURCHASE');
+      totalMinor += lineTotal;
+    }
+    if (!Number.isSafeInteger(body.amountMinor) || body.amountMinor >= 0 || Math.abs(body.amountMinor) >= 1_000_000_000_000 || Math.abs(body.amountMinor) < totalMinor) throw new HttpError(400, 'INVALID_INVENTORY_PURCHASE');
+    const actor = await authorize(req, body.organizationId, ['owner','operator']);
+    await requireFeature(body.organizationId, actor.accessToken, 'inventoryTracking');
+    if (typeof db.recordInventoryPurchase !== 'function') throw new HttpError(503, 'INVENTORY_UNAVAILABLE');
+    const result = await db.recordInventoryPurchase({ organizationId: body.organizationId, accountId: body.accountId,
+      amountMinor: body.amountMinor, currency: body.currency, occurredAt: body.occurredAt, description: body.description.trim(),
+      evidenceFileId: body.evidenceRef, idempotencyKey: key, lines: body.lines.map(line => ({ ...line, itemId: line.itemId.trim(), itemName: line.itemName.trim() })) , accessToken: actor.accessToken });
+    return created(result);
+  });
+  const inventoryCorrection = run(async req => {
+    if (req.method !== 'POST') throw new HttpError(405, 'METHOD_NOT_ALLOWED');
+    const body = await readJson(req), key = idempotency(req);
+    if (!exactObject(body, ['organizationId','itemId','quantityDelta','occurredAt','reason','evidenceRef'])
+        || !UUID.test(body.organizationId) || !UUID.test(body.itemId ?? '') || !Number.isSafeInteger(body.quantityDelta)
+        || body.quantityDelta === 0 || Math.abs(body.quantityDelta) > 1_000_000 || !validDate(body.occurredAt)
+        || !text(body.reason, 1000) || body.reason.trim().length < 10 || !UUID.test(body.evidenceRef ?? '')) throw new HttpError(400, 'INVALID_INVENTORY_CORRECTION');
+    const actor = await authorize(req, body.organizationId, ['owner','reviewer']);
+    await requireFeature(body.organizationId, actor.accessToken, 'inventoryTracking');
+    if (typeof db.recordInventoryCorrection !== 'function') throw new HttpError(503, 'INVENTORY_UNAVAILABLE');
+    return created(await db.recordInventoryCorrection({ organizationId: body.organizationId, itemId: body.itemId.trim(),
+      quantityDelta: body.quantityDelta, occurredAt: body.occurredAt, reason: body.reason.trim(),
+      evidenceFileId: body.evidenceRef, idempotencyKey: key, accessToken: actor.accessToken }));
+  });
+  const inventoryOpening = run(async req => {
+    if (req.method !== 'POST') throw new HttpError(405, 'METHOD_NOT_ALLOWED');
+    const body = await readJson(req), key = idempotency(req);
+    if (!exactObject(body, ['organizationId','itemId','quantity','occurredAt','reason','evidenceRef'])
+        || !UUID.test(body.organizationId) || !UUID.test(body.itemId ?? '') || !Number.isSafeInteger(body.quantity)
+        || body.quantity < 0 || body.quantity > 1_000_000 || !validDate(body.occurredAt)
+        || !text(body.reason, 1000) || body.reason.trim().length < 10 || !UUID.test(body.evidenceRef ?? '')) throw new HttpError(400, 'INVALID_INVENTORY_OPENING');
+    const actor = await authorize(req, body.organizationId, ['owner','reviewer']);
+    await requireFeature(body.organizationId, actor.accessToken, 'inventoryTracking');
+    if (typeof db.recordInventoryOpening !== 'function') throw new HttpError(503, 'INVENTORY_UNAVAILABLE');
+    return created(await db.recordInventoryOpening({ organizationId: body.organizationId, itemId: body.itemId.trim(),
+      quantity: body.quantity, occurredAt: body.occurredAt, reason: body.reason.trim(),
+      evidenceFileId: body.evidenceRef, idempotencyKey: key, accessToken: actor.accessToken }));
+  });
+  const inventoryItem = run(async req => {
+    if (req.method !== 'POST') throw new HttpError(405, 'METHOD_NOT_ALLOWED');
+    const body = await readJson(req), key = idempotency(req);
+    if (!exactObject(body, ['organizationId','sku','name','currency','evidenceRef','reason'])
+        || !UUID.test(body.organizationId) || !text(body.sku, 100) || !text(body.name, 200)
+        || !/^[A-Z]{3}$/.test(body.currency) || !UUID.test(body.evidenceRef ?? '')
+        || !text(body.reason, 1000) || body.reason.trim().length < 10) throw new HttpError(400, 'INVALID_INVENTORY_ITEM');
+    const actor = await authorize(req, body.organizationId, ['owner','reviewer']);
+    await requireFeature(body.organizationId, actor.accessToken, 'inventoryTracking');
+    if (typeof db.recordInventoryItem !== 'function') throw new HttpError(503, 'INVENTORY_UNAVAILABLE');
+    return created(await db.recordInventoryItem({ organizationId: body.organizationId, sku: body.sku.trim(), name: body.name.trim(),
+      currency: body.currency, evidenceFileId: body.evidenceRef, reason: body.reason.trim(),
+      idempotencyKey: key, accessToken: actor.accessToken }));
+  });
+  const analytics = run(async req => {
+    if (req.method !== 'GET') throw new HttpError(405, 'METHOD_NOT_ALLOWED');
+    const u = new URL(req.url), organizationId = u.searchParams.get('organizationId');
+    const from = u.searchParams.get('from'), to = u.searchParams.get('to'), currency = u.searchParams.get('currency');
+    if (!validDate(from) || !validDate(to) || Date.parse(from) >= Date.parse(to) || Date.parse(to) - Date.parse(from) > 366 * 86400000 || !/^[A-Z]{3}$/.test(currency ?? '')) throw new HttpError(400, 'INVALID_QUERY');
+    const actor = await authorize(req, organizationId);
+    await requireFeature(organizationId, actor.accessToken, 'productAnalytics');
+    if (typeof db.listProductAnalyticsFacts !== 'function') throw new HttpError(503, 'ANALYTICS_UNAVAILABLE');
+    const sourceData = await db.listProductAnalyticsFacts({ organizationId, from, to, currency, accessToken: actor.accessToken });
+    const rows = Array.isArray(sourceData) ? sourceData : Array.isArray(sourceData?.facts) ? sourceData.facts : [];
+    const lines = [], refunds = [], fees = [];
+    const orderStatuses = new Map(rows.filter(row => row?.kind === 'order').map(row => [row.objectId, row.fact?.status]));
+    let missingFee = false;
+    for (const row of rows) {
+      const fact = row?.fact ?? row;
+      if (!fact) continue;
+      const normalized = { ...fact, id: fact.id ?? fact.objectId ?? row.objectId, version: fact.version ?? row.version };
+      if (row.kind === 'order_line' || row.kind === 'sale_line') {
+        normalized.status = String(normalized.status ?? orderStatuses.get(fact.orderId) ?? fact.orderStatus ?? '').toLowerCase();
+        normalized.itemName ??= fact.name;
+        lines.push(normalized);
+      } else if (row.kind === 'refund') {
+        normalized.reviewDisposition ??= fact.disposition;
+        normalized.status = String(normalized.status ?? '').toLowerCase();
+        refunds.push(normalized);
+      } else if (row.kind === 'payment') {
+        if (String(fact.status).toLowerCase() !== 'completed') continue;
+        if (fact.feeMinor == null || !['provided','provided_from_payout_entry','provided_from_payout_charge_entry','not_applicable_cash','not_applicable_no_sale'].includes(fact.feeStatus)) { missingFee = true; continue; }
+        fees.push({ id: normalized.id, version: normalized.version, orderId: fact.orderId, occurredAt: fact.occurredAt, currency: fact.currency, amountMinor: fact.feeMinor, status: 'completed' });
+      } else if (row.kind === 'fee' || row.kind === 'payment_fee' || row.kind === 'payout_entry') fees.push(normalized);
+    }
+    const rawPolicy = sourceData?.policy ?? {};
+    const incomePolicy = { tax: rawPolicy.taxTreatment === 'include' ? 'include' : 'exclude', tips: rawPolicy.tipTreatment === 'include' ? 'include' : 'exclude' };
+    const report = calculateProductAnalytics({ lines, refunds, fees, from, to, currency, incomePolicy });
+    const health = sourceData?.sourceHealth ?? sourceData?.health ?? [];
+    const incompleteHealth = sourceHealthIncomplete(health, ['square', 'orders', 'payments', 'refunds', 'catalog', 'payouts'])
+      || (sourceData?.sourceGaps?.missingPayoutEntryHealthCount ?? 0) > 0;
+    const incompleteCoverage = !windowCovered(sourceData?.sourceCoverage?.windows, from, to);
+    const missingParents = (sourceData?.sourceGaps?.missingParentOrderLineCount ?? 0) > 0;
+    if (missingFee || incompleteHealth || incompleteCoverage || missingParents || (sourceData?.openIssueCount ?? 0) > 0) {
+      if (report.status !== 'failed') report.status = 'incomplete';
+      report.totals.costMinor = null; report.totals.netMinor = null;
+      if (report.status !== 'failed') for (const product of report.products) { product.netMinor = null; product.netRank = null; product.marginBps = null; }
+      for (const series of [...(report.daily ?? []), ...(report.monthly ?? [])]) { series.costMinor = null; series.netMinor = null; }
+      if (missingFee) {
+        report.totals.feesMinor = null; report.unallocated.feesMinor = null;
+        for (const product of report.products) { product.feesMinor = null; product.netMinor = null; product.netRank = null; product.marginBps = null; }
+        for (const series of [...(report.daily ?? []), ...(report.monthly ?? [])]) series.feesMinor = null;
+      }
+      if (incompleteHealth || incompleteCoverage || missingParents) {
+        report.totals.revenueMinor = null;
+        for (const product of report.products) { product.revenueMinor = null; product.grossMinor = null; product.discountMinor = null; product.refundsMinor = null; product.revenueRank = null; product.revenueShareBps = null; product.netMinor = null; product.netRank = null; product.marginBps = null; }
+        for (const series of [...(report.daily ?? []), ...(report.monthly ?? [])]) series.revenueMinor = null;
+      }
+      if (missingFee) report.issues.push({ code: 'PROCESSING_FEE_INCOMPLETE', sourceRefs: [] });
+      if (incompleteHealth) report.issues.push({ code: 'SOURCE_HEALTH_INCOMPLETE', sourceRefs: [] });
+      if (incompleteCoverage) report.issues.push({ code: 'SOURCE_WINDOW_UNVERIFIED', sourceRefs: [] });
+      if (missingParents) report.issues.push({ code: 'SOURCE_PARENT_MISSING', sourceRefs: [] });
+      if ((sourceData?.openIssueCount ?? 0) > 0) report.issues.push({ code: 'OPEN_SOURCE_ISSUES', sourceRefs: [] });
+    }
+    return ok({ analytics: { ...report, sourceRevision: sourceData?.sourceRevision ?? null,
+      sourceCoverage: sourceData?.sourceCoverage ?? null, sourceHealth: health, incomePolicy } });
   });
 
   const evidence = run(async req => {
@@ -363,5 +579,5 @@ export function createHandlers(adapters) {
     return ok(result);
   });
 
-  return Object.freeze({ dashboard, issues, issueEvidence, audit, settings, evidence, evidenceUrl, manualMovement, manualMovements, observation, observations, proposal, itemCost, saleLineCost, refundReview, decision, replay, sync, webhook });
+  return Object.freeze({ dashboard, issues, issueEvidence, audit, settings, inventory, inventoryPurchase, inventoryCorrection, inventoryOpening, inventoryItem, analytics, evidence, evidenceUrl, manualMovement, manualMovements, observation, observations, proposal, itemCost, saleLineCost, refundReview, decision, replay, sync, webhook });
 }

@@ -539,6 +539,85 @@ export function createSupabaseAdapters({ url, publishableKey, secretKey, tokenEn
       }
       return table(userRest(accessToken), 'cash_movements', query);
     },
+    async getOrganizationFeatureFlags({ organizationId, accessToken }) {
+      const query = new URLSearchParams({ select: 'inventory_tracking,product_analytics', organization_id: eq(organizationId), limit: '2' });
+      const row = one(await table(userRest(accessToken), 'organization_feature_flags', query), 'organization feature flags');
+      return { inventoryTracking: row?.inventory_tracking === true, productAnalytics: row?.product_analytics === true };
+    },
+    async listInventoryMovements({ organizationId, from, to, accessToken }) {
+      const query = new URLSearchParams({ select: '*', organization_id: eq(organizationId), order: 'occurred_at.desc,id.desc', limit: '1000' });
+      if (from || to) {
+        const filters = [from && `occurred_at.gte.${from}`, to && `occurred_at.lt.${to}`].filter(Boolean);
+        query.set('and', `(${filters.join(',')})`);
+      }
+      return table(userRest(accessToken), 'inventory_movements', query);
+    },
+    async getInventorySnapshot({ organizationId, from, to, currency, accessToken }) {
+      const { data, error } = await userRest(accessToken).rpc('get_inventory_snapshot', {
+        organization_id: organizationId, start_at: from, end_at: to, currency
+      });
+      if (error) throw error;
+      return data ?? { from, to, currency, items: [], movements: [], lines: [] };
+    },
+    async listInventoryItems({ organizationId, asOf, accessToken }) {
+      const query = new URLSearchParams({ select: 'id,sku,square_catalog_object_id,name,currency,effective_from,effective_until,unit_cost_minor', organization_id: eq(organizationId), effective_from: `lte.${asOf}`, order: 'name.asc,effective_from.desc', limit: '1000' });
+      query.set('or', `(effective_until.is.null,effective_until.gt.${asOf})`);
+      const manualQuery = new URLSearchParams({ select: 'id,sku,name,currency,evidence_file_id,reason,created_at', organization_id: eq(organizationId), order: 'name.asc', limit: '1000' });
+      const [definitions, manualItems] = await Promise.all([
+        table(userRest(accessToken), 'item_definitions', query),
+        table(userRest(accessToken), 'inventory_items', manualQuery)
+      ]);
+      return [
+        ...definitions.map(item => ({ ...item, item_kind: 'catalog' })),
+        ...manualItems.map(item => ({ ...item, square_catalog_object_id: null, effective_from: null, effective_until: null, unit_cost_minor: null, item_kind: 'manual' }))
+      ].sort((a, b) => a.name.localeCompare(b.name) || a.item_kind.localeCompare(b.item_kind));
+    },
+    async recordInventoryItem(args) {
+      const { data, error } = await userRest(args.accessToken).rpc('record_inventory_item', {
+        organization_id: args.organizationId, sku: args.sku, name: args.name,
+        currency: args.currency, evidence_file_id: args.evidenceFileId,
+        reason: args.reason, idempotency_key: args.idempotencyKey
+      });
+      if (error) throw error;
+      return { itemId: data };
+    },
+    async recordInventoryPurchase(args) {
+      const { data, error } = await userRest(args.accessToken).rpc('record_inventory_purchase', {
+        organization_id: args.organizationId, account_id: args.accountId,
+        amount_minor: args.amountMinor, currency: args.currency, occurred_at: args.occurredAt,
+        description: args.description, evidence_file_id: args.evidenceFileId,
+        idempotency_key: args.idempotencyKey,
+        lines: args.lines.map(line => ({ itemId: line.itemId, itemName: line.itemName, quantity: line.quantity, unitCostMinor: line.unitCostMinor }))
+      });
+      if (error) throw error;
+      return data;
+    },
+    async recordInventoryCorrection(args) {
+      const { data, error } = await userRest(args.accessToken).rpc('record_inventory_correction', {
+        organization_id: args.organizationId, item_id: args.itemId,
+        quantity_delta: args.quantityDelta, occurred_at: args.occurredAt,
+        reason: args.reason, evidence_file_id: args.evidenceFileId,
+        idempotency_key: args.idempotencyKey
+      });
+      if (error) throw error;
+      return { movementId: data };
+    },
+    async recordInventoryOpening(args) {
+      const { data, error } = await userRest(args.accessToken).rpc('record_inventory_opening', {
+        organization_id: args.organizationId, item_id: args.itemId, quantity: args.quantity,
+        occurred_at: args.occurredAt, reason: args.reason, evidence_file_id: args.evidenceFileId,
+        idempotency_key: args.idempotencyKey
+      });
+      if (error) throw error;
+      return { movementId: data };
+    },
+    async listProductAnalyticsFacts({ organizationId, from, to, accessToken }) {
+      const { data, error } = await userRest(accessToken).rpc('get_product_analytics_facts', {
+        organization_id: organizationId, start_at: from, end_at: to
+      });
+      if (error) throw error;
+      return data ?? { from, to, facts: [], policy: {}, sourceHealth: [], openIssueCount: 0 };
+    },
     async listObservations({ organizationId, accountId, accessToken }) {
       const query = new URLSearchParams({ select: '*', organization_id: eq(organizationId), order: 'observed_at.desc', limit: '1000' });
       if (accountId) query.set('account_id', eq(accountId));

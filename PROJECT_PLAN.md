@@ -157,6 +157,19 @@ Key invariants:
 
 ## 8. Screens and workflow
 
+### Staged next update (October 2, 2026)
+
+Inventory quantity tracking and product analytics are being prepared behind
+disabled server and organization feature gates. They must remain inactive while
+the current product is being debugged. Supply receipts link to one actual
+purchase cash outflow; evidence-backed opening stock and manual corrections
+append quantity records without changing cash. Product reports show revenue,
+approved COGS, and operational net, preserving missing-data exceptions and
+unallocated refunds/fees. These capabilities are deterministic and do not use
+agent loops. See [the staged update contract](docs/STAGED_INVENTORY_ANALYTICS.md)
+for boundaries and the future rollout gate. Quantity tracking does not establish
+formal inventory valuation or an accounting net-income statement.
+
 1. **Overview:** income, cash, sync freshness, unresolved issues, period and account selector; each metric links to its calculation.
 2. **Income & inventory:** Square sales by item, unit cost status, fees, margin, item definition review.
 3. **Cash flow:** dated inflow/outflow register, cash category breakdown, expected vs observed balance, manual entry form.

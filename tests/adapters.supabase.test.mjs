@@ -68,13 +68,13 @@ test('human finance corrections use caller authorization while projection replay
   await adapters.db.recordRefundCostReview({ organizationId: org, issueId: 'issue-id', squareRefundId: 'refund-1',
     squareOrderId: 'order-1', disposition: 'not_returned_to_inventory', approvedCogsReversalMinor: 0,
     currency: 'USD', reason: 'Merchant confirmed no restock.', idempotencyKey: 'refund:1', accessToken: userJwt });
-  await adapters.db.recordSaleLineCostOverride({ organizationId: org, issueId: 'issue-id', saleLineId: 'line-row-id',
+  await adapters.db.recordSaleLineCostOverride({ organizationId: org, issueId: 'issue-id', squareOrderId: 'order-1', squareLineUid: 'line-1',
     unitCostMinor: 425, currency: 'USD', reason: 'Supplier invoice confirms this cost.',
     idempotencyKey: 'line-cost:1', accessToken: userJwt });
   await adapters.queue.enqueueProjectionReplay({ organizationId: org, startAt: '2026-07-03T04:00:00Z',
     endAt: '2026-10-02T04:00:00Z', idempotencyKey: 'replay:1', requestedBy: 'user-id' });
   assert.deepEqual(calls.map(call => call.url.split('/').at(-1)), [
-    'record_item_definition', 'record_refund_cost_review', 'record_sale_line_cost_override', 'enqueue_projection_replay'
+    'record_item_definition', 'record_refund_cost_review', 'record_square_sale_line_cost_override', 'enqueue_projection_replay'
   ]);
   assert.ok(calls.slice(0, 3).every(call => call.headers.get('authorization') === `Bearer ${userJwt}`));
   assert.equal(calls[3].headers.get('authorization'), `Bearer ${serviceKey}`);
@@ -84,9 +84,8 @@ test('human finance corrections use caller authorization while projection replay
     p_approval_reason: 'Supplier invoice confirmed.', p_idempotency_key: 'cost:1'
   });
   assert.deepEqual(calls[2].body, {
-    p_organization_id: org, p_issue_id: 'issue-id', p_sale_line_id: 'line-row-id',
-    p_unit_cost_minor: 425, p_currency: 'USD', p_approval_reason: 'Supplier invoice confirms this cost.',
-    p_idempotency_key: 'line-cost:1'
+    p_organization_id: org, p_issue_id: 'issue-id', p_square_order_id: 'order-1', p_square_line_uid: 'line-1',
+    p_unit_cost_minor: 425, p_currency: 'USD', p_approval_reason: 'Supplier invoice confirms this cost.', p_idempotency_key: 'line-cost:1'
   });
 });
 
@@ -253,29 +252,30 @@ test('dashboard returns actual projection or explicit unavailable values and ten
   assert.ok(calls.every(call => call.headers.get('authorization') === `Bearer ${userJwt}`));
 });
 
-test('issue evidence uses stable unique sale-line ids and organization-scoped Square/order lookups', async () => {
+test('issue evidence preserves unnamed sale-line identifiers from the organization-scoped fact RPC', async () => {
   const calls = [];
   const issueId = '44444444-4444-4444-8444-444444444444';
-  const sourceId = '55555555-5555-4555-8555-555555555555';
   const adapters = createSupabaseAdapters({
-    url: 'https://tenant.supabase.test', publishableKey: 'publishable',
-    fetchImpl: async url => {
-      calls.push(String(url));
-      if (String(url).includes('/issues?')) return response([{ id: issueId, code: 'UNKNOWN_ITEM', details: {}, source_refs: [sourceId, 'order:456', 'another-order'] }]);
-      if (String(url).includes('/sale_lines?')) return response([
-        { id: 'line-1', source_event_id: sourceId, square_order_id: 'order:456', item_name: 'A', sold_at: '2026-01-01T00:00:00Z' },
-        { id: 'line-2', source_event_id: sourceId, square_order_id: 'order:456', item_name: 'B', sold_at: '2026-01-01T00:00:00Z' }
-      ]);
+    url: 'https://tenant.supabase.test', publishableKey: 'publishable', secretKey: serviceKey,
+    fetchImpl: async (url, init) => {
+      calls.push({ url: String(url), headers: new Headers(init.headers), body: init.body ? JSON.parse(init.body) : null });
+      if (String(url).includes('/issues?')) return response([{ id: issueId, code: 'UNKNOWN_ITEM', details: {}, source_refs: ['order-1:line-1', 'order-1:line-2'] }]);
+      if (String(url).includes('/rpc/get_issue_square_evidence')) return response({ facts: [
+        { kind: 'order_line', objectId: 'order-1:line-1', orderId: 'order-1', lineItemUid: 'line-1', name: null, occurredAt: '2026-01-01T00:00:00Z', currency: 'USD', quantity: 1, grossMinor: 200, catalogObjectId: null },
+        { kind: 'order_line', objectId: 'order-1:line-2', orderId: 'order-1', lineItemUid: 'line-2', name: 'B', occurredAt: '2026-01-01T00:00:00Z', currency: 'USD', quantity: 1, grossMinor: 300, catalogObjectId: null }
+      ] });
       throw new Error(`Unexpected request ${url}`);
     }
   });
   const records = await adapters.db.getIssueEvidence({ organizationId: org, issueId, accessToken: userJwt });
-  assert.deepEqual(records.map(record => record.id), ['line-1', 'line-2']);
-  const query = new URL(calls.find(url => url.includes('/sale_lines?')));
-  assert.equal(query.searchParams.get('organization_id'), `eq.${org}`);
-  assert.match(query.searchParams.get('or'), /source_event_id\.in\./);
-  assert.match(query.searchParams.get('or'), /square_order_id\.in\./);
-  assert.match(query.searchParams.get('or'), /and\(square_order_id\.eq\.order,square_line_uid\.eq\.456\)/);
+  assert.deepEqual(records.map(record => record.id), ['order-1:line-1', 'order-1:line-2']);
+  assert.equal(records[0].item_name, null);
+  assert.equal(records[0].provider_object_id, 'order-1');
+  assert.equal(records[0].line_id, 'line-1');
+  const rpc = calls.find(call => call.url.includes('/rpc/get_issue_square_evidence'));
+  assert.deepEqual(rpc.body, { p_organization_id: org, p_issue_code: 'UNKNOWN_ITEM', p_source_refs: ['order-1:line-1', 'order-1:line-2'] });
+  assert.equal(rpc.headers.get('apikey'), serviceKey);
+  assert.equal(rpc.headers.get('authorization'), `Bearer ${serviceKey}`);
 });
 
 test('projection issues use their calculation version for proposal context and support refund review drafts', async () => {

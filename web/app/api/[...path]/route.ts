@@ -25,6 +25,8 @@ function handlers() {
       openRouterApiKey: process.env.OPENROUTER_API_KEY ?? '',
       openRouterModel: process.env.OPENROUTER_MODEL ?? 'openai/gpt-6-luna',
       openRouterMaxOutputTokens: Number(process.env.OPENROUTER_MAX_OUTPUT_TOKENS ?? 700),
+      inventoryTrackingEnabled: process.env.INVENTORY_TRACKING_ENABLED === 'true',
+      productAnalyticsEnabled: process.env.PRODUCT_ANALYTICS_ENABLED === 'true',
     },
   });
   return { route, adapters };
@@ -77,6 +79,12 @@ async function dispatch(request: Request) {
   if (resource === 'observations' && method === 'POST') return route.observation(request);
   if (resource === 'audit' && method === 'GET') return route.audit(request);
   if (resource === 'settings' && method === 'GET') return route.settings(request);
+  if (resource === 'inventory' && !id && method === 'GET') return route.inventory(request);
+  if (resource === 'inventory' && id === 'purchases' && method === 'POST') return route.inventoryPurchase(request);
+  if (resource === 'inventory' && id === 'corrections' && method === 'POST') return route.inventoryCorrection(request);
+  if (resource === 'inventory' && id === 'openings' && method === 'POST') return route.inventoryOpening(request);
+  if (resource === 'inventory' && id === 'items' && method === 'POST') return route.inventoryItem(request);
+  if (resource === 'analytics' && method === 'GET') return route.analytics(request);
   if (resource === 'evidence' && !id && method === 'POST') return route.evidence(request);
   if (resource === 'evidence' && !id && method === 'GET') return route.evidenceUrl(request);
   if (resource === 'runs' && id && action === 'replay' && method === 'POST') return route.replay(request);
