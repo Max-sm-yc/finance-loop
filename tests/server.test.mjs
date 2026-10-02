@@ -18,14 +18,16 @@ function setup({ role = 'operator', proposalFixture = false, proposalType = 'unk
     async listObservations(arg) { calls.push(['observations', arg]); return []; },
     async listAuditEvents(arg) { calls.push(['audit', arg]); return []; },
     async getSettings(arg) { calls.push(['settings', arg]); return {}; },
-    async getIssue() { return proposalFixture ? { id: '44444444-4444-4444-8444-444444444444', type: proposalType, code: proposalType === 'refund_cogs_review' ? 'REFUND_COGS_REVIEW' : 'UNKNOWN_ITEM', details: { message: 'Human decision needed.' }, policyVersion: proposalPolicyVersion, allowedCategories: proposalType === 'unknown_item' ? ['inventory_item'] : [] } : null; },
+    async getIssue() { return proposalFixture ? { id: '44444444-4444-4444-8444-444444444444', type: proposalType, code: proposalType === 'refund_cogs_review' ? 'REFUND_COGS_REVIEW' : 'UNKNOWN_ITEM', source_refs: proposalType === 'refund_cogs_review' ? ['refund-1','order-1'] : ['order-1:line-1'], details: { message: 'Human decision needed.', period_start: '2026-07-03T04:00:00Z', period_end: '2026-10-02T04:00:00Z' }, policyVersion: proposalPolicyVersion, allowedCategories: proposalType === 'unknown_item' ? ['inventory_item'] : [] } : null; },
     async getIssueEvidence() { return proposalFixture ? [{ id: 'source-1', type: 'sale_line', catalog_object_id: null, quantity: 1.5 }] : []; },
+    async recordItemDefinition(arg) { calls.push(['item-definition', arg]); return { id: 'item-definition-1', version: 1 }; },
+    async recordRefundCostReview(arg) { calls.push(['refund-review', arg]); return { id: 'refund-review-1' }; },
     async createProposalAtomic(arg) { calls.push(['proposal', arg]); return { id: 'proposal' }; },
     async reserveModelBudget() { return budgetAllowed; }, async recordModelUsage() {},
     async getReplaySnapshot() { return null; }, async saveProjectionRun() { return {}; },
     asUser(token) { calls.push(['asUser', token]); return { async rpc(name, args) { calls.push(['rpc', name, args]); return { data: 'new-id', error: null }; } }; }
   };
-  const queue = { async enqueueSquareSync(arg) { calls.push(['sync', arg]); return { id: 'job-1' }; }, async enqueueSquareWebhook(arg) { calls.push(['webhook-job', arg]); } };
+  const queue = { async enqueueSquareSync(arg) { calls.push(['sync', arg]); return { id: 'job-1' }; }, async enqueueSquareWebhook(arg) { calls.push(['webhook-job', arg]); }, async enqueueProjectionReplay(arg) { calls.push(['projection-replay', arg]); return { id: 'replay-1' }; } };
   const webhookInbox = { async putIfAbsent(id, record) { calls.push(['inbox', id]); const inserted = !inboxIds.has(id); inboxIds.add(id); return { inserted, record }; } };
   const supabase = { auth: { async getUser(token) { calls.push(['auth', token]); return { data: { user: { id: user } }, error: null }; } } };
   return { handlers: createHandlers({ supabase, db, queue, webhookInbox, fetchImpl, engine: { replayAccounting: () => ({}) }, config: { squareWebhookSignatureKey: 'key', squareNotificationUrl: 'https://example.test/webhook', openRouterApiKey: 'test-key' } }), calls };
@@ -161,6 +163,50 @@ test('proposal budget failures explain the organization budget and per-issue dai
     error: 'BUDGET_EXCEEDED', code: 'BUDGET_EXCEEDED',
     detail: 'The organization daily token budget is exhausted, or this issue already has a reservation today'
   });
+});
+
+test('issue evidence endpoint returns only organization-scoped sale lines', async () => {
+  const { handlers } = setup({ proposalFixture: true });
+  const issueId = '44444444-4444-4444-8444-444444444444';
+  const response = await handlers.issueEvidence(new Request(`https://app.test/api/issues/${issueId}/evidence?organizationId=${org}`, { headers: auth }));
+  assert.equal(response.status, 200);
+  const data = await read(response);
+  assert.equal(data.evidence[0].id, 'source-1');
+  assert.equal(data.evidence[0].type, 'sale_line');
+});
+
+test('approved item cost is recorded against issue evidence and queues historical recalculation', async () => {
+  const { handlers, calls } = setup({ role: 'owner', proposalFixture: true });
+  const issueId = '44444444-4444-4444-8444-444444444444';
+  const body = { organizationId: org, squareCatalogObjectId: 'variation-1', name: 'Tea', unitCostMinor: 425,
+    currency: 'USD', effectiveFrom: '2026-07-03T04:00:00Z', reason: 'Approved from the supplier invoice.' };
+  const response = await handlers.itemCost(post(`/api/issues/${issueId}/item-cost`, body, { 'idempotency-key': 'item-cost:1' }));
+  assert.equal(response.status, 201);
+  assert.deepEqual(await read(response), { id: 'item-definition-1', version: 1, projectionJobId: 'replay-1', projectionQueued: true });
+  const correction = calls.find(x => x[0] === 'item-definition')[1];
+  assert.equal(correction.squareCatalogObjectId, 'variation-1');
+  assert.equal(correction.unitCostMinor, 425);
+  assert.deepEqual(calls.find(x => x[0] === 'projection-replay')[1], {
+    organizationId: org, startAt: '2026-07-03T04:00:00.000Z', endAt: '2026-10-02T04:00:00.000Z',
+    idempotencyKey: `item-cost:${issueId}:item-cost:1`, requestedBy: user
+  });
+});
+
+test('refund COGS review validates disposition and queues historical recalculation', async () => {
+  const { handlers, calls } = setup({ role: 'owner', proposalFixture: true, proposalType: 'refund_cogs_review' });
+  const issueId = '44444444-4444-4444-8444-444444444444';
+  const body = { organizationId: org, squareRefundId: 'refund-1', squareOrderId: 'order-1',
+    disposition: 'not_returned_to_inventory', approvedCogsReversalMinor: 0, currency: 'USD',
+    reason: 'Merchant confirmed goods were not returned.' };
+  const response = await handlers.refundReview(post(`/api/issues/${issueId}/refund-review`, body, { 'idempotency-key': 'refund-review:1' }));
+  assert.equal(response.status, 201);
+  assert.equal((await read(response)).projectionQueued, true);
+  assert.equal(calls.find(x => x[0] === 'refund-review')[1].disposition, 'not_returned_to_inventory');
+  const invalid = await handlers.refundReview(post(`/api/issues/${issueId}/refund-review`, {
+    ...body, disposition: 'not_returned_to_inventory', approvedCogsReversalMinor: 1
+  }, { 'idempotency-key': 'refund-review:2' }));
+  assert.equal(invalid.status, 400);
+  assert.equal((await read(invalid)).code, 'INVALID_REFUND_REVIEW');
 });
 
 test('read endpoints expose issues, audit, and settings in a data envelope', async () => {

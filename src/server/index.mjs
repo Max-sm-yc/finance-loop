@@ -15,9 +15,9 @@ const created = data => response(201, data);
 const bad = (status, code) => response(status, { error: code, code });
 function requireAdapters({ supabase, db, queue, config }) {
   if (!supabase?.auth?.getUser || !db || !queue || !config) throw new TypeError('Supabase auth, durable DB/queue adapters, and config are required');
-  const required = ['getMembership', 'getDashboard', 'listIssues', 'listManualMovements', 'listObservations', 'listAuditEvents', 'getSettings', 'getIssue', 'getIssueEvidence', 'createProposalAtomic', 'reserveModelBudget', 'recordModelUsage', 'getReplaySnapshot', 'saveProjectionRun', 'asUser'];
+  const required = ['getMembership', 'getDashboard', 'listIssues', 'listManualMovements', 'listObservations', 'listAuditEvents', 'getSettings', 'getIssue', 'getIssueEvidence', 'recordItemDefinition', 'recordRefundCostReview', 'createProposalAtomic', 'reserveModelBudget', 'recordModelUsage', 'getReplaySnapshot', 'saveProjectionRun', 'asUser'];
   for (const method of required) if (typeof db[method] !== 'function') throw new TypeError(`db.${method} durable adapter method is required`);
-  for (const method of ['enqueueSquareSync', 'enqueueSquareWebhook']) if (typeof queue[method] !== 'function') throw new TypeError(`queue.${method} durable adapter method is required`);
+  for (const method of ['enqueueSquareSync', 'enqueueSquareWebhook', 'enqueueProjectionReplay']) if (typeof queue[method] !== 'function') throw new TypeError(`queue.${method} durable adapter method is required`);
   return { supabase, db, queue, config };
 }
 function exactObject(value, keys, required = keys) {
@@ -150,6 +150,60 @@ export function createHandlers(adapters) {
     return created(await db.createProposalAtomic({ organizationId: body.organizationId, issueId: body.issueId, proposal: draft.proposal, modelId: draft.model, promptVersion: draft.promptVersion, validationStatus: 'valid', decision: 'pending', idempotencyKey: key, actorUserId: actor.userId, accessToken: actor.accessToken, correlationId: req.headers.get('x-correlation-id') ?? randomUUID() }));
   });
 
+  const correctionWindow = issue => {
+    const startAt = Date.parse(issue.details?.period_start ?? '');
+    const endAt = Date.parse(issue.details?.period_end ?? '');
+    if (!Number.isFinite(startAt) || !Number.isFinite(endAt) || endAt <= startAt || endAt - startAt > 370 * 24 * 60 * 60 * 1000) {
+      throw new HttpError(409, 'ISSUE_PERIOD_UNAVAILABLE');
+    }
+    return { startAt: new Date(startAt).toISOString(), endAt: new Date(endAt).toISOString() };
+  };
+  const itemCost = run(async req => {
+    if (req.method !== 'POST') throw new HttpError(405, 'METHOD_NOT_ALLOWED');
+    const body = await readJson(req); const key = idempotency(req);
+    if (!exactObject(body, ['organizationId','squareCatalogObjectId','name','unitCostMinor','currency','effectiveFrom','reason'])
+        || !UUID.test(body.organizationId) || !text(body.squareCatalogObjectId, 200) || !text(body.name, 200)
+        || !Number.isSafeInteger(body.unitCostMinor) || body.unitCostMinor < 0 || body.unitCostMinor >= 1_000_000_000_000
+        || !/^[A-Z]{3}$/.test(body.currency) || !validDate(body.effectiveFrom)
+        || !text(body.reason, 1000) || body.reason.trim().length < 10) throw new HttpError(400, 'INVALID_ITEM_COST');
+    const actor = await authorize(req, body.organizationId, ['owner','reviewer']);
+    const issueId = new URL(req.url).pathname.split('/').at(-2) ?? '';
+    if (!UUID.test(issueId)) throw new HttpError(400, 'INVALID_ISSUE_ID');
+    const issue = await db.getIssue({ organizationId: body.organizationId, issueId, accessToken: actor.accessToken });
+    if (!issue || issue.code !== 'UNKNOWN_ITEM' || issue.state === 'resolved') throw new HttpError(404, 'UNKNOWN_ITEM_ISSUE_NOT_FOUND');
+    const window = correctionWindow(issue);
+    const definition = await db.recordItemDefinition({ organizationId: body.organizationId, issueId: issue.id,
+      squareCatalogObjectId: body.squareCatalogObjectId.trim(), name: body.name.trim(), unitCostMinor: body.unitCostMinor,
+      currency: body.currency, effectiveFrom: body.effectiveFrom, reason: body.reason.trim(), idempotencyKey: key,
+      accessToken: actor.accessToken });
+    const replay = await queue.enqueueProjectionReplay({ organizationId: body.organizationId, ...window,
+      idempotencyKey: `item-cost:${issue.id}:${key}`, requestedBy: actor.userId });
+    return created({ ...definition, projectionJobId: replay.id, projectionQueued: true });
+  });
+  const refundReview = run(async req => {
+    if (req.method !== 'POST') throw new HttpError(405, 'METHOD_NOT_ALLOWED');
+    const body = await readJson(req); const key = idempotency(req);
+    if (!exactObject(body, ['organizationId','squareRefundId','squareOrderId','disposition','approvedCogsReversalMinor','currency','reason'])
+        || !UUID.test(body.organizationId) || !text(body.squareRefundId, 200) || !text(body.squareOrderId, 200)
+        || !['returned_to_inventory','not_returned_to_inventory'].includes(body.disposition)
+        || !Number.isSafeInteger(body.approvedCogsReversalMinor) || body.approvedCogsReversalMinor < 0
+        || !/^[A-Z]{3}$/.test(body.currency) || !text(body.reason, 1000) || body.reason.trim().length < 10
+        || (body.disposition === 'not_returned_to_inventory' && body.approvedCogsReversalMinor !== 0)) throw new HttpError(400, 'INVALID_REFUND_REVIEW');
+    const actor = await authorize(req, body.organizationId, ['owner','reviewer']);
+    const issueId = new URL(req.url).pathname.split('/').at(-2) ?? '';
+    if (!UUID.test(issueId)) throw new HttpError(400, 'INVALID_ISSUE_ID');
+    const issue = await db.getIssue({ organizationId: body.organizationId, issueId, accessToken: actor.accessToken });
+    if (!issue || issue.code !== 'REFUND_COGS_REVIEW' || issue.state === 'resolved') throw new HttpError(404, 'REFUND_REVIEW_ISSUE_NOT_FOUND');
+    const window = correctionWindow(issue);
+    const review = await db.recordRefundCostReview({ organizationId: body.organizationId, issueId: issue.id,
+      squareRefundId: body.squareRefundId.trim(), squareOrderId: body.squareOrderId.trim(), disposition: body.disposition,
+      approvedCogsReversalMinor: body.approvedCogsReversalMinor, currency: body.currency,
+      reason: body.reason.trim(), idempotencyKey: key, accessToken: actor.accessToken });
+    const replay = await queue.enqueueProjectionReplay({ organizationId: body.organizationId, ...window,
+      idempotencyKey: `refund-review:${issue.id}:${key}`, requestedBy: actor.userId });
+    return created({ ...review, projectionJobId: replay.id, projectionQueued: true });
+  });
+
   const decision = run(async req => {
     if (req.method !== 'POST') throw new HttpError(405, 'METHOD_NOT_ALLOWED');
     const body = await readJson(req); const key = idempotency(req);
@@ -199,6 +253,16 @@ export function createHandlers(adapters) {
     const actor = await authorize(req, organizationId);
     const records = await db.listIssues({ organizationId, state: u.searchParams.get('state') ?? undefined, accessToken: actor.accessToken });
     return ok({ issues: records });
+  });
+  const issueEvidence = run(async req => {
+    if (req.method !== 'GET') throw new HttpError(405, 'METHOD_NOT_ALLOWED');
+    const u = new URL(req.url); const organizationId = u.searchParams.get('organizationId');
+    const issueId = u.pathname.split('/').at(-2) ?? '';
+    if (!UUID.test(organizationId ?? '') || !UUID.test(issueId)) throw new HttpError(400, 'INVALID_ISSUE_EVIDENCE_REQUEST');
+    const actor = await authorize(req, organizationId, ['owner','operator','reviewer','read_only']);
+    const issue = await db.getIssue({ organizationId, issueId, accessToken: actor.accessToken });
+    if (!issue) throw new HttpError(404, 'ISSUE_NOT_FOUND');
+    return ok({ evidence: await db.getIssueEvidence({ organizationId, issueId, accessToken: actor.accessToken }) });
   });
   const manualMovements = run(async req => {
     if (req.method !== 'GET') throw new HttpError(405, 'METHOD_NOT_ALLOWED');
@@ -274,5 +338,5 @@ export function createHandlers(adapters) {
     return ok(result);
   });
 
-  return Object.freeze({ dashboard, issues, audit, settings, evidence, evidenceUrl, manualMovement, manualMovements, observation, observations, proposal, decision, replay, sync, webhook });
+  return Object.freeze({ dashboard, issues, issueEvidence, audit, settings, evidence, evidenceUrl, manualMovement, manualMovements, observation, observations, proposal, itemCost, refundReview, decision, replay, sync, webhook });
 }

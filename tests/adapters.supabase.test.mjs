@@ -53,6 +53,35 @@ test('RPC uses the caller JWT and SQL p_ argument names; no service key is expos
   assert.equal('serviceKey' in adapters, false);
 });
 
+test('human finance corrections use caller authorization while projection replay uses the worker key', async () => {
+  const calls = [];
+  const adapters = createSupabaseAdapters({
+    url: 'https://tenant.supabase.test', publishableKey: 'publishable', secretKey: serviceKey,
+    fetchImpl: async (url, init) => {
+      calls.push({ url: String(url), headers: new Headers(init.headers), body: JSON.parse(init.body) });
+      return response({ id: 'saved-id' });
+    }
+  });
+  await adapters.db.recordItemDefinition({ organizationId: org, issueId: 'issue-id', squareCatalogObjectId: 'variation-1',
+    name: 'Tea', unitCostMinor: 425, currency: 'USD', effectiveFrom: '2026-07-03T04:00:00Z',
+    reason: 'Supplier invoice confirmed.', idempotencyKey: 'cost:1', accessToken: userJwt });
+  await adapters.db.recordRefundCostReview({ organizationId: org, issueId: 'issue-id', squareRefundId: 'refund-1',
+    squareOrderId: 'order-1', disposition: 'not_returned_to_inventory', approvedCogsReversalMinor: 0,
+    currency: 'USD', reason: 'Merchant confirmed no restock.', idempotencyKey: 'refund:1', accessToken: userJwt });
+  await adapters.queue.enqueueProjectionReplay({ organizationId: org, startAt: '2026-07-03T04:00:00Z',
+    endAt: '2026-10-02T04:00:00Z', idempotencyKey: 'replay:1', requestedBy: 'user-id' });
+  assert.deepEqual(calls.map(call => call.url.split('/').at(-1)), [
+    'record_item_definition', 'record_refund_cost_review', 'enqueue_projection_replay'
+  ]);
+  assert.ok(calls.slice(0, 2).every(call => call.headers.get('authorization') === `Bearer ${userJwt}`));
+  assert.equal(calls[2].headers.get('authorization'), `Bearer ${serviceKey}`);
+  assert.deepEqual(calls[0].body, {
+    p_organization_id: org, p_issue_id: 'issue-id', p_square_catalog_object_id: 'variation-1', p_name: 'Tea',
+    p_unit_cost_minor: 425, p_currency: 'USD', p_effective_from: '2026-07-03T04:00:00Z',
+    p_approval_reason: 'Supplier invoice confirmed.', p_idempotency_key: 'cost:1'
+  });
+});
+
 test('only durable queue and inbox RPCs use the server key, and lack of key fails closed', async () => {
   const seen = [];
   const adapters = createSupabaseAdapters({
@@ -167,6 +196,7 @@ test('worker projection snapshot maps Square income, refunds, approved costs, an
           { kind: 'refund', objectId: 'refund-1', version: '1', status: 'COMPLETED', currency: 'USD', amountMinor: 250, occurredAt: '2026-09-20T12:00:00Z' },
         ],
         itemDefinitions: [{ square_catalog_object_id: 'variation-1', unit_cost_minor: '400', currency: 'USD', effective_from: '2026-01-01T00:00:00Z', effective_until: null }],
+        refundReviews: [{ square_refund_id: 'refund-1', square_order_id: 'order-1', disposition: 'returned_to_inventory', approved_cogs_reversal_minor: 400, currency: 'USD' }],
         accounts: [{ id: 'bank-1', currency: 'USD', opening_balance_minor: 10000, opening_balance_at: '2026-09-01T00:00:00Z' }],
         observations: [{ id: 'obs-1', account_id: 'bank-1', amount_minor: 12000, currency: 'USD', observed_at: '2026-09-30T00:00:00Z' }],
         movements: [{ id: 'movement-1', account_id: 'bank-1', kind: 'other_inflow', amount_minor: 1000, currency: 'USD', occurred_at: '2026-09-10T00:00:00Z', approval_status: 'approved', idempotency_key: 'inflow:1' }],
@@ -179,6 +209,9 @@ test('worker projection snapshot maps Square income, refunds, approved costs, an
   assert.equal(snapshot.lines[0].unitCostMinor, 400);
   assert.equal(snapshot.fees[0].amountMinor, 60);
   assert.equal(snapshot.refunds[0].amountMinor, 250);
+  assert.equal(snapshot.refunds[0].reviewDisposition, 'returned_to_inventory');
+  assert.equal(snapshot.refunds[0].approvedCogsReversalMinor, 400);
+  assert.equal(snapshot.refunds[0].reviewCurrency, 'USD');
   assert.equal(snapshot.accounts[0].toleranceMinor, 50);
   assert.equal(snapshot.reconciliations['bank-1'].movements[0].status, 'posted');
 });

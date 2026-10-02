@@ -363,10 +363,19 @@ export function createWorker(dependencies) {
   }
 
   async function handleReplay(job) {
-    const revision = job.payload?.sourceRevision;
+    const { sourceRevision: revision, startAt, endAt } = job.payload ?? {};
     if (!Number.isSafeInteger(revision) || revision < 0) throw Object.assign(new Error('Invalid replay revision'), { permanent: true });
-    await recomputeProjection(job.organizationId, revision, `job:${job.id}`, monthWindow(now().toISOString(), config.accountingTimezone ?? 'America/New_York', now()));
-    return { revision };
+    let window = monthWindow(now().toISOString(), config.accountingTimezone ?? 'America/New_York', now());
+    if (startAt !== undefined || endAt !== undefined) {
+      if (typeof startAt !== 'string' || typeof endAt !== 'string' || !Number.isFinite(Date.parse(startAt))
+          || !Number.isFinite(Date.parse(endAt)) || Date.parse(endAt) <= Date.parse(startAt)
+          || Date.parse(endAt) - Date.parse(startAt) > 370 * 24 * 60 * 60 * 1000) {
+        throw Object.assign(new Error('Invalid replay window'), { permanent: true });
+      }
+      window = { startAt: new Date(startAt).toISOString(), endAt: new Date(endAt).toISOString() };
+    }
+    await recomputeProjection(job.organizationId, revision, `job:${job.id}`, window);
+    return { revision, ...window };
   }
 
   async function handleInvestigation(job) {

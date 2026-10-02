@@ -82,9 +82,11 @@ export function calculateIncome({ lines = [], fees = [], refundFacts = [], giftC
   const gd = deduplicateFacts(giftCardActivities, x => `${x.id}@${x.version ?? '1'}`);
   const issues = [...ld.issues, ...fd.issues, ...rd.issues, ...gd.issues];
   let gross = 0, discounts = 0, refunds = 0, tax = 0, tips = 0, recognized = 0;
-  let unitsSold = 0, unitsSoldGross = 0, unitsReturned = 0, cogs = 0, feesMinor = 0;
+  let unitsSold = 0, unitsSoldGross = 0, unitsReturned = 0, cogs = 0, refundCogsReversals = 0, feesMinor = 0;
   let marginComplete = true;
   let giftCardLines = 0, giftCardActivations = 0, giftCardLoads = 0, giftCardRedemptions = 0;
+  const orderCogs = new Map();
+  const orderCogsReversals = new Map();
   const currencies = [];
   for (const line of ld.facts) {
     const ref = String(line.id);
@@ -126,6 +128,7 @@ export function calculateIncome({ lines = [], fees = [], refundFacts = [], giftC
       money(reversal, `${ref}.approvedReturnReversalMinor`);
       assert(reversal >= 0 && reversal <= soldCogs, `${ref} return reversal exceeds COGS`);
       cogs = add(cogs, soldCogs - reversal, 'COGS');
+      if (line.orderId) orderCogs.set(line.orderId, add(orderCogs.get(line.orderId) ?? 0, soldCogs - reversal, 'order COGS'));
     }
   }
   for (const fee of fd.facts) {
@@ -146,8 +149,21 @@ export function calculateIncome({ lines = [], fees = [], refundFacts = [], giftC
     recognized -= amount;
     assert(Number.isSafeInteger(recognized), 'recognized sales exceeds safe integer range');
     if (amount > 0) {
-      marginComplete = false;
-      issues.push(issue('REFUND_COGS_REVIEW', `Refund ${refund.id} needs a human decision about returned inventory and any approved COGS reversal.`, [refund.id, refund.orderId].filter(Boolean)));
+      if (!['returned_to_inventory', 'not_returned_to_inventory'].includes(refund.reviewDisposition)) {
+        marginComplete = false;
+        issues.push(issue('REFUND_COGS_REVIEW', `Refund ${refund.id} needs a human decision about returned inventory and any approved COGS reversal.`, [refund.id, refund.orderId].filter(Boolean)));
+        continue;
+      }
+      assert(refund.reviewCurrency === refund.currency, `${refund.id} refund review currency does not match`);
+      const reversal = money(refund.approvedCogsReversalMinor, `${refund.id}.approvedCogsReversalMinor`);
+      assert(reversal >= 0, `${refund.id} COGS reversal cannot be negative`);
+      if (refund.reviewDisposition === 'not_returned_to_inventory') assert(reversal === 0, `${refund.id} non-returned goods cannot reverse COGS`);
+      const priorReversals = orderCogsReversals.get(refund.orderId) ?? 0;
+      const availableCogs = orderCogs.get(refund.orderId) ?? 0;
+      assert(reversal <= availableCogs - priorReversals, `${refund.id} COGS reversal exceeds known order COGS`);
+      orderCogsReversals.set(refund.orderId, add(priorReversals, reversal, 'order COGS reversals'));
+      cogs -= reversal;
+      refundCogsReversals = add(refundCogsReversals, reversal, 'refund COGS reversals');
     }
   }
   for (const activity of gd.facts) {
@@ -174,6 +190,7 @@ export function calculateIncome({ lines = [], fees = [], refundFacts = [], giftC
     grossItemSalesMinor: gross, discountsMinor: discounts, refundsMinor: refunds,
     taxMinor: tax, tipsMinor: tips, netSalesMinor: recognized,
     unitsSold, unitsSoldGross, unitsReturned, cogsMinor: marginComplete ? cogs : null,
+    refundCogsReversalsMinor: refundCogsReversals,
     squareFeesMinor: feesMinor,
     giftCardLiabilityChangeMinor: giftCardLines > 0 && giftCardActivations + giftCardLoads === 0 ? null : giftCardActivations + giftCardLoads - giftCardRedemptions,
     giftCardActivationsMinor: giftCardActivations, giftCardLoadsMinor: giftCardLoads, giftCardRedemptionsMinor: giftCardRedemptions,

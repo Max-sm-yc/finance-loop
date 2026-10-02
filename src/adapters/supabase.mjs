@@ -75,6 +75,8 @@ function makeProjectionSnapshot(data, { startAt, endAt }) {
     return Number.isFinite(at) && at >= Date.parse(startAt) && at < Date.parse(endAt);
   };
   const definitions = Array.isArray(data?.itemDefinitions) ? data.itemDefinitions : [];
+  const refundReviews = new Map((Array.isArray(data?.refundReviews) ? data.refundReviews : [])
+    .map(review => [review.square_refund_id, review]));
   const definitionAt = (catalogId, soldAt) => definitions.filter(d => d.square_catalog_object_id === catalogId
     && Date.parse(d.effective_from) <= Date.parse(soldAt ?? '')
     && (!d.effective_until || Date.parse(d.effective_until) > Date.parse(soldAt ?? '')))
@@ -97,10 +99,16 @@ function makeProjectionSnapshot(data, { startAt, endAt }) {
     id: fact.objectId, version: fact.version, status: statusText(fact.status), currency: fact.currency,
     amountMinor: safeMinor(fact.feeMinor),
   }));
-  const refunds = facts.filter(x => x.kind === 'refund' && inWindow(x.occurredAt)).map(fact => ({
-    id: fact.objectId, version: fact.version, status: statusText(fact.status), currency: fact.currency,
-    amountMinor: safeMinor(fact.amountMinor), orderId: fact.orderId,
-  }));
+  const refunds = facts.filter(x => x.kind === 'refund' && inWindow(x.occurredAt)).map(fact => {
+    const review = refundReviews.get(fact.objectId);
+    return {
+      id: fact.objectId, version: fact.version, status: statusText(fact.status), currency: fact.currency,
+      amountMinor: safeMinor(fact.amountMinor), orderId: fact.orderId,
+      reviewDisposition: review?.disposition ?? null,
+      approvedCogsReversalMinor: review ? safeMinor(review.approved_cogs_reversal_minor) : null,
+      reviewCurrency: review?.currency ?? null,
+    };
+  });
   const giftCardActivities = facts.filter(x => x.kind === 'gift_card_activity' && inWindow(x.occurredAt)).map(fact => ({
     id: fact.objectId, version: fact.version, type: fact.type, status: statusText(fact.status),
     currency: fact.currency, amountMinor: safeMinor(fact.amountMinor), orderId: fact.orderId,
@@ -471,6 +479,27 @@ export function createSupabaseAdapters({ url, publishableKey, secretKey, tokenEn
       const lines = (await table(userRest(accessToken), 'sale_lines', query)).slice(0, 20);
       return lines.map(row => ({ id: row.id, type: 'sale_line', occurred_at: row.sold_at, currency: row.currency, amount_minor: row.gross_minor, refund_minor: row.refund_minor, quantity: row.quantity, catalog_object_id: row.square_catalog_object_id, item_name: String(row.item_name ?? '').slice(0, 256), provider_object_id: String(row.square_order_id ?? '').slice(0, 200), line_id: String(row.square_line_uid ?? '').slice(0, 200) }));
     },
+    async recordItemDefinition(args) {
+      const { data, error } = await userRest(args.accessToken).rpc('record_item_definition', {
+        organization_id: args.organizationId, issue_id: args.issueId,
+        square_catalog_object_id: args.squareCatalogObjectId, name: args.name,
+        unit_cost_minor: args.unitCostMinor, currency: args.currency,
+        effective_from: args.effectiveFrom, approval_reason: args.reason,
+        idempotency_key: args.idempotencyKey
+      });
+      if (error) throw error;
+      return typeof data === 'string' ? { id: data } : data;
+    },
+    async recordRefundCostReview(args) {
+      const { data, error } = await userRest(args.accessToken).rpc('record_refund_cost_review', {
+        organization_id: args.organizationId, issue_id: args.issueId,
+        square_refund_id: args.squareRefundId, square_order_id: args.squareOrderId,
+        disposition: args.disposition, approved_cogs_reversal_minor: args.approvedCogsReversalMinor,
+        currency: args.currency, decision_reason: args.reason, idempotency_key: args.idempotencyKey
+      });
+      if (error) throw error;
+      return typeof data === 'string' ? { id: data } : data;
+    },
     async createProposalAtomic(args) {
       const { data, error } = await userRest(args.accessToken).rpc('create_proposal_atomic', {
         organization_id: args.organizationId, issue_id: args.issueId, payload: args.proposal,
@@ -536,6 +565,14 @@ export function createSupabaseAdapters({ url, publishableKey, secretKey, tokenEn
       const { data, error } = await serviceRest().rpc('enqueue_square_webhook', { notification_id: notificationId });
       if (error) throw error;
       return data;
+    },
+    async enqueueProjectionReplay(args) {
+      const { data, error } = await serviceRest().rpc('enqueue_projection_replay', {
+        organization_id: args.organizationId, start_at: args.startAt, end_at: args.endAt,
+        idempotency_key: args.idempotencyKey, requested_by: args.requestedBy
+      });
+      if (error) throw error;
+      return typeof data === 'string' ? { id: data } : data;
     },
     async claim({ workerId, leaseSeconds, types }) {
       const { data, error } = await serviceRest().rpc('claim_durable_jobs', { worker_id: workerId, lease_seconds: leaseSeconds, types });

@@ -62,6 +62,9 @@ async function dispatch(request: Request) {
   }
   if (resource === 'dashboard' && method === 'GET') return route.dashboard(request);
   if (resource === 'issues' && !id && method === 'GET') return route.issues(request);
+  if (resource === 'issues' && id && action === 'evidence' && method === 'GET') return route.issueEvidence(request);
+  if (resource === 'issues' && id && action === 'item-cost' && method === 'POST') return route.itemCost(request);
+  if (resource === 'issues' && id && action === 'refund-review' && method === 'POST') return route.refundReview(request);
   if (resource === 'proposals' && !id && method === 'POST') return route.proposal(request);
   if (resource === 'proposals' && id && action === 'decision' && method === 'POST') return route.decision(request);
   if (resource === 'manual-movements' && method === 'GET') return route.manualMovements(request);

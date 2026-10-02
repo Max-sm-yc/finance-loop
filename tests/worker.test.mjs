@@ -26,7 +26,7 @@ function harness({ payload, responses = {}, health = {}, now = new Date('2026-09
     async upsertSourceIssue(data) { issues.set(data.code, data); events.push(['issue', data.code]); },
     async resolveSourceIssue(data) { issues.delete(data.code); events.push(['resolve', data.code]); },
     async resolveSourceIssueRefs(data) { if (issues.get(data.code)?.sourceRefs?.some(id => data.sourceRefs.includes(id))) issues.delete(data.code); events.push(['resolve-refs', data]); },
-    async getProjectionSnapshot({ sourceRevision }) { return { sourceRevision, snapshot: { incomePolicy: { tax: 'exclude', tips: 'exclude' }, lines: [], fees: [], accounts: [] } }; },
+    async getProjectionSnapshot({ sourceRevision, startAt, endAt }) { events.push(['snapshot', { sourceRevision, startAt, endAt }]); return { sourceRevision, snapshot: { incomePolicy: { tax: 'exclude', tips: 'exclude' }, lines: [], fees: [], accounts: [] } }; },
     async saveProjectionRun(data) { projectionRuns.add(data.idempotencyKey); events.push(['projection', data.sourceRevision]); },
     async saveProjectionRunSystem(data) { projectionRuns.add(data.idempotencyKey); events.push(['projection', data.sourceRevision, data.result]); },
     async syncProjectionIssues(data) { events.push(['projection-issues', data.issues]); },
@@ -242,6 +242,16 @@ test('durable queue claims are fenced with a lease token for acknowledgement', a
   const result = await state.worker.runOne({ workerId: 'worker-1' });
   assert.equal(result.status, 'completed');
   assert.deepEqual(state.events.find(x => x[0] === 'ack')[1], { jobId: 'lease-job', workerId: 'worker-1', leaseToken: 'lease-abc' });
+});
+
+test('projection replay honors a correction job historical window', async () => {
+  const { worker, events } = harness();
+  const result = await worker.processJob({ id: 'correction-replay', type: 'projection.replay', organizationId: org,
+    payload: { sourceRevision: 1, startAt: '2026-07-03T04:00:00Z', endAt: '2026-10-02T04:00:00Z' } });
+  assert.equal(result.startAt, '2026-07-03T04:00:00.000Z');
+  assert.deepEqual(events.find(event => event[0] === 'snapshot')[1], {
+    sourceRevision: 1, startAt: '2026-07-03T04:00:00.000Z', endAt: '2026-10-02T04:00:00.000Z'
+  });
 });
 
 test('worker fails closed when queue cannot provide a fencing token', async () => {

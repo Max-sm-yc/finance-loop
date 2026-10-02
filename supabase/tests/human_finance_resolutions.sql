@@ -1,0 +1,11 @@
+begin;
+select plan(7);
+select has_table('public', 'refund_cost_reviews', 'refund resolution table exists');
+select has_column('public', 'item_definitions', 'approval_reason', 'item cost decisions carry a reason');
+select has_table('private', 'finance_correction_requests', 'correction idempotency records stay private');
+select has_function('public', 'record_item_definition', array['uuid','uuid','text','text','numeric','text','timestamp with time zone','text','text'], 'approved item cost RPC exists');
+select has_function('public', 'record_refund_cost_review', array['uuid','uuid','text','text','text','bigint','text','text','text'], 'refund review RPC exists');
+select has_function('public', 'get_square_projection_snapshot', array['uuid','bigint','timestamp with time zone','timestamp with time zone'], 'projection snapshot includes reviewed corrections');
+select has_function('public', 'enqueue_projection_replay', array['uuid','timestamp with time zone','timestamp with time zone','text','uuid'], 'correction replay queue RPC exists');
+select * from finish();
+rollback;

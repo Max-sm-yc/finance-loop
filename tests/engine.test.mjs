@@ -47,6 +47,27 @@ test('completed Square refunds reduce recognized income and hold margin for huma
   assert.ok(result.issues.some(issue => issue.code === 'REFUND_COGS_REVIEW'));
 });
 
+test('reviewed Square refund reverses only the human-approved order COGS amount', () => {
+  const result = calculateIncome({
+    lines: [{ id: 'line-1', orderId: 'order-1', status: 'completed', currency: 'USD', quantity: 2,
+      grossMinor: 2000, discountMinor: 0, refundMinor: 0, taxMinor: 0, tipMinor: 0,
+      unitCostMinor: 500, costCurrency: 'USD' }],
+    refundFacts: [{ id: 'refund-1', orderId: 'order-1', status: 'completed', currency: 'USD', amountMinor: 250,
+      reviewDisposition: 'returned_to_inventory', approvedCogsReversalMinor: 500, reviewCurrency: 'USD' }],
+  });
+  assert.equal(result.status, 'complete');
+  assert.equal(result.cogsMinor, 500);
+  assert.equal(result.refundCogsReversalsMinor, 500);
+  assert.equal(result.operationalMarginMinor, 1250);
+  assert.equal(result.issues.some(issue => issue.code === 'REFUND_COGS_REVIEW'), false);
+  assert.throws(() => calculateIncome({
+    lines: [{ id: 'line-1', orderId: 'order-1', status: 'completed', currency: 'USD', quantity: 2,
+      grossMinor: 2000, unitCostMinor: 500, costCurrency: 'USD' }],
+    refundFacts: [{ id: 'refund-1', orderId: 'order-1', status: 'completed', currency: 'USD', amountMinor: 250,
+      reviewDisposition: 'returned_to_inventory', approvedCogsReversalMinor: 1001, reviewCurrency: 'USD' }],
+  }), /exceeds known order COGS/);
+});
+
 test('exact duplicate source replay is idempotent and conflicting same-version facts are exceptions', () => {
   const fact = { id: 'o1', version: '2', status: 'completed', currency: 'USD', quantity: 1, grossMinor: 100, unitCostMinor: 20, costCurrency: 'USD' };
   const replay = calculateIncome({ lines: [fact, structuredClone(fact)] });
