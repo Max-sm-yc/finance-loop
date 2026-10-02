@@ -68,7 +68,7 @@ test('completed cash payments normalize with no processing fee instead of raisin
   } });
   const outcome = await worker.processJob({ id: 'cash-job', type: 'square.webhook', organizationId: org, payload: { notificationId: 'evt-cash' } });
   const fact = [...facts.values()][0];
-  assert.equal(fact.version, '2026-09-30T11:00:00Z|normalization-2');
+  assert.equal(fact.version, '2026-09-30T11:00:00Z|normalization-3');
   assert.equal(fact.feeMinor, 0);
   assert.equal(fact.feeStatus, 'not_applicable_cash');
   assert.equal(outcome.changed, true);
@@ -78,11 +78,19 @@ test('completed cash payments normalize with no processing fee instead of raisin
 test('sync uses a linked Square CHARGE payout entry to fill a delayed payment processing fee', async () => {
   const state = harness({ request: async path => {
     if (path.includes('/orders/search')) return { orders: [] };
-    if (path.includes('/payments?')) return { payments: [{
-      id: 'pay-delayed-fee', status: 'COMPLETED', source_type: 'CARD',
-      created_at: '2026-09-30T10:00:00Z', updated_at: '2026-09-30T10:00:01Z',
-      amount_money: { amount: 1000, currency: 'USD' },
-    }] };
+    if (path.includes('/payments?')) return { payments: [
+      {
+        id: 'pay-delayed-fee', status: 'COMPLETED', source_type: 'CARD',
+        created_at: '2026-09-30T10:00:00Z', updated_at: '2026-09-30T10:00:01Z',
+        amount_money: { amount: 1000, currency: 'USD' },
+      },
+      {
+        id: 'external-no-sale', status: 'COMPLETED', source_type: 'EXTERNAL',
+        created_at: '2026-09-30T10:01:00Z', updated_at: '2026-09-30T10:01:01Z',
+        amount_money: { amount: 0, currency: 'USD' },
+        external_details: { type: 'OTHER', source: 'NO_SALE' },
+      },
+    ] };
     if (path.includes('/refunds?')) return { refunds: [] };
     if (path.includes('/catalog/list')) return { objects: [] };
     if (path.includes('/gift-cards/activities?')) return { gift_card_activities: [] };
@@ -105,10 +113,14 @@ test('sync uses a linked Square CHARGE payout entry to fill a delayed payment pr
     payload: { startAt: '2026-09-01T00:00:00Z', endAt: '2026-10-01T00:00:00Z', locationIds: ['loc-1'] },
   });
   const payment = state.facts.get(`${org}:payment:pay-delayed-fee`);
+  const noSale = state.facts.get(`${org}:payment:external-no-sale`);
   assert.equal(result.freshness, 'fresh');
   assert.equal(payment.feeMinor, 30);
   assert.equal(payment.feeStatus, 'provided_from_payout_entry');
   assert.match(payment.version, /\|payout-fee-1$/);
+  assert.equal(noSale.sourceType, 'EXTERNAL');
+  assert.equal(noSale.feeMinor, 0);
+  assert.equal(noSale.feeStatus, 'not_applicable_no_sale');
   assert.equal(state.events.filter(event => event[0] === 'projection').length, 1);
   assert.equal(state.issues.has('SOURCE_GAP'), false);
 });
