@@ -64,20 +64,22 @@ negative stock, source gaps, and mixed currencies remain visible.
 
 Reports use integer minor-unit arithmetic and a bounded UTC interval with an
 inclusive start and exclusive end. Product revenue, approved COGS, quantities,
-and operational net retain source references and a calculation version. Reports
-also include UTC daily/monthly trends, product rankings, revenue share, margin
-ratios, and CSV export. Net is
-an operational margin, not an accounting net-income statement.
+and contribution before processing fees retain source references and a
+calculation version. Reports also include aggregate Square processing fees,
+UTC daily/monthly trends, product rankings, revenue share, margin ratios, and
+CSV export. Product net and margin are before fees; report-wide net deducts
+COGS and aggregate fees from revenue. Net is an operational margin, not an
+accounting net-income statement.
 
-Order-level refunds and payment-level fees remain explicitly unallocated when
-their sources do not identify a product. A payment fee can be attributed to an
-order's product when every recognized sale line in that order identifies the
-same product; fees for multi-product orders remain unallocated. Known fee
-amounts stay visible when health is stale, while the report and net results
-remain incomplete until readiness is restored. Missing fee amounts or an
-uncovered source window make fee totals incomplete. Product analytics does not
-use model-inferred amounts or create agent jobs. The receipt helper is a
-user-triggered extraction request only; it cannot approve or post a cost.
+Order-level refunds remain unallocated when their sources do not identify a
+product. Processing fees are always treated as an aggregate operating cost
+after product-level COGS; they are never allocated to a product, even when an
+order contains only one product. Stale fee health can leave known aggregate
+fees visible while report-wide net remains incomplete. Missing fee amounts or
+an uncovered source window make fee totals incomplete, but do not change
+product contribution before fees. Product analytics does not use model-inferred
+amounts or create agent jobs. The receipt helper is a user-triggered extraction
+request only; it cannot approve or post a cost.
 Source readiness requires fresh health for the required resources and payout
 entries, plus a completed sync window
 covering the requested period. Stock additionally requires source coverage from

@@ -105,7 +105,7 @@ test('inventory joins purchase definition UUIDs to Square variation IDs', () => 
   assert.equal(result.items[0].onHandQuantity, 5);
 });
 
-test('product analytics reconciles recognized sales, COGS and fees; unsupported allocations remain explicit', () => {
+test('product analytics shows contribution before fees and keeps processing fees aggregate', () => {
   const lines = [
     { id: 'line-1', version: '1', orderId: 'order-1', lineItemUid: 'uid-1', status: 'completed', currency: 'USD', occurredAt: '2026-09-05T00:00:00Z', quantity: 2,
       catalogObjectId: 'catalog-A', name: 'Tea', grossMinor: 2000, discountMinor: 200, refundMinor: 100, taxMinor: 150, tipMinor: 100, unitCostMinor: 500, costCurrency: 'USD' },
@@ -122,10 +122,11 @@ test('product analytics reconciles recognized sales, COGS and fees; unsupported 
   assert.equal(result.products[0].productId, 'catalog-A');
   assert.equal(result.products[0].revenueMinor, 1700);
   assert.equal(result.products[0].costMinor, 1000);
-  assert.equal(result.products[0].feesMinor, 75);
-  assert.equal(result.products[0].netMinor, 625);
+  assert.equal(Object.hasOwn(result.products[0], 'feesMinor'), false);
+  assert.equal(result.products[0].netMinor, 700);
+  assert.equal(result.products[0].marginBps, 4118);
   assert.equal(result.products[1].costMinor, null);
-  assert.deepEqual(result.unallocated, { revenueMinor: 0, refundsMinor: 50, feesMinor: 25, cogsReversalMinor: 0 });
+  assert.deepEqual(result.unallocated, { revenueMinor: 0, refundsMinor: 50, feesMinor: 100, cogsReversalMinor: 0 });
   assert.equal(result.totals.revenueMinor, income.netSalesMinor);
   assert.equal(result.totals.costMinor, null);
   assert.equal(result.totals.feesMinor, income.squareFeesMinor);
@@ -137,7 +138,7 @@ test('product analytics reconciles recognized sales, COGS and fees; unsupported 
   assert.equal(typeof result.products[0].revenueRank, 'number');
 });
 
-test('payment fees allocate to a single-product order and stay unallocated for mixed-product orders', () => {
+test('processing fees remain aggregate costs regardless of order product mix', () => {
   const lines = [
     { id: 'single-line', orderId: 'single-order', lineItemUid: 'single-uid', status: 'completed', currency: 'USD', occurredAt: from,
       quantity: 1, catalogObjectId: 'A', grossMinor: 1000, discountMinor: 0, unitCostMinor: 300, costCurrency: 'USD' },
@@ -152,26 +153,25 @@ test('payment fees allocate to a single-product order and stay unallocated for m
   ] });
   const productA = result.products.find(product => product.productId === 'A');
   const productB = result.products.find(product => product.productId === 'B');
-  assert.equal(productA.feesMinor, null);
-  assert.equal(productA.feesAllocationComplete, false);
-  assert.equal(productA.netMinor, null);
-  assert.equal(productB.feesMinor, null);
-  assert.equal(productB.feesAllocationComplete, false);
-  assert.equal(productB.netMinor, null);
-  assert.equal(result.unallocated.feesMinor, 40);
+  assert.equal(Object.hasOwn(productA, 'feesMinor'), false);
+  assert.equal(Object.hasOwn(productB, 'feesMinor'), false);
+  assert.equal(productA.netMinor, 1000);
+  assert.equal(productB.netMinor, 300);
+  assert.equal(result.unallocated.feesMinor, 65);
   assert.equal(result.totals.feesMinor, 65);
   assert.equal(result.totals.netMinor, 1235);
-  assert.ok(result.issues.some(issue => issue.code === 'FEE_ALLOCATION_INCOMPLETE'));
+  assert.ok(!result.issues.some(issue => issue.code === 'FEE_ALLOCATION_INCOMPLETE'));
 
   const exact = calculateProductAnalytics({ from, to, lines: [lines[0]], fees: [{ id: 'exact-fee', orderId: 'single-order', status: 'completed', currency: 'USD', occurredAt: from, amountMinor: 25 }] });
-  assert.equal(exact.products[0].feesMinor, 25);
-  assert.equal(exact.products[0].feesAllocationComplete, true);
+  assert.equal(exact.products[0].netMinor, 700);
+  assert.equal(Object.hasOwn(exact.products[0], 'feesMinor'), false);
+  assert.equal(exact.unallocated.feesMinor, 25);
 
   const partlyIdentified = calculateProductAnalytics({ from, to, lines: [lines[0],
     { id: 'unknown-line', orderId: 'single-order', status: 'completed', currency: 'USD', occurredAt: from, quantity: 1, grossMinor: 500, discountMinor: 0 }],
     fees: [{ id: 'partly-identified-fee', orderId: 'single-order', status: 'completed', currency: 'USD', occurredAt: from, amountMinor: 25 }] });
-  assert.equal(partlyIdentified.products[0].feesMinor, null);
-  assert.equal(partlyIdentified.products[0].feesAllocationComplete, false);
+  assert.equal(partlyIdentified.products[0].netMinor, 700);
+  assert.equal(Object.hasOwn(partlyIdentified.products[0], 'feesMinor'), false);
   assert.equal(partlyIdentified.unallocated.feesMinor, 25);
 });
 
@@ -205,17 +205,18 @@ test('reviewed refund reversals reconcile product COGS and operational net with 
   assert.throws(() => calculateProductAnalytics({ lines, refunds: [{ ...refunds[0], approvedCogsReversalMinor: 1000 }], fees, from, to }), /exceeds known order COGS/);
 });
 
-test('unknown sale money and completed fee amounts remain null with visible issues', () => {
+test('missing aggregate fee amounts do not block product contribution before fees', () => {
   const missingSale = calculateProductAnalytics({ from, to, lines: [{ id: 'line', status: 'completed', currency: 'USD', occurredAt: from,
     quantity: 1, grossMinor: null, discountMinor: null, unitCostMinor: 100, costCurrency: 'USD' }] });
   assert.equal(missingSale.totals.revenueMinor, null);
   assert.equal(missingSale.totals.netMinor, null);
   assert.ok(missingSale.issues.some(issue => issue.code === 'SOURCE_GAP'));
-  const missingFee = calculateProductAnalytics({ from, to, lines: [{ id: 'valid', status: 'completed', currency: 'USD', occurredAt: from,
+  const missingFee = calculateProductAnalytics({ from, to, lines: [{ id: 'valid', catalogObjectId: 'A', status: 'completed', currency: 'USD', occurredAt: from,
     quantity: 1, grossMinor: 100, discountMinor: 0, unitCostMinor: 20, costCurrency: 'USD' }],
     fees: [{ id: 'fee', status: 'completed', currency: 'USD', occurredAt: from, amountMinor: null }] });
   assert.equal(missingFee.totals.feesMinor, null);
   assert.equal(missingFee.totals.netMinor, null);
+  assert.equal(missingFee.products[0].netMinor, 80);
   assert.ok(missingFee.issues.some(issue => issue.code === 'FEE_MISSING'));
   assert.throws(() => calculateProductAnalytics({ lines: [], from: '2026-02-30T00:00:00Z', to }), /valid ISO UTC timestamp/);
 });

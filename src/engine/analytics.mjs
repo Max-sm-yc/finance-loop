@@ -1,5 +1,5 @@
 /** Product-level operational revenue and cost analytics, with explicit unallocated amounts. */
-export const PRODUCT_ANALYTICS_CALCULATION_VERSION = 'finance-loop-product-analytics-v2';
+export const PRODUCT_ANALYTICS_CALCULATION_VERSION = 'finance-loop-product-analytics-v3';
 
 const assert = (ok, message) => { if (!ok) throw new TypeError(message); };
 const validCurrency = value => typeof value === 'string' && /^[A-Z]{3}$/.test(value);
@@ -27,8 +27,9 @@ const productKey = line => line.catalogObjectId ?? line.squareCatalogObjectId ??
 const factProductKey = fact => fact.catalogObjectId ?? fact.squareCatalogObjectId ?? fact.itemId ?? (fact.orderId && fact.lineItemUid ? `line:${fact.orderId}:${fact.lineItemUid}` : null);
 
 /**
- * Calculate product revenue, COGS and net for [from,to). Refunds and fees are
- * assigned only when they identify an exact product or exact order line.
+ * Calculate product revenue and contribution before processing fees for
+ * [from,to). Refunds may be assigned to exact products; all processing fees
+ * remain aggregate costs outside the product breakdown.
  */
 export function calculateProductAnalytics({ lines = [], fees = [], refunds = [], incomePolicy = {}, from, to, currency } = {}) {
   assert(Array.isArray(lines) && Array.isArray(fees) && Array.isArray(refunds), 'lines, fees and refunds must be arrays');
@@ -41,12 +42,11 @@ export function calculateProductAnalytics({ lines = [], fees = [], refunds = [],
   const issues = [];
   const cleanLines = dedupe(lines, 'line', issues), cleanFees = dedupe(fees, 'fee', issues), cleanRefunds = dedupe(refunds, 'refund', issues);
   const inPeriod = fact => { const at = instant(fact.occurredAt, `${fact.id}.occurredAt`); return at >= start && at < end; };
-  const products = new Map(), lineToProduct = new Map(), orderProducts = new Map(), feeOrderProducts = new Map(), feeOrderAmbiguousOrders = new Set(), orderCogs = new Map(), orderLineCount = new Map(), orderReversals = new Map(), currencies = new Set();
+  const products = new Map(), lineToProduct = new Map(), orderProducts = new Map(), orderCogs = new Map(), orderLineCount = new Map(), orderReversals = new Map(), currencies = new Set();
   const seriesRecords = [];
-  const feeAllocationRefs = [];
   const ensure = (key, name) => {
     if (!key) return null;
-    if (!products.has(key)) products.set(key, { productId: key, productName: name ?? null, revenueMinor: 0, costMinor: 0, feesMinor: 0, netMinor: 0, grossMinor: 0, discountMinor: 0, refundsMinor: 0, unitsSold: 0, sourceRefs: [], costComplete: true, revenueComplete: true, feesAllocationComplete: true });
+    if (!products.has(key)) products.set(key, { productId: key, productName: name ?? null, revenueMinor: 0, costMinor: 0, netMinor: 0, grossMinor: 0, discountMinor: 0, refundsMinor: 0, unitsSold: 0, sourceRefs: [], costComplete: true, revenueComplete: true });
     const p = products.get(key); if (name && (!p.productName || name.localeCompare(p.productName) < 0)) p.productName = name;
     return p;
   };
@@ -58,14 +58,6 @@ export function calculateProductAnalytics({ lines = [], fees = [], refunds = [],
     if (line.itemType === 'GIFT_CARD') continue;
     const key = productKey(line), p = ensure(key, line.itemName ?? line.name ?? null);
     assert(validCurrency(line.currency), `${line.id}.currency must be an uppercase ISO currency code`); currencies.add(line.currency);
-    if (line.orderId) {
-      const orderId = String(line.orderId);
-      if (!p) feeOrderAmbiguousOrders.add(orderId);
-      else {
-        const orderSet = feeOrderProducts.get(orderId) ?? new Set();
-        orderSet.add(p); feeOrderProducts.set(orderId, orderSet);
-      }
-    }
     const quantity = line.quantity;
     assert(Number.isSafeInteger(quantity) && quantity > 0, `${line.id}.quantity must be a positive integer`);
     const value = (field, required = false) => {
@@ -117,25 +109,15 @@ export function calculateProductAnalytics({ lines = [], fees = [], refunds = [],
     }
     seriesRecords.push({ at: line.occurredAt, type: 'sale', revenue, cost: Number.isSafeInteger(unitCost) && unitCost >= 0 && line.costCurrency === line.currency ? unitCost * quantity - (line.approvedReturnReversalMinor ?? 0) : null, fees: 0, units: quantity });
   }
-  const allocate = (fact, amount, field) => {
+  const allocateRefund = (fact, amount) => {
     const key = factProductKey(fact);
     let p = key ? products.get(key) : null;
     if (!p && fact.orderId && fact.lineItemUid) p = lineToProduct.get(`${fact.orderId}:${fact.lineItemUid}`) ?? null;
-    if (!p && field === 'fee' && fact.orderId) {
-      const orderId = String(fact.orderId), orderSet = feeOrderProducts.get(orderId);
-      if (!feeOrderAmbiguousOrders.has(orderId) && orderSet?.size === 1) p = [...orderSet][0];
-      else if (feeOrderAmbiguousOrders.has(orderId) || orderSet?.size > 1) {
-        feeAllocationRefs.push(fact.id);
-        for (const product of orderSet ?? []) { product.feesAllocationComplete = false; product.sourceRefs.push(fact.id); }
-      }
-    }
     if (!p) {
-      if (field === 'refund') unallocatedRefundsMinor = sum(unallocatedRefundsMinor, amount, 'unallocated refunds');
-      else unallocatedFeesMinor = sum(unallocatedFeesMinor, amount, 'unallocated fees');
+      unallocatedRefundsMinor = sum(unallocatedRefundsMinor, amount, 'unallocated refunds');
       return;
     }
-    if (field === 'refund') { p.revenueMinor -= amount; p.refundsMinor = sum(p.refundsMinor, amount, 'product refunds'); }
-    else p.feesMinor = sum(p.feesMinor, amount, 'product fees');
+    p.revenueMinor -= amount; p.refundsMinor = sum(p.refundsMinor, amount, 'product refunds');
     p.sourceRefs.push(fact.id);
   };
   for (const refund of cleanRefunds) {
@@ -147,7 +129,7 @@ export function calculateProductAnalytics({ lines = [], fees = [], refunds = [],
       seriesRecords.push({ at: refund.occurredAt, type: 'refund', amount: null, reviewIncomplete: true });
       continue;
     }
-    allocate(refund, refund.amountMinor, 'refund');
+    allocateRefund(refund, refund.amountMinor);
     if (refund.amountMinor > 0) {
       if (!['returned_to_inventory', 'not_returned_to_inventory'].includes(refund.reviewDisposition)) {
         refundReviewIncomplete = true;
@@ -180,21 +162,19 @@ export function calculateProductAnalytics({ lines = [], fees = [], refunds = [],
     if (fee.status !== 'completed' || !inPeriod(fee)) continue;
     assert(validCurrency(fee.currency), `${fee.id}.currency must be an uppercase ISO currency code`); currencies.add(fee.currency);
     if (!Number.isSafeInteger(fee.amountMinor) || fee.amountMinor < 0) { feesComplete = false; issues.push({ code: 'FEE_MISSING', sourceRefs: [fee.id] }); seriesRecords.push({ at: fee.occurredAt, type: 'fee', amount: null }); continue; }
-    allocate(fee, fee.amountMinor, 'fee');
+    unallocatedFeesMinor = sum(unallocatedFeesMinor, fee.amountMinor, 'unallocated processing fees');
     seriesRecords.push({ at: fee.occurredAt, type: 'fee', amount: fee.amountMinor });
   }
-  if (feeAllocationRefs.length) issues.push({ code: 'FEE_ALLOCATION_INCOMPLETE', sourceRefs: refs(feeAllocationRefs) });
   if (currency) currencies.add(currency);
   if (currencies.size > 1) issues.push({ code: 'CURRENCY_MISMATCH', sourceRefs: [] });
   let revenueMinor = unallocatedRevenueMinor, costMinor = 0, allCostsKnown = !unallocatedCostIncomplete && !refundReviewIncomplete && !unboundedCogsReversal;
   for (const p of products.values()) {
     if (!p.costComplete) issues.push({ code: 'UNKNOWN_ITEM', sourceRefs: refs(p.sourceRefs) });
     p.costMinor = p.costComplete ? p.costMinor : null;
-    p.netMinor = p.costMinor === null || !p.revenueComplete || !p.feesAllocationComplete || !feesComplete ? null : sum(sum(p.revenueMinor, -p.costMinor, 'product net'), -p.feesMinor, 'product net');
+    p.netMinor = p.costMinor === null || !p.revenueComplete ? null : sum(p.revenueMinor, -p.costMinor, 'product net before processing fees');
     revenueMinor = sum(revenueMinor, p.revenueMinor, 'revenue total');
     if (p.costMinor === null) allCostsKnown = false; else costMinor = sum(costMinor, p.costMinor, 'COGS total');
     if (!p.revenueComplete) p.revenueMinor = null;
-    if (!p.feesAllocationComplete || !feesComplete) p.feesMinor = null;
     p.sourceRefs = refs(p.sourceRefs); delete p.costComplete; delete p.revenueComplete;
   }
   const refundFactsInPeriod = cleanRefunds.filter(f => f.status === 'completed' && inPeriod(f));
@@ -254,9 +234,8 @@ export function calculateProductAnalytics({ lines = [], fees = [], refunds = [],
     p.marginBps = p.netMinor === null ? null : ratio(p.netMinor, p.revenueMinor);
     if (p.netRank === undefined) p.netRank = null;
     if (p.revenueRank === undefined) p.revenueRank = null;
-    if (!feesComplete) { p.feesMinor = null; p.netMinor = null; }
     if (calculationFailed) {
-      p.revenueMinor = null; p.costMinor = null; p.feesMinor = null; p.netMinor = null;
+      p.revenueMinor = null; p.costMinor = null; p.netMinor = null;
       p.grossMinor = null; p.discountMinor = null; p.refundsMinor = null; p.revenueShareBps = null; p.marginBps = null;
       p.revenueRank = null; p.netRank = null;
     }

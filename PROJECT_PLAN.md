@@ -169,14 +169,17 @@ configuration. Server environment examples default both flags on, and migration
 future organizations. Deployments must also set both server-side Vercel
 variables to `true`. Supply receipts link to one actual purchase cash outflow;
 evidence-backed opening stock and manual corrections append quantity records
-without changing cash. Product reports show revenue, approved COGS, and
-operational net, preserving missing-data exceptions and unallocated refunds and
-fees. The receipt text helper drafts extraction only; a human maps catalog
-identity and approves any effective-dated COGS update. Product analytics remains
-deterministic. Quantity tracking does not establish formal inventory valuation
-or an accounting net-income statement; pilot reconciliation and merchant and
-accounting-adviser sign-off remain separate readiness requirements. See [the
-inventory and analytics rollout contract](docs/STAGED_INVENTORY_ANALYTICS.md).
+without changing cash. Product reports show item revenue, approved COGS, and
+contribution before processing fees. Actual Square fees remain an aggregate
+cost deducted after item-level margin to calculate report-wide operational net;
+they are not attributed to products. Missing-data exceptions and unallocated
+refunds remain visible. The receipt text helper drafts extraction only; a
+human maps catalog identity and approves any effective-dated COGS update.
+Product analytics remains deterministic. Quantity tracking does not establish
+formal inventory valuation or an accounting net-income statement; pilot
+reconciliation and merchant and accounting-adviser sign-off remain separate
+readiness requirements. See [the inventory and analytics rollout
+contract](docs/STAGED_INVENTORY_ANALYTICS.md).
 
 1. **Overview:** income, cash, sync freshness, unresolved issues, period and account selector; each metric links to its calculation.
 2. **Income & inventory:** Square sales by item, unit cost status, fees, margin, item definition review.

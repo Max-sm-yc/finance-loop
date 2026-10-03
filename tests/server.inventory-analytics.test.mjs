@@ -53,7 +53,8 @@ test('analytics missing card fees never become zero and incomplete source covera
   const result = await (await handlers({ facts }).analytics(get('analytics'))).json();
   assert.equal(result.analytics.totals.revenueMinor, 1000);
   assert.equal(result.analytics.totals.feesMinor, null);
-  assert.equal(result.analytics.products[0].feesMinor, null);
+  assert.equal(Object.hasOwn(result.analytics.products[0], 'feesMinor'), false);
+  assert.equal(result.analytics.products[0].netMinor, 700);
   assert.equal(result.analytics.daily[0].feesMinor, null);
   facts.sourceCoverage.windows = [];
   const unverified = await (await handlers({ facts }).analytics(get('analytics'))).json();
@@ -67,8 +68,8 @@ test('analytics missing card fees never become zero and incomplete source covera
   assert.equal(absentResource.analytics.totals.revenueMinor, 1000);
   assert.equal(absentResource.analytics.products[0].revenueMinor, 1000);
   assert.equal(absentResource.analytics.products[0].costMinor, 300);
-  assert.equal(absentResource.analytics.products[0].feesMinor, null);
-  assert.equal(absentResource.analytics.products[0].netMinor, null);
+  assert.equal(Object.hasOwn(absentResource.analytics.products[0], 'feesMinor'), false);
+  assert.equal(absentResource.analytics.products[0].netMinor, 700);
 
   facts.sourceHealth = ready().sourceHealth.map(row => ['square', 'payments'].includes(row.resource)
     ? { ...row, status: 'incomplete', gap: { code: 'PROCESSING_FEE_UNAVAILABLE' }, lastSuccessfulSyncAt: null } : row);
@@ -76,8 +77,8 @@ test('analytics missing card fees never become zero and incomplete source covera
   assert.equal(feeGap.analytics.totals.revenueMinor, 1000);
   assert.equal(feeGap.analytics.products[0].revenueMinor, 1000);
   assert.equal(feeGap.analytics.products[0].costMinor, 300);
-  assert.equal(feeGap.analytics.products[0].feesMinor, null);
-  assert.equal(feeGap.analytics.products[0].netMinor, null);
+  assert.equal(Object.hasOwn(feeGap.analytics.products[0], 'feesMinor'), false);
+  assert.equal(feeGap.analytics.products[0].netMinor, 700);
 
   facts.sourceHealth = ready().sourceHealth.filter(row => row.resource !== 'orders');
   const missingOrders = await (await handlers({ facts }).analytics(get('analytics'))).json();
@@ -88,16 +89,20 @@ test('analytics missing card fees never become zero and incomplete source covera
   facts.facts[1] = { kind: 'payment', objectId: 'payment', fact: { orderId: 'order', status: 'COMPLETED', occurredAt: from, currency: 'USD', feeMinor: 35 } };
   const knownAmountWithoutStatus = await (await handlers({ facts }).analytics(get('analytics'))).json();
   assert.equal(knownAmountWithoutStatus.analytics.totals.feesMinor, 35);
-  assert.equal(knownAmountWithoutStatus.analytics.products[0].feesMinor, 35);
-  assert.equal(knownAmountWithoutStatus.analytics.products[0].netMinor, 665);
+  assert.equal(Object.hasOwn(knownAmountWithoutStatus.analytics.products[0], 'feesMinor'), false);
+  assert.equal(knownAmountWithoutStatus.analytics.products[0].netMinor, 700);
+  assert.equal(knownAmountWithoutStatus.analytics.products[0].marginBps, 7000);
+  assert.equal(knownAmountWithoutStatus.analytics.totals.netMinor, 665);
 
   facts.sourceHealth = ready().sourceHealth.map(row => row.resource === 'payments'
     ? { ...row, status: 'incomplete', gap: { code: 'PROCESSING_FEE_UNAVAILABLE' }, lastSuccessfulSyncAt: null } : row);
   const stalePaymentHealth = await (await handlers({ facts }).analytics(get('analytics'))).json();
   assert.equal(stalePaymentHealth.analytics.status, 'incomplete');
   assert.equal(stalePaymentHealth.analytics.totals.feesMinor, 35);
-  assert.equal(stalePaymentHealth.analytics.products[0].feesMinor, 35);
-  assert.equal(stalePaymentHealth.analytics.products[0].netMinor, null);
+  assert.equal(Object.hasOwn(stalePaymentHealth.analytics.products[0], 'feesMinor'), false);
+  assert.equal(stalePaymentHealth.analytics.products[0].netMinor, 700);
+  assert.equal(stalePaymentHealth.analytics.products[0].marginBps, 7000);
+  assert.equal(stalePaymentHealth.analytics.totals.netMinor, null);
 });
 
 test('opening counts and supply registration permit reviewers while rejecting operator writes and foreign membership', async () => {

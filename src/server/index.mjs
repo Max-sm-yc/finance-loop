@@ -613,17 +613,14 @@ export function createHandlers(adapters) {
     }
     if (incompleteCoverage) {
       report.totals.feesMinor = null; report.unallocated.feesMinor = null;
-      for (const product of report.products) product.feesMinor = null;
       for (const series of [...(report.daily ?? []), ...(report.monthly ?? [])]) series.feesMinor = null;
     }
     if (missingFee || incompleteFeeHealth) {
       report.totals.netMinor = null;
-      for (const product of report.products) { product.netMinor = null; product.netRank = null; product.marginBps = null; }
       for (const series of [...(report.daily ?? []), ...(report.monthly ?? [])]) series.netMinor = null;
     }
     if (missingFee) {
       report.totals.feesMinor = null; report.unallocated.feesMinor = null;
-      for (const product of report.products) { product.feesMinor = null; product.netMinor = null; product.netRank = null; product.marginBps = null; }
       for (const series of [...(report.daily ?? []), ...(report.monthly ?? [])]) series.feesMinor = null;
     }
     if (openIssues) {
