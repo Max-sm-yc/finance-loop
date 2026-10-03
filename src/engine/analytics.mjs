@@ -43,7 +43,7 @@ export function calculateProductAnalytics({ lines = [], fees = [], refunds = [],
   const cleanLines = dedupe(lines, 'line', issues), cleanFees = dedupe(fees, 'fee', issues), cleanRefunds = dedupe(refunds, 'refund', issues);
   const inPeriod = fact => { const at = instant(fact.occurredAt, `${fact.id}.occurredAt`); return at >= start && at < end; };
   const products = new Map(), lineToProduct = new Map(), orderProducts = new Map(), orderCogs = new Map(), orderLineCount = new Map(), orderReversals = new Map(), currencies = new Set();
-  const seriesRecords = [];
+  const seriesRecords = [], productSalesRecords = [];
   const ensure = (key, name) => {
     if (!key) return null;
     if (!products.has(key)) products.set(key, { productId: key, productName: name ?? null, revenueMinor: 0, costMinor: 0, netMinor: 0, grossMinor: 0, discountMinor: 0, refundsMinor: 0, unitsSold: 0, sourceRefs: [], costComplete: true, revenueComplete: true });
@@ -73,7 +73,7 @@ export function calculateProductAnalytics({ lines = [], fees = [], refunds = [],
     const tips = policy.tips === 'include' ? value('tipMinor', true) : 0;
     if (gross === null || discount === null || tax === null || tips === null) {
       revenueComplete = false; issues.push({ code: 'SOURCE_GAP', sourceRefs: [line.id] });
-      if (p) { p.costComplete = false; p.revenueComplete = false; p.sourceRefs.push(line.id); }
+      if (p) { p.costComplete = false; p.revenueComplete = false; p.sourceRefs.push(line.id); productSalesRecords.push({ at: line.occurredAt, productId: p.productId, kind: 'sale', amount: null }); }
       seriesRecords.push({ at: line.occurredAt, type: 'sale', revenue: null, cost: null, fees: 0, units: 0 });
       continue;
     }
@@ -90,6 +90,7 @@ export function calculateProductAnalytics({ lines = [], fees = [], refunds = [],
     p.grossMinor = sum(p.grossMinor, gross, 'product gross sales');
     p.discountMinor = sum(p.discountMinor, discount, 'product discounts');
     p.refundsMinor = sum(p.refundsMinor, lineRefund, 'product refunds');
+    productSalesRecords.push({ at: line.occurredAt, productId: p.productId, kind: 'sale', amount: revenue });
     if (line.orderId) {
       const orderId = String(line.orderId), orderSet = orderProducts.get(orderId) ?? new Set();
       orderSet.add(p); orderProducts.set(orderId, orderSet);
@@ -115,21 +116,31 @@ export function calculateProductAnalytics({ lines = [], fees = [], refunds = [],
     if (!p && fact.orderId && fact.lineItemUid) p = lineToProduct.get(`${fact.orderId}:${fact.lineItemUid}`) ?? null;
     if (!p) {
       unallocatedRefundsMinor = sum(unallocatedRefundsMinor, amount, 'unallocated refunds');
-      return;
+      return null;
     }
     p.revenueMinor -= amount; p.refundsMinor = sum(p.refundsMinor, amount, 'product refunds');
     p.sourceRefs.push(fact.id);
+    return p;
   };
   for (const refund of cleanRefunds) {
     if (refund.status !== 'completed' || !inPeriod(refund)) continue;
     assert(validCurrency(refund.currency), `${refund.id}.currency must be an uppercase ISO currency code`); currencies.add(refund.currency);
     if (!Number.isSafeInteger(refund.amountMinor) || refund.amountMinor < 0) {
       refundsComplete = false; revenueComplete = false; issues.push({ code: 'SOURCE_GAP', sourceRefs: [refund.id] });
-      for (const product of orderProducts.get(String(refund.orderId)) ?? []) { product.costComplete = false; product.revenueComplete = false; }
+      const affectedProducts = new Set(orderProducts.get(String(refund.orderId)) ?? []);
+      const exactProductKey = factProductKey(refund);
+      const exactProduct = (exactProductKey && products.get(exactProductKey))
+        ?? (refund.orderId && refund.lineItemUid ? lineToProduct.get(`${refund.orderId}:${refund.lineItemUid}`) : null);
+      if (exactProduct) affectedProducts.add(exactProduct);
+      for (const product of affectedProducts) {
+        product.costComplete = false; product.revenueComplete = false;
+        productSalesRecords.push({ at: refund.occurredAt, productId: product.productId, kind: 'refund', amount: null });
+      }
       seriesRecords.push({ at: refund.occurredAt, type: 'refund', amount: null, reviewIncomplete: true });
       continue;
     }
-    allocateRefund(refund, refund.amountMinor);
+    const refundedProduct = allocateRefund(refund, refund.amountMinor);
+    if (refundedProduct) productSalesRecords.push({ at: refund.occurredAt, productId: refundedProduct.productId, kind: 'refund', amount: refund.amountMinor });
     if (refund.amountMinor > 0) {
       if (!['returned_to_inventory', 'not_returned_to_inventory'].includes(refund.reviewDisposition)) {
         refundReviewIncomplete = true;
@@ -185,6 +196,24 @@ export function calculateProductAnalytics({ lines = [], fees = [], refunds = [],
   const totalFees = feesComplete ? feeFactsInPeriod.reduce((n, f) => sum(n, f.amountMinor, 'fees total'), 0) : null;
   revenueMinor -= unallocatedRefundsMinor;
   if (![revenueMinor, costMinor].every(Number.isSafeInteger)) throw new TypeError('analytics totals exceed safe integer range');
+  const productDailySales = new Map();
+  for (const record of productSalesRecords) {
+    const period = String(record.at).slice(0, 10);
+    const periods = productDailySales.get(record.productId) ?? new Map();
+    const bucket = periods.get(period) ?? { period, salesMinor: 0, refundsMinor: 0, revenueComplete: true };
+    if (record.amount === null) bucket.revenueComplete = false;
+    else if (record.kind === 'sale') bucket.salesMinor = sum(bucket.salesMinor, record.amount, 'daily product sales');
+    else bucket.refundsMinor = sum(bucket.refundsMinor, record.amount, 'daily product refunds');
+    periods.set(period, bucket); productDailySales.set(record.productId, periods);
+  }
+  for (const product of products.values()) {
+    const periods = productDailySales.get(product.productId) ?? new Map();
+    product.dailySales = [...periods.values()].sort((a, b) => a.period.localeCompare(b.period)).map(bucket => {
+      const revenue = bucket.salesMinor - bucket.refundsMinor;
+      assert(Number.isSafeInteger(revenue), 'daily product sales exceeds safe integer range');
+      return { period: bucket.period, revenueMinor: product.revenueComplete && bucket.revenueComplete ? revenue : null };
+    });
+  }
   const adjustedCostMinor = allCostsKnown ? sum(costMinor, -unallocatedCogsReversalMinor, 'adjusted COGS') : null;
   const calculationFailed = issues.some(i => ['SOURCE_CONFLICT', 'CURRENCY_MISMATCH'].includes(i.code));
   const status = calculationFailed ? 'failed' : allCostsKnown ? (issues.length ? 'incomplete' : 'complete') : 'incomplete';
@@ -238,6 +267,7 @@ export function calculateProductAnalytics({ lines = [], fees = [], refunds = [],
       p.revenueMinor = null; p.costMinor = null; p.netMinor = null;
       p.grossMinor = null; p.discountMinor = null; p.refundsMinor = null; p.revenueShareBps = null; p.marginBps = null;
       p.revenueRank = null; p.netRank = null;
+      p.dailySales = p.dailySales.map(day => ({ ...day, revenueMinor: null }));
     }
   }
   return { calculationVersion: PRODUCT_ANALYTICS_CALCULATION_VERSION, status, currency: currencies.size === 1 ? [...currencies][0] : null, from, to,

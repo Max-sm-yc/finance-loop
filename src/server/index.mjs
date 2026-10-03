@@ -606,6 +606,7 @@ export function createHandlers(adapters) {
         product.revenueMinor = null; product.grossMinor = null; product.discountMinor = null; product.refundsMinor = null;
         product.revenueRank = null; product.revenueShareBps = null; product.costMinor = null;
         product.netMinor = null; product.netRank = null; product.marginBps = null;
+        product.dailySales = product.dailySales.map(day => ({ ...day, revenueMinor: null }));
       }
       for (const series of [...(report.daily ?? []), ...(report.monthly ?? [])]) {
         series.revenueMinor = null; series.costMinor = null; series.netMinor = null;

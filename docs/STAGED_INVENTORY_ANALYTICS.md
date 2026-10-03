@@ -67,7 +67,9 @@ inclusive start and exclusive end. Product revenue, approved COGS, quantities,
 and contribution before processing fees retain source references and a
 calculation version. Reports also include aggregate Square processing fees,
 UTC daily/monthly trends, product rankings, revenue share, margin ratios, and
-CSV export. Product net and margin are before fees; report-wide net deducts
+CSV export. Selecting a product shows its item-level sales revenue by day or
+month as a bar chart; incomplete source coverage leaves the trend unavailable.
+Product net and margin are before fees; report-wide net deducts
 COGS and aggregate fees from revenue. Net is an operational margin, not an
 accounting net-income statement.
 
