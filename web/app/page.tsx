@@ -3,15 +3,16 @@ import { useEffect, useMemo, useRef, useState, type FormEvent } from 'react';
 import { browserSupabase } from '@/lib/browser-supabase';
 import { api, type AuditEvent, type Dashboard, type Issue, type Movement } from '@/lib/api';
 import { rankReceiptCatalogCandidates } from '../../src/agent/receipt-matching.mjs';
+import { calculatePackageUnitCostMinor } from '../../src/agent/receipt-units.mjs';
 
 type Page = 'overview' | 'income' | 'cash' | 'review' | 'ledger' | 'settings' | 'analytics';
 type Features = { inventoryTracking: boolean; productAnalytics: boolean };
 type InventoryMovement = { id: string; item_id: string; item_name: string; quantity_delta: number; occurred_at: string; movement_type?: string; reason?: string };
 type InventorySnapshot = { asOf: string; status?: string; issues?: Array<{ code: string }>; sourceCoverage?: unknown; sourceHealth?: unknown[]; items?: Array<{ id: string; name: string; currency: string; sku?: string | null; square_catalog_object_id?: string | null; item_kind?: string }>; balances?: Array<{ itemDefinitionId: string; itemName: string; currency: string; quantity: number | null }> };
 type PurchaseLineInput = { itemId: string; quantity: string; unitCost: string };
-type ReceiptDraftLine = { lineNumber: number; description: string; quantity: string | null; wholeQuantity: number | null; unitPriceText: string | null; sourceUnitPriceText: string | null; lineAmountText: string | null; sourceLineAmountText: string | null; suggestedLineAmountText: string | null; unitCostMinor: number | null; costBasis: string; reviewReason: string | null };
+type ReceiptDraftLine = { lineNumber: number; description: string; quantity: string | null; wholeQuantity: number | null; packageUnitCount: number | null; unitPriceText: string | null; sourceUnitPriceText: string | null; lineAmountText: string | null; sourceLineAmountText: string | null; expectedLineAmountText: string | null; suggestedLineAmountText: string | null; unitCostMinor: number | null; packageCostMinor: number | null; costBasis: string; reviewReason: string | null };
 type ReceiptDraft = { supplier: string | null; invoiceDate: string | null; currency: string; model: string; promptVersion: string; lines: ReceiptDraftLine[] };
-type ReceiptDraftLineInput = ReceiptDraftLine & { itemId: string; unitCostText: string; catalogSearchText: string };
+type ReceiptDraftLineInput = ReceiptDraftLine & { itemId: string; unitCostText: string; unitsPerSquareItemText: string; catalogSearchText: string };
 type ReceiptCatalogCandidate = { catalogObjectId: string; name: string; sku: string | null; currency: string };
 type AnalyticsProduct = { productId: string; productName?: string | null; unitsSold: number; revenueMinor: number | null; costMinor: number | null; netMinor: number | null; grossMinor?: number | null; discountMinor?: number | null; refundsMinor?: number | null; revenueRank?: number | null; netRank?: number | null; revenueShareBps?: number | null; marginBps?: number | null; dailySales?: Array<{ period: string; revenueMinor: number | null }>; sourceRefs?: string[] };
 type AnalyticsSeries = { period: string; revenueMinor: number | null; costMinor: number | null; feesMinor: number | null; netMinor: number | null; unitsSold: number };
@@ -62,6 +63,14 @@ function parseMinor(value: string, currency: string) {
   const places = digits, scale = 10 ** places;
   const total = Number(whole) * scale + Number((fraction + '0'.repeat(places)).slice(0, places) || '0');
   return Number.isSafeInteger(total) ? total : null;
+}
+function receiptLineConversion(line: ReceiptDraftLineInput, currency: string) {
+  const packageCostMinor = line.packageCostMinor ?? line.unitCostMinor;
+  const unitsPerSquareItem = Number(line.unitsPerSquareItemText);
+  if (packageCostMinor === null || !Number.isSafeInteger(unitsPerSquareItem) || unitsPerSquareItem < 1 || unitsPerSquareItem > 1_000_000) return null;
+  const squareUnitCostMinor = line.unitCostText.trim() ? parseMinor(line.unitCostText, currency) : null;
+  if (line.unitCostText.trim() && squareUnitCostMinor === null) return null;
+  return calculatePackageUnitCostMinor(packageCostMinor, line.wholeQuantity, unitsPerSquareItem, squareUnitCostMinor);
 }
 const date = (value?: string | null) => value ? new Date(value).toLocaleString() : '—';
 function periodLabel(from: string, to: string) {
@@ -408,7 +417,19 @@ function InventoryPanel({ organizationId, accountId, currency, timezone, account
     try {
       const result = await api<{ draft: ReceiptDraft; candidates: ReceiptCatalogCandidate[] }>('/api/inventory/receipt-drafts', { method: 'POST', body: JSON.stringify({ organizationId, currency: receiptCurrency, text: receiptText }) });
       const draft = result.draft; setReceiptDraft(draft); setReceiptCandidates(result.candidates ?? []); setReceiptDate(draft.invoiceDate ?? todayInTimezone(timezone));
-      setReceiptLines(draft.lines.map(line => ({ ...line, itemId: '', catalogSearchText: line.description, unitCostText: line.unitCostMinor === null ? '' : minorInput(line.unitCostMinor, draft.currency) })));
+      setReceiptLines(draft.lines.map(line => {
+        const unitsPerSquareItem = line.packageUnitCount ?? 1;
+        const packageCostMinor = line.packageCostMinor ?? line.unitCostMinor;
+        const conversion = packageCostMinor === null ? null : calculatePackageUnitCostMinor(packageCostMinor, line.wholeQuantity, unitsPerSquareItem);
+        return {
+          ...line,
+          packageCostMinor,
+          itemId: '',
+          catalogSearchText: line.description,
+          unitsPerSquareItemText: String(unitsPerSquareItem),
+          unitCostText: conversion ? minorInput(conversion.unitCostMinor, draft.currency) : '',
+        };
+      }));
     } catch (err) { setReceiptError(err instanceof Error ? err.message : 'Receipt details could not be extracted.'); }
     finally { setParsingReceipt(false); }
   }
@@ -423,20 +444,34 @@ function InventoryPanel({ organizationId, accountId, currency, timezone, account
     const effectiveDateCheck = new Date(effectiveFrom);
     if (!effectiveFrom || !Number.isFinite(effectiveDateCheck.getTime()) || effectiveDateCheck.toISOString() !== effectiveFrom) { setReceiptError('Enter a valid effective date for the approved COGS change.'); return; }
     if (Date.now() + 1_000 - effectiveDateCheck.getTime() > 370 * 24 * 60 * 60 * 1000) { setReceiptError('This flow can replay at most 370 days. Choose a later effective date; older cost corrections need a separately planned historical replay.'); return; }
+    if (selectedLines.some(line => {
+      const unitsPerSquareItem = Number(line.unitsPerSquareItemText);
+      return !Number.isSafeInteger(unitsPerSquareItem) || unitsPerSquareItem < 1 || unitsPerSquareItem > 1_000_000;
+    })) { setReceiptError('Enter a whole number of 1 to 1,000,000 units per Square item.'); return; }
     const prepared = selectedLines.map(line => { const candidate = receiptCandidates.find(item => item.catalogObjectId === line.itemId)!; return { catalogObjectId: candidate.catalogObjectId, name: candidate.name, unitCostMinor: parseMinor(line.unitCostText, receiptDraft.currency), currency: receiptDraft.currency, effectiveFrom }; });
     if (prepared.some(update => update.unitCostMinor === null)) { setReceiptError('Each mapped line needs a valid nonnegative unit acquisition cost in the receipt currency.'); return; }
     if (new Set(prepared.map(update => update.catalogObjectId)).size !== prepared.length) { setReceiptError('Map each catalog item once. Combine duplicate receipt lines before applying a cost.'); return; }
     if (receiptReason.trim().length < 10) { setReceiptError('Add a reason of at least 10 characters describing how you reviewed the receipt.'); return; }
+    const conversionNotes = selectedLines.flatMap(line => {
+      const unitsPerSquareItem = Number(line.unitsPerSquareItemText);
+      if (unitsPerSquareItem <= 1 || (line.packageCostMinor ?? line.unitCostMinor) === null) return [];
+      const conversion = receiptLineConversion(line, receiptDraft.currency);
+      if (!conversion) return [];
+      const rounding = conversion.roundingDeltaMinor === null ? '' : `; ${money(conversion.roundingDeltaMinor, receiptDraft.currency)} rounding difference over ${conversion.squareUnitCount} items`;
+      return [`Line ${line.lineNumber}: ${money(line.packageCostMinor ?? line.unitCostMinor, receiptDraft.currency)}/package ÷ ${unitsPerSquareItem} = ${money(conversion.unitCostMinor, receiptDraft.currency)} rounded/item; approved ${money(conversion.appliedUnitCostMinor, receiptDraft.currency)}${rounding}.`];
+    });
+    const approvalReason = [receiptReason.trim(), conversionNotes.length ? `Package conversions: ${conversionNotes.join(' ')}` : ''].filter(Boolean).join(' ');
+    if (approvalReason.length > 1000) { setReceiptError('Shorten the approval reason so it and the package conversion details fit within 1,000 characters.'); return; }
     if (!receiptEvidence && !UUID_INPUT.test(receiptEvidenceRef.trim())) { setReceiptError('Attach the receipt file or enter an existing evidence ID.'); return; }
     setApplyingReceiptCosts(true);
     try {
-      const fingerprint = JSON.stringify([organizationId, prepared, receiptReason.trim(), receiptEvidence?.name, receiptEvidence?.size, receiptEvidence?.lastModified, receiptEvidenceRef]);
+      const fingerprint = JSON.stringify([organizationId, prepared, approvalReason, receiptEvidence?.name, receiptEvidence?.size, receiptEvidence?.lastModified, receiptEvidenceRef]);
       if (!receiptApprovalKey.current || receiptApprovalKey.current.fingerprint !== fingerprint) receiptApprovalKey.current = { fingerprint, key: crypto.randomUUID() };
       if (!receiptApprovalKey.current.evidenceId) {
         if (receiptEvidence) { const upload = new FormData(); upload.set('organizationId', organizationId); upload.set('file', receiptEvidence); const stored = await api<{ evidence: { id: string } }>('/api/evidence', { method: 'POST', body: upload }); receiptApprovalKey.current.evidenceId = stored.evidence.id; }
         else receiptApprovalKey.current.evidenceId = receiptEvidenceRef.trim();
       }
-      const result = await api<{ projectionQueued: boolean }>('/api/inventory/receipt-costs', { method: 'POST', headers: { 'Idempotency-Key': receiptApprovalKey.current.key }, body: JSON.stringify({ organizationId, evidenceRef: receiptApprovalKey.current.evidenceId, reason: receiptReason.trim(), updates: prepared }) });
+      const result = await api<{ projectionQueued: boolean }>('/api/inventory/receipt-costs', { method: 'POST', headers: { 'Idempotency-Key': receiptApprovalKey.current.key }, body: JSON.stringify({ organizationId, evidenceRef: receiptApprovalKey.current.evidenceId, reason: approvalReason, updates: prepared }) });
       receiptApprovalKey.current = null;
       setReceiptNotice(result.projectionQueued ? 'Approved cost updates were recorded. Projection replay is queued; refresh after it completes.' : 'Approved cost updates were recorded. They take effect on the selected date.');
       setReceiptDraft(null); setReceiptLines([]); setReceiptCandidates([]); setReceiptText(''); setReceiptEvidence(null); setReceiptEvidenceRef(''); setReceiptReason('');
@@ -526,11 +561,26 @@ function InventoryPanel({ organizationId, accountId, currency, timezone, account
       <p className="field-hint">Only pasted text is sent to the model; do not include payment card data or personal details. The model cannot match catalog items or write costs. Extraction is budget limited.</p>
       {receiptError && <p className="error" role="alert">{receiptError}</p>}{receiptNotice && <div className="notice" role="status">{receiptNotice}</div>}
       {receiptDraft && <>
-        <div className="notice compact-notice"><b>Review every extracted value.</b> Enter unit acquisition cost excluding purchase tax and miscellaneous charges. The receipt remains supporting evidence. This approval changes effective-dated COGS; it does not record the purchase cash outflow or stock receipt. Use “Purchase supplies” for that separate entry. Cost approval requires an owner or reviewer.</div>
+        <div className="notice compact-notice"><b>Review every extracted value.</b> Package prices are converted to cost per Square item using the units assigned to each Square item. Use the package contents when Square sells an individual piece; use 1 when the Square item is the full package. The calculation rounds to the nearest cent and shows the total difference. Exclude purchase tax and miscellaneous charges. The receipt remains supporting evidence. This approval changes effective-dated COGS; it does not record the purchase cash outflow or stock receipt. Use “Purchase supplies” for that separate entry. Cost approval requires an owner or reviewer.</div>
         <div className="status-row"><span>Supplier detected</span><b>{receiptDraft.supplier ?? 'Not identified'}</b></div>
         <div className="form-grid">
           <label>Effective date for COGS ({timezone})<input type="date" required value={receiptDate} onChange={e => setReceiptDate(e.target.value)} /></label>
-          <div className="wide table-wrap"><table><thead><tr><th>Receipt line</th><th>Quantity</th><th>Extracted basis</th><th>Unit cost ({receiptDraft.currency})</th><th>Square catalog item</th></tr></thead><tbody>{receiptLines.map((line, index) => { const suggestions = rankReceiptCatalogCandidates(line.catalogSearchText, receiptCandidates, receiptDraft.currency); const topSuggestion = suggestions[0]; return <tr key={line.lineNumber}><td>{line.description}{line.reviewReason && <small className="cell-sub">Review: {line.reviewReason.replaceAll('_', ' ')}</small>}</td><td>{line.quantity ?? 'Unclear'}</td><td><span>{line.costBasis.replaceAll('_', ' ')}</span>{line.sourceUnitPriceText && <small className="cell-sub">Printed unit price {line.sourceUnitPriceText}</small>}{line.sourceLineAmountText || line.lineAmountText ? <small className="cell-sub">Printed line amount {line.sourceLineAmountText ?? line.lineAmountText}</small> : null}{line.suggestedLineAmountText && <small className="cell-sub">Likely {line.suggestedLineAmountText} from unit price × quantity; verify the receipt.</small>}</td><td><input aria-label={`Unit cost for receipt line ${line.lineNumber}`} type="number" min="0" step="any" value={line.unitCostText} onChange={e => setReceiptLines(current => current.map((row, i) => i === index ? { ...row, unitCostText: e.target.value } : row))} /></td><td><input aria-label={`Search catalog for receipt line ${line.lineNumber}`} type="search" value={line.catalogSearchText} onChange={e => setReceiptLines(current => current.map((row, i) => i === index ? { ...row, itemId: '', catalogSearchText: e.target.value } : row))} placeholder="Search name, SKU, or ID" /><select aria-label={`Select catalog item for receipt line ${line.lineNumber}`} value={line.itemId} onChange={e => setReceiptLines(current => current.map((row, i) => i === index ? { ...row, itemId: e.target.value, catalogSearchText: receiptCandidates.find(candidate => candidate.catalogObjectId === e.target.value)?.name ?? row.catalogSearchText } : row))}><option value="">{suggestions.length ? `Choose from ${suggestions.length} suggestions` : 'Skip this line'}</option>{suggestions.map(({ candidate, exactNameMatch, nameWordsMatch }) => <option key={candidate.catalogObjectId} value={candidate.catalogObjectId}>{exactNameMatch ? 'Exact name match · ' : nameWordsMatch ? 'Name words match · ' : ''}{candidate.name}{candidate.sku ? ` · ${candidate.sku}` : ''} · {candidate.catalogObjectId}</option>)}</select>{topSuggestion && <small className="cell-sub">Suggested by name: {topSuggestion.candidate.name}. Select to confirm.</small>}{!suggestions.length && <small className="cell-sub">No name matches. Try a shorter product name, SKU, or ID.</small>}</td></tr>; })}</tbody></table></div>
+          <div className="wide table-wrap"><table><thead><tr><th>Receipt line</th><th>Purchased packages</th><th>Extracted basis</th><th>Units per Square item</th><th>Cost per Square item ({receiptDraft.currency})</th><th>Square catalog item</th></tr></thead><tbody>{receiptLines.map((line, index) => {
+            const suggestions = rankReceiptCatalogCandidates(line.catalogSearchText, receiptCandidates, receiptDraft.currency);
+            const topSuggestion = suggestions[0];
+            const conversion = receiptLineConversion(line, receiptDraft.currency);
+            const packageCostMinor = line.packageCostMinor ?? line.unitCostMinor;
+            const unitsPerSquareItem = Number(line.unitsPerSquareItemText);
+            const unitsPerSquareItemValid = Number.isSafeInteger(unitsPerSquareItem) && unitsPerSquareItem >= 1 && unitsPerSquareItem <= 1_000_000;
+            return <tr key={line.lineNumber}>
+              <td>{line.description}{line.reviewReason && <small className="cell-sub">Review: {line.reviewReason.replaceAll('_', ' ')}</small>}</td>
+              <td>{line.quantity ? `${line.quantity} package${Number(line.quantity) === 1 ? '' : 's'}` : 'Unclear'}</td>
+              <td><span>{line.costBasis.replaceAll('_', ' ')}</span>{line.sourceUnitPriceText ? <small className="cell-sub">Printed package price {line.sourceUnitPriceText}</small> : line.unitPriceText && <small className="cell-sub">Model extracted package price {line.unitPriceText}; check the pasted price.</small>}{line.sourceLineAmountText && <small className="cell-sub">Printed line amount {line.sourceLineAmountText}</small>}{!line.sourceLineAmountText && line.lineAmountText && <small className="cell-sub">Model extracted amount {line.lineAmountText}; check the pasted total.</small>}{line.expectedLineAmountText && <small className="cell-sub">At package price × quantity: {line.expectedLineAmountText}</small>}{line.suggestedLineAmountText && <small className="cell-sub">The printed total may be missing its decimal; verify it.</small>}</td>
+              <td><input aria-label={`Units per Square item for receipt line ${line.lineNumber}`} type="number" min="1" max="1000000" step="1" value={line.unitsPerSquareItemText} onChange={e => setReceiptLines(current => current.map((row, i) => i === index ? { ...row, unitsPerSquareItemText: e.target.value } : row))} /><small className="cell-sub">Contents inside each package assigned to this Square item. Use 1 if Square sells the full package.</small></td>
+              <td><input aria-label={`Cost per Square item for receipt line ${line.lineNumber}`} type="number" min="0" step="any" value={line.unitCostText} onChange={e => setReceiptLines(current => current.map((row, i) => i === index ? { ...row, unitCostText: e.target.value } : row))} />{conversion && <small className="cell-sub">Nearest-cent calculation: {money(packageCostMinor, receiptDraft.currency)} per package ÷ {unitsPerSquareItem} = {money(conversion.unitCostMinor, receiptDraft.currency)} per item.</small>}{conversion?.roundingDeltaMinor !== null && conversion?.roundingDeltaMinor !== undefined && <small className="cell-sub">At entered cost: {money(conversion.roundingDeltaMinor, receiptDraft.currency)} rounding difference over {conversion.squareUnitCount} items.</small>}{conversion && conversion.roundingDeltaMinor === null && <small className="cell-sub">Purchase-total rounding difference unavailable because quantity is unclear.</small>}{!unitsPerSquareItemValid && <small className="cell-sub">Enter a whole number from 1 to 1,000,000.</small>}</td>
+              <td><input aria-label={`Search catalog for receipt line ${line.lineNumber}`} type="search" value={line.catalogSearchText} onChange={e => setReceiptLines(current => current.map((row, i) => i === index ? { ...row, itemId: '', catalogSearchText: e.target.value } : row))} placeholder="Search name, SKU, or ID" /><select aria-label={`Select catalog item for receipt line ${line.lineNumber}`} value={line.itemId} onChange={e => setReceiptLines(current => current.map((row, i) => i === index ? { ...row, itemId: e.target.value, catalogSearchText: receiptCandidates.find(candidate => candidate.catalogObjectId === e.target.value)?.name ?? row.catalogSearchText } : row))}><option value="">{suggestions.length ? `Choose from ${suggestions.length} suggestions` : 'Skip this line'}</option>{suggestions.map(({ candidate, exactNameMatch, nameWordsMatch }) => <option key={candidate.catalogObjectId} value={candidate.catalogObjectId}>{exactNameMatch ? 'Exact name match · ' : nameWordsMatch ? 'Name words match · ' : ''}{candidate.name}{candidate.sku ? ` · ${candidate.sku}` : ''} · {candidate.catalogObjectId}</option>)}</select>{topSuggestion && <small className="cell-sub">Suggested by name: {topSuggestion.candidate.name}. Select to confirm.</small>}{!suggestions.length && <small className="cell-sub">No name matches. Try a shorter product name, SKU, or ID.</small>}</td>
+            </tr>;
+          })}</tbody></table></div>
           <label className="wide">Approval reason<textarea minLength={10} maxLength={1000} value={receiptReason} onChange={e => setReceiptReason(e.target.value)} placeholder="Describe how you matched the receipt lines to the catalog and verified the unit costs." /></label>
           <label className="wide">Receipt evidence file<input type="file" accept="application/pdf,image/jpeg,image/png" onChange={e => { setReceiptEvidence(e.target.files?.[0] ?? null); receiptApprovalKey.current = null; }} /></label>
           <label className="wide">Or existing evidence ID<input value={receiptEvidenceRef} onChange={e => { setReceiptEvidenceRef(e.target.value); receiptApprovalKey.current = null; }} maxLength={36} placeholder="UUID for receipt evidence already uploaded by a workspace member" /></label>

@@ -1,4 +1,5 @@
 import { DiagnosisError } from './diagnosis.mjs';
+import { parseReceiptPackageUnits } from './receipt-units.mjs';
 
 export const RECEIPT_MODEL = 'openai/gpt-6-luna';
 export const RECEIPT_PROMPT_VERSION = 'receipt-extraction-v2';
@@ -143,11 +144,12 @@ function normalizeExtraction(value, currency, sourceText) {
       const printedUnitPriceText = wholeQuantity ? findPrintedUnitPrice(sourceText, line.description, currency, quantity) : null;
       const extractedUnitPriceMinor = line.unit_price === null ? null : parseReceiptMoney(line.unit_price, currency);
       const printedUnitPriceMinor = printedUnitPriceText === null ? null : parseReceiptMoney(printedUnitPriceText.replaceAll(',', ''), currency);
-      const unitPriceMinor = extractedUnitPriceMinor ?? printedUnitPriceMinor;
-      const lineAmountMinor = line.line_amount === null ? null : parseReceiptMoney(line.line_amount, currency);
+      const unitPriceMinor = printedUnitPriceMinor ?? extractedUnitPriceMinor;
+      const extractedLineAmountMinor = line.line_amount === null ? null : parseReceiptMoney(line.line_amount, currency);
       const sourceLineAmountText = wholeQuantity ? findPrintedLineAmount(sourceText, line.description, currency, quantity) : null;
       const printedLineAmountMinor = sourceLineAmountText === null ? null : parseReceiptMoney(sourceLineAmountText.replaceAll(',', ''), currency);
-      const lineAmountMinorForReview = printedLineAmountMinor ?? lineAmountMinor;
+      const lineAmountMinor = printedLineAmountMinor ?? extractedLineAmountMinor;
+      const lineAmountMinorForReview = lineAmountMinor;
       const expectedLineAmountValue = unitPriceMinor !== null && wholeQuantity ? unitPriceMinor * wholeQuantity : null;
       const expectedLineAmountMinor = Number.isSafeInteger(expectedLineAmountValue) ? expectedLineAmountValue : null;
       const sourceIsUnpunctuatedMinorUnits = sourceLineAmountText !== null && /^\d+$/.test(sourceLineAmountText);
@@ -172,12 +174,15 @@ function normalizeExtraction(value, currency, sourceText) {
         description: line.description.trim(),
         quantity,
         wholeQuantity,
-        unitPriceText: line.unit_price ?? printedUnitPriceText,
+        packageUnitCount: parseReceiptPackageUnits(line.description),
+        unitPriceText: printedUnitPriceText ?? line.unit_price,
         sourceUnitPriceText: printedUnitPriceText,
         lineAmountText: line.line_amount,
         sourceLineAmountText,
+        expectedLineAmountText: expectedLineAmountMinor === null ? null : fixedMoneyText(expectedLineAmountMinor, currency),
         suggestedLineAmountText: missingDecimalSuggestion ? fixedMoneyText(expectedLineAmountMinor, currency) : null,
         unitCostMinor,
+        packageCostMinor: unitCostMinor,
         costBasis: basis,
         reviewReason
       };
