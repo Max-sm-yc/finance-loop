@@ -55,12 +55,14 @@ test('analytics missing card fees never become zero and incomplete source covera
   assert.equal(result.analytics.totals.feesMinor, null);
   assert.equal(Object.hasOwn(result.analytics.products[0], 'feesMinor'), false);
   assert.equal(result.analytics.products[0].netMinor, 700);
+  assert.deepEqual(result.analytics.products[0].dailySales, [{ period: '2026-09-01', revenueMinor: 1000 }]);
   assert.equal(result.analytics.daily[0].feesMinor, null);
   facts.sourceCoverage.windows = [];
   const unverified = await (await handlers({ facts }).analytics(get('analytics'))).json();
   assert.equal(unverified.analytics.totals.revenueMinor, null);
   assert.equal(unverified.analytics.products[0].revenueRank, null);
   assert.equal(unverified.analytics.products[0].marginBps, null);
+  assert.ok(unverified.analytics.products[0].dailySales.every(day => day.revenueMinor === null));
   facts.sourceCoverage = ready().sourceCoverage;
   facts.sourceHealth = facts.sourceHealth.filter(row => row.resource !== 'payouts');
   const absentResource = await (await handlers({ facts }).analytics(get('analytics'))).json();
@@ -79,6 +81,7 @@ test('analytics missing card fees never become zero and incomplete source covera
   assert.equal(feeGap.analytics.products[0].costMinor, 300);
   assert.equal(Object.hasOwn(feeGap.analytics.products[0], 'feesMinor'), false);
   assert.equal(feeGap.analytics.products[0].netMinor, 700);
+  assert.deepEqual(feeGap.analytics.products[0].dailySales, [{ period: '2026-09-01', revenueMinor: 1000 }]);
 
   facts.sourceHealth = ready().sourceHealth.filter(row => row.resource !== 'orders');
   const missingOrders = await (await handlers({ facts }).analytics(get('analytics'))).json();

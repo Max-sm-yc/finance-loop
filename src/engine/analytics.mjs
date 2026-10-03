@@ -1,5 +1,5 @@
 /** Product-level operational revenue and cost analytics, with explicit unallocated amounts. */
-export const PRODUCT_ANALYTICS_CALCULATION_VERSION = 'finance-loop-product-analytics-v3';
+export const PRODUCT_ANALYTICS_CALCULATION_VERSION = 'finance-loop-product-analytics-v4';
 
 const assert = (ok, message) => { if (!ok) throw new TypeError(message); };
 const validCurrency = value => typeof value === 'string' && /^[A-Z]{3}$/.test(value);
@@ -186,7 +186,7 @@ export function calculateProductAnalytics({ lines = [], fees = [], refunds = [],
     revenueMinor = sum(revenueMinor, p.revenueMinor, 'revenue total');
     if (p.costMinor === null) allCostsKnown = false; else costMinor = sum(costMinor, p.costMinor, 'COGS total');
     if (!p.revenueComplete) p.revenueMinor = null;
-    p.sourceRefs = refs(p.sourceRefs); delete p.costComplete; delete p.revenueComplete;
+    p.sourceRefs = refs(p.sourceRefs);
   }
   const refundFactsInPeriod = cleanRefunds.filter(f => f.status === 'completed' && inPeriod(f));
   const feeFactsInPeriod = cleanFees.filter(f => f.status === 'completed' && inPeriod(f));
@@ -196,6 +196,7 @@ export function calculateProductAnalytics({ lines = [], fees = [], refunds = [],
   const totalFees = feesComplete ? feeFactsInPeriod.reduce((n, f) => sum(n, f.amountMinor, 'fees total'), 0) : null;
   revenueMinor -= unallocatedRefundsMinor;
   if (![revenueMinor, costMinor].every(Number.isSafeInteger)) throw new TypeError('analytics totals exceed safe integer range');
+  // Item trend buckets still need the per-product completeness flags.
   const productDailySales = new Map();
   for (const record of productSalesRecords) {
     const period = String(record.at).slice(0, 10);
@@ -213,6 +214,8 @@ export function calculateProductAnalytics({ lines = [], fees = [], refunds = [],
       assert(Number.isSafeInteger(revenue), 'daily product sales exceeds safe integer range');
       return { period: bucket.period, revenueMinor: product.revenueComplete && bucket.revenueComplete ? revenue : null };
     });
+    delete product.costComplete;
+    delete product.revenueComplete;
   }
   const adjustedCostMinor = allCostsKnown ? sum(costMinor, -unallocatedCogsReversalMinor, 'adjusted COGS') : null;
   const calculationFailed = issues.some(i => ['SOURCE_CONFLICT', 'CURRENCY_MISMATCH'].includes(i.code));
