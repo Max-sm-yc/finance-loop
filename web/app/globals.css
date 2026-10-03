@@ -123,6 +123,19 @@ td { padding: 11px 10px; border-bottom: 1px solid var(--line-soft); color: #c4ce
 tbody tr:last-child td { border-bottom: 0; }
 tbody tr:hover td { background: #1c221e; }
 td small.cell-sub { display: block; margin-top: 4px; color: var(--subtle); font-size: 8px; }
+.analytics-product-choice { display: inline-flex; flex-direction: column; align-items: flex-start; padding: 0; border: 0; color: var(--green); background: transparent; font: inherit; text-align: left; cursor: pointer; }
+.analytics-product-choice:hover, .analytics-product-choice.selected { color: #a1e3b6; }
+.analytics-product-choice:focus-visible { outline: 2px solid var(--green); outline-offset: 3px; border-radius: 2px; }
+.analytics-product-choice .cell-sub { color: var(--subtle); }
+.item-sales-chart { margin-top: 16px; padding-top: 15px; border-top: 1px solid var(--line); }
+.item-sales-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; margin-bottom: 10px; }
+.item-sales-heading h3 { margin: 0; color: #e1e8e2; font-size: 11px; font-weight: 630; }
+.item-sales-heading p { margin: 5px 0 0; color: var(--subtle); font-size: 9px; line-height: 1.5; }
+.item-sales-svg-wrap { width: 100%; overflow: hidden; }
+.item-sales-svg { display: block; width: 100%; height: auto; overflow: visible; }
+.item-sales-zero { stroke: #39463d; stroke-width: 1; vector-effect: non-scaling-stroke; }
+.item-sales-axis { fill: var(--subtle); font-family: inherit; font-size: 8px; font-variant-numeric: tabular-nums; }
+.item-sales-empty { margin: 5px 0 0; color: var(--subtle); text-align: center; font-size: 9px; }
 .negative { color: var(--red); }
 .positive { color: var(--green); }
 .notice { display: flex; align-items: flex-start; gap: 10px; margin: 11px 0; padding: 11px 13px; border: 1px solid #34483a; border-radius: 7px; color: #afc7b6; background: #1b2820; font-size: 9px; line-height: 1.55; }
@@ -188,6 +201,7 @@ td small.cell-sub { display: block; margin-top: 4px; color: var(--subtle); font-
   .panel { padding: 14px; }
   .filter-panel { align-items: stretch; flex-direction: column; }
   .filter-panel select { width: 100%; }
+  .item-sales-heading { flex-direction: column; }
   .review-item { gap: 8px; }
   .review-item > .secondary { padding: 7px; }
   .notice { display: block; }

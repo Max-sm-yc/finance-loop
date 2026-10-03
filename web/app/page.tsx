@@ -12,7 +12,7 @@ type ReceiptDraftLine = { lineNumber: number; description: string; quantity: str
 type ReceiptDraft = { supplier: string | null; invoiceDate: string | null; currency: string; model: string; promptVersion: string; lines: ReceiptDraftLine[] };
 type ReceiptDraftLineInput = ReceiptDraftLine & { itemId: string; unitCostText: string; catalogSearchText: string };
 type ReceiptCatalogCandidate = { catalogObjectId: string; name: string; sku: string | null; currency: string };
-type AnalyticsProduct = { productId: string; productName?: string | null; unitsSold: number; revenueMinor: number | null; costMinor: number | null; netMinor: number | null; grossMinor?: number | null; discountMinor?: number | null; refundsMinor?: number | null; revenueRank?: number | null; netRank?: number | null; revenueShareBps?: number | null; marginBps?: number | null; sourceRefs?: string[] };
+type AnalyticsProduct = { productId: string; productName?: string | null; unitsSold: number; revenueMinor: number | null; costMinor: number | null; netMinor: number | null; grossMinor?: number | null; discountMinor?: number | null; refundsMinor?: number | null; revenueRank?: number | null; netRank?: number | null; revenueShareBps?: number | null; marginBps?: number | null; dailySales?: Array<{ period: string; revenueMinor: number | null }>; sourceRefs?: string[] };
 type AnalyticsSeries = { period: string; revenueMinor: number | null; costMinor: number | null; feesMinor: number | null; netMinor: number | null; unitsSold: number };
 type AnalyticsReport = { calculationVersion: string; status: string; currency: string | null; sourceRevision?: number | null; products: AnalyticsProduct[]; totals: { revenueMinor: number | null; costMinor: number | null; netMinor: number | null; feesMinor: number | null; refundsMinor: number | null }; unallocated: { revenueMinor: number | null; refundsMinor: number | null; feesMinor: number | null; cogsReversalMinor?: number | null }; issues: Array<{ code: string; sourceRefs?: string[] }>; daily?: AnalyticsSeries[]; monthly?: AnalyticsSeries[] };
 const UUID_INPUT = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -432,9 +432,9 @@ function InventoryPanel({ organizationId, accountId, currency, timezone, account
   </section>;
 }
 function Analytics({ organizationId, from, to, currency }: { organizationId: string; from: string; to: string; currency: string }) {
-  const [report, setReport] = useState<AnalyticsReport | null>(null), [error, setError] = useState(''), [loading, setLoading] = useState(false), [search, setSearch] = useState(''), [sortBy, setSortBy] = useState<'revenue' | 'cost' | 'net' | 'units'>('revenue'), [seriesView, setSeriesView] = useState<'monthly' | 'daily'>('monthly');
+  const [report, setReport] = useState<AnalyticsReport | null>(null), [error, setError] = useState(''), [loading, setLoading] = useState(false), [search, setSearch] = useState(''), [sortBy, setSortBy] = useState<'revenue' | 'cost' | 'net' | 'units'>('revenue'), [seriesView, setSeriesView] = useState<'monthly' | 'daily'>('monthly'), [selectedProductId, setSelectedProductId] = useState('');
   useEffect(() => {
-    let active = true; setLoading(true); setError(''); setReport(null);
+    let active = true; setLoading(true); setError(''); setReport(null); setSelectedProductId('');
     const query = new URLSearchParams({ organizationId, from, to, currency });
     api<{ analytics: AnalyticsReport }>(`/api/analytics?${query}`).then(result => { if (active) setReport(result.analytics); })
       .catch(err => { if (active) setError(err instanceof Error ? err.message : 'Analytics could not be loaded.'); })
@@ -445,6 +445,7 @@ function Analytics({ organizationId, from, to, currency }: { organizationId: str
     const value = (p: AnalyticsProduct) => sortBy === 'cost' ? p.costMinor : sortBy === 'net' ? p.netMinor : sortBy === 'units' ? p.unitsSold : p.revenueMinor;
     const av = value(a), bv = value(b); return av == null ? 1 : bv == null ? -1 : bv - av || a.productId.localeCompare(b.productId);
   });
+  const selectedProduct = report?.products.find(product => product.productId === selectedProductId);
   function exportCsv() {
     if (!report) return;
     const rows: unknown[][] = [['Period from', from], ['Period to', to], ['Requested currency', currency], ['Reported currency', report.currency ?? 'Mixed or unavailable'], ['Calculation version', report.calculationVersion], ['Calculation status', report.status], ['Source revision', report.sourceRevision ?? 'unavailable'], ['Aggregate Square processing fees', report.totals.feesMinor ?? 'incomplete'], ['Aggregate net after fees', report.totals.netMinor ?? 'incomplete'], ['Product result basis', 'Net and margin before processing fees'], [], ['Product','Product ID','Units sold','Revenue minor','Cost minor','Net before fees minor','Revenue rank','Net rank','Margin before fees bps','Source refs','Status'], ...report.products.map(p => [p.productName ?? 'Unidentified product', p.productId, p.unitsSold, p.revenueMinor, p.costMinor ?? '', p.netMinor ?? '', p.revenueRank ?? '', p.netRank ?? '', p.marginBps ?? '', p.sourceRefs?.join('|') ?? '', p.netMinor == null ? 'incomplete' : 'complete']), ['Unallocated revenue','','',report.unallocated.revenueMinor,'','','','','','','review'], ['Unallocated refunds','','',report.unallocated.refundsMinor,'','','','','','','review'], ['Unallocated COGS reversals','','','',report.unallocated.cogsReversalMinor ?? '','','','','','','review']];
@@ -452,12 +453,81 @@ function Analytics({ organizationId, from, to, currency }: { organizationId: str
     const href = URL.createObjectURL(new Blob([csv], { type: 'text/csv;charset=utf-8' })); const link = document.createElement('a'); link.href = href; link.download = `product-analytics-${from.slice(0,10)}-${to.slice(0,10)}.csv`; link.click(); URL.revokeObjectURL(href);
   }
   return <><section className="metric-grid"><Card label="Product revenue" value={money(report?.totals?.revenueMinor, currency)} hint="After known discounts and refunds" /><Card label="Product cost" value={money(report?.totals?.costMinor, currency)} hint={report?.totals?.costMinor == null ? 'Incomplete where cost evidence is missing' : 'Effective approved acquisition costs'} tone={report?.totals?.costMinor == null ? 'warn-text' : ''} /><Card label="Square processing fees" value={money(report?.totals?.feesMinor, currency)} hint={report?.totals?.feesMinor == null ? 'Incomplete source fee data' : 'Deducted after product margins'} tone={report?.totals?.feesMinor == null ? 'warn-text' : ''} /><Card label="Net after fees" value={money(report?.totals?.netMinor, currency)} hint="Product revenue − COGS − processing fees" tone={report?.totals?.netMinor == null ? 'warn-text' : ''} /></section>
-    <section className="panel table-panel"><div className="panel-heading"><div><h2>Product performance before fees</h2><p>Item-level results show revenue, COGS and margin before aggregate Square fees · {report?.calculationVersion ?? 'loading'} · source revision {report?.sourceRevision ?? 'unavailable'}</p></div><div className="form-actions"><span className={`pill ${report?.status === 'complete' ? 'good' : report?.status === 'failed' ? 'warn' : 'neutral'}`}>{report?.status ?? (loading ? 'Loading' : 'Unavailable')}</span><button className="secondary" onClick={exportCsv} disabled={!report}>Export CSV</button></div></div>
+    <section className="panel table-panel"><div className="panel-heading"><div><h2>Product performance before fees</h2><p>Select an item name to chart its sales. Revenue, COGS and margin are before aggregate Square fees · {report?.calculationVersion ?? 'loading'} · source revision {report?.sourceRevision ?? 'unavailable'}</p></div><div className="form-actions"><span className={`pill ${report?.status === 'complete' ? 'good' : report?.status === 'failed' ? 'warn' : 'neutral'}`}>{report?.status ?? (loading ? 'Loading' : 'Unavailable')}</span><button className="secondary" onClick={exportCsv} disabled={!report}>Export CSV</button></div></div>
       {loading && <div className="inline-empty">Calculating product results…</div>}{error && <div className="notice error-box" role="alert">{error}</div>}{report?.currency == null && report?.status === 'failed' && <div className="notice error-box" role="alert">Mixed or invalid source currencies prevented a single-currency report.</div>}
       <div className="filter-panel"><label>Find product<input type="search" value={search} onChange={e => setSearch(e.target.value)} placeholder="Name or product ID" /></label><label>Rank by<select value={sortBy} onChange={e => setSortBy(e.target.value as typeof sortBy)}><option value="revenue">Revenue</option><option value="cost">Cost</option><option value="net">Net before fees</option><option value="units">Units sold</option></select></label></div>
-      {visibleProducts.length ? <div className="table-wrap"><table><thead><tr><th>Rank</th><th>Product</th><th>Units</th><th>Revenue</th><th>Cost</th><th>Net before fees</th><th>Margin before fees</th><th>Revenue share</th></tr></thead><tbody>{visibleProducts.map(product => <tr key={product.productId}><td>R{product.revenueRank ?? '—'} / N{product.netRank ?? '—'}</td><td>{product.productName ?? 'Unidentified product'}<small className="cell-sub">{product.productId}</small></td><td>{product.unitsSold}</td><td>{money(product.revenueMinor, currency)}</td><td>{money(product.costMinor, currency)}</td><td>{product.netMinor == null ? <span className="pill warn">Incomplete</span> : money(product.netMinor, currency)}</td><td>{product.marginBps == null ? '—' : `${(product.marginBps / 100).toFixed(1)}%`}</td><td>{product.revenueShareBps == null ? '—' : `${(product.revenueShareBps / 100).toFixed(1)}%`}</td></tr>)}</tbody></table></div> : !loading && !error && <div className="inline-empty">No product sales match this period and filter.</div>}
+      {visibleProducts.length ? <div className="table-wrap"><table><thead><tr><th>Rank</th><th>Product</th><th>Units</th><th>Revenue</th><th>Cost</th><th>Net before fees</th><th>Margin before fees</th><th>Revenue share</th></tr></thead><tbody>{visibleProducts.map(product => <tr key={product.productId}><td>R{product.revenueRank ?? '—'} / N{product.netRank ?? '—'}</td><td><button type="button" className={'analytics-product-choice' + (selectedProductId === product.productId ? ' selected' : '')} aria-pressed={selectedProductId === product.productId} aria-label={(selectedProductId === product.productId ? 'Hide' : 'Show') + ' sales chart for ' + (product.productName ?? 'Unidentified product')} onClick={() => setSelectedProductId(selectedProductId === product.productId ? '' : product.productId)}>{product.productName ?? 'Unidentified product'}<small className="cell-sub">{product.productId}</small></button></td><td>{product.unitsSold}</td><td>{money(product.revenueMinor, currency)}</td><td>{money(product.costMinor, currency)}</td><td>{product.netMinor == null ? <span className="pill warn">Incomplete</span> : money(product.netMinor, currency)}</td><td>{product.marginBps == null ? '—' : `${(product.marginBps / 100).toFixed(1)}%`}</td><td>{product.revenueShareBps == null ? '—' : `${(product.revenueShareBps / 100).toFixed(1)}%`}</td></tr>)}</tbody></table></div> : !loading && !error && <div className="inline-empty">No product sales match this period and filter.</div>}{selectedProduct && <ProductSalesChart product={selectedProduct} from={from} to={to} currency={currency} />}
     </section>{(seriesView === 'monthly' ? report?.monthly : report?.daily)?.length ? <section className="panel table-panel"><div className="panel-heading"><div><h2>{seriesView === 'monthly' ? 'Monthly' : 'Daily'} trend</h2><p>UTC reporting buckets show processing fees as an aggregate cost after product COGS.</p></div><label>View<select value={seriesView} onChange={e => setSeriesView(e.target.value as 'monthly' | 'daily')}><option value="monthly">Monthly</option><option value="daily">Daily</option></select></label></div><div className="table-wrap"><table><thead><tr><th>Period (UTC)</th><th>Revenue</th><th>Cost</th><th>Processing fees</th><th>Net after fees</th><th>Units</th></tr></thead><tbody>{(seriesView === 'monthly' ? report?.monthly : report?.daily)?.map(series => <tr key={series.period}><td>{series.period}</td><td>{money(series.revenueMinor, currency)}</td><td>{money(series.costMinor, currency)}</td><td>{money(series.feesMinor, currency)}</td><td>{money(series.netMinor, currency)}</td><td>{series.unitsSold}</td></tr>)}</tbody></table></div></section> : null}<section className="panel"><div className="panel-heading"><div><h2>Unallocated activity</h2><p>Revenue, refunds and COGS reversals without defensible item attribution remain separate; fees are summarized above.</p></div></div><div className="status-row"><span>Unallocated revenue</span><b>{money(report?.unallocated?.revenueMinor, currency)}</b></div><div className="status-row"><span>Unallocated refunds</span><b>{money(report?.unallocated?.refundsMinor, currency)}</b></div><div className="status-row"><span>Unallocated COGS reversals</span><b>{money(report?.unallocated?.cogsReversalMinor, currency)}</b></div>{report?.issues?.length ? <div className="notice compact-notice">Incomplete data: {Array.from(new Set(report.issues.map(issue => issue.code))).join(', ')}</div> : null}</section></>;
 }
+function salesPeriodKeys(from: string, to: string, view: 'daily' | 'monthly') {
+  const fromTime = Date.parse(from), toTime = Date.parse(to);
+  if (!Number.isFinite(fromTime) || !Number.isFinite(toTime) || toTime <= fromTime) return [];
+  const start = new Date(fromTime), last = new Date(toTime - 1);
+  let cursor = view === 'monthly'
+    ? new Date(Date.UTC(start.getUTCFullYear(), start.getUTCMonth(), 1))
+    : new Date(Date.UTC(start.getUTCFullYear(), start.getUTCMonth(), start.getUTCDate()));
+  const lastPeriod = view === 'monthly'
+    ? Date.UTC(last.getUTCFullYear(), last.getUTCMonth(), 1)
+    : Date.UTC(last.getUTCFullYear(), last.getUTCMonth(), last.getUTCDate());
+  const periods: string[] = [];
+  while (cursor.getTime() <= lastPeriod && periods.length < 400) {
+    periods.push(cursor.toISOString().slice(0, view === 'monthly' ? 7 : 10));
+    if (view === 'monthly') cursor.setUTCMonth(cursor.getUTCMonth() + 1);
+    else cursor.setUTCDate(cursor.getUTCDate() + 1);
+  }
+  return periods;
+}
+
+function ProductSalesChart({ product, from, to, currency }: { product: AnalyticsProduct; from: string; to: string; currency: string }) {
+  const [view, setView] = useState<'daily' | 'monthly'>('daily');
+  const points = useMemo(() => {
+    const daily = salesPeriodKeys(from, to, 'daily');
+    const salesByDay = new Map((product.dailySales ?? []).map(day => [day.period, day.revenueMinor] as const));
+    const dailyPoints = daily.map(period => ({ period, revenueMinor: salesByDay.has(period) ? salesByDay.get(period)! : 0 }));
+    if (view === 'daily') return dailyPoints;
+    const monthly = new Map<string, { period: string; revenueMinor: number | null }>();
+    for (const point of dailyPoints) {
+      const period = point.period.slice(0, 7), bucket = monthly.get(period) ?? { period, revenueMinor: 0 };
+      if (point.revenueMinor === null || bucket.revenueMinor === null) bucket.revenueMinor = null;
+      else {
+        const total = bucket.revenueMinor + point.revenueMinor;
+        bucket.revenueMinor = Number.isSafeInteger(total) ? total : null;
+      }
+      monthly.set(period, bucket);
+    }
+    return [...monthly.values()];
+  }, [from, to, product.dailySales, view]);
+  const trendAvailable = Array.isArray(product.dailySales) && product.dailySales.length > 0
+    && points.length > 0 && points.every(point => point.revenueMinor !== null);
+  const hasSales = points.some(point => point.revenueMinor !== null && point.revenueMinor !== 0);
+  const width = 760, height = 220, left = 76, right = 748, top = 20, bottom = 177;
+  const values = points.map(point => point.revenueMinor ?? 0);
+  const maxValue = Math.max(0, ...values), minValue = Math.min(0, ...values);
+  const domainMax = maxValue === minValue ? 1 : maxValue;
+  const domainMin = maxValue === minValue ? 0 : minValue;
+  const yFor = (value: number) => top + (domainMax - value) / (domainMax - domainMin) * (bottom - top);
+  const zeroY = yFor(0), step = points.length ? (right - left) / points.length : 0;
+  const barWidth = Math.max(1, Math.min(28, step * 0.68));
+  const tickIndexes = points.length ? [...new Set([0, Math.floor((points.length - 1) / 2), points.length - 1])].filter(index => index >= 0) : [];
+  return <div className="item-sales-chart">
+    <div className="item-sales-heading"><div><h3>Sales over time · {product.productName ?? 'Unidentified product'}</h3><p>Daily bars show item revenue after known discounts and item-level refunds. Dates use UTC; processing fees remain aggregate.</p></div><label className="compact">Buckets<select value={view} onChange={event => setView(event.target.value as typeof view)}><option value="daily">Daily</option><option value="monthly">Monthly</option></select></label></div>
+    {!trendAvailable ? <div className="inline-empty">This item’s sales trend is unavailable because the item data or source coverage is incomplete.</div> : <>
+      <div className="item-sales-svg-wrap"><svg className="item-sales-svg" viewBox={`0 0 ${width} ${height}`} role="img" aria-label={`${product.productName ?? product.productId} revenue by ${view === 'daily' ? 'day' : 'month'}`}>
+        <line x1={left} x2={right} y1={zeroY} y2={zeroY} className="item-sales-zero" />
+        <text x={left - 8} y={top + 4} textAnchor="end" className="item-sales-axis">{money(maxValue, currency)}</text>
+        {domainMin < 0 && <text x={left - 8} y={bottom + 3} textAnchor="end" className="item-sales-axis">{money(minValue, currency)}</text>}
+        {points.map((point, index) => {
+          const value = point.revenueMinor ?? 0, valueY = yFor(value), barHeight = value === 0 ? 0 : Math.max(1, Math.abs(zeroY - valueY));
+          const x = left + index * step + (step - barWidth) / 2;
+          return <rect key={point.period} x={x} y={Math.min(zeroY, valueY)} width={barWidth} height={barHeight} rx="1" fill={value < 0 ? '#e6a36b' : '#76ca94'}><title>{point.period}: {money(point.revenueMinor, currency)}</title></rect>;
+        })}
+        {tickIndexes.map(index => <text key={points[index].period} x={left + index * step + step / 2} y={height - 12} textAnchor={index === 0 ? 'start' : index === points.length - 1 ? 'end' : 'middle'} className="item-sales-axis">{points[index].period}</text>)}
+      </svg></div>
+      {!hasSales && <p className="item-sales-empty">No recorded revenue for this item in the selected period.</p>}
+    </>}
+  </div>;
+}
+
 function Review({ issues, organizationId, currency, onSaved }: { issues: Issue[]; organizationId: string; currency: string; onSaved: () => void }) {
   const [selected, setSelected] = useState<Issue | null>(null);
   const [correction, setCorrection] = useState<{ issue: Issue; kind: 'item' | 'refund' } | null>(null);
