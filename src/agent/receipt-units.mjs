@@ -1,7 +1,10 @@
 const MAX_PACKAGE_UNITS = 1_000_000;
 const MAX_SAFE_MINOR = BigInt(Number.MAX_SAFE_INTEGER);
 
-/** Detect a printed inner-unit count such as "36 pk" or "24 count". */
+/** Detect a printed inner-unit count such as "36 pk" or "24 count".
+ * @param {string} description
+ * @returns {number | null}
+ */
 export function parseReceiptPackageUnits(description) {
   const matches = [...String(description ?? '').matchAll(/\b(\d{1,7})\s*(?:pk|packs?|ct|count)\b/gi)];
   if (matches.length !== 1) return null;
@@ -9,7 +12,13 @@ export function parseReceiptPackageUnits(description) {
   return Number.isSafeInteger(units) && units > 0 && units <= MAX_PACKAGE_UNITS ? units : null;
 }
 
-/** Round one Square-unit cost to the nearest minor unit and report package-total variance. */
+/** Round one Square-unit cost to the nearest minor unit and report package-total variance.
+ * @param {number} packageCostMinor
+ * @param {number | null} packageQuantity
+ * @param {number} unitsPerPackage
+ * @param {number | null} [squareUnitCostMinor]
+ * @returns {{ unitCostMinor: number, appliedUnitCostMinor: number, roundingDeltaMinor: number | null, squareUnitCount: string | null } | null}
+ */
 export function calculatePackageUnitCostMinor(packageCostMinor, packageQuantity, unitsPerPackage, squareUnitCostMinor = null) {
   if (!Number.isSafeInteger(packageCostMinor) || packageCostMinor < 0 ||
       packageQuantity !== null && (!Number.isSafeInteger(packageQuantity) || packageQuantity < 1 || packageQuantity > MAX_PACKAGE_UNITS) ||
