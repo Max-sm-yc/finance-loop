@@ -43,12 +43,12 @@ function windowCovered(windows, from, to) {
   }
   return false;
 }
-function sourceHealthIncomplete(health, requiredResources) {
+function sourceHealthIncomplete(health, requiredResources, { includeUnlisted = true } = {}) {
   const fresh = row => row?.status === 'fresh' && row.gap == null
     && Number.isFinite(Date.parse(row.lastSuccessfulSyncAt ?? ''))
     && Date.now() - Date.parse(row.lastSuccessfulSyncAt) <= 24 * 60 * 60 * 1000;
   return requiredResources.some(resource => !fresh(health.find(row => row?.resource === resource)))
-    || health.some(row => !fresh(row));
+    || (includeUnlisted && health.some(row => !fresh(row)));
 }
 function validMoney(value) { return Number.isSafeInteger(value) && value !== 0; }
 function idempotency(req) {
@@ -582,29 +582,49 @@ export function createHandlers(adapters) {
     const health = sourceData?.sourceHealth ?? sourceData?.health ?? [];
     const incompleteHealth = sourceHealthIncomplete(health, ['square', 'orders', 'payments', 'refunds', 'catalog', 'payouts'])
       || (sourceData?.sourceGaps?.missingPayoutEntryHealthCount ?? 0) > 0;
+    // Product revenue is supported by completed order lines and refunds. A
+    // payment/payout fee gap can make net incomplete, but must not erase known
+    // item revenue. Keep each completeness gate tied to the facts it governs.
+    const incompleteRevenueHealth = sourceHealthIncomplete(health, ['orders', 'refunds'], { includeUnlisted: false });
+    const feeHealth = health.filter(row => ['payments', 'payouts'].includes(row?.resource)
+      || (typeof row?.resource === 'string' && row.resource.startsWith('payout_entries:')));
+    const incompleteFeeHealth = sourceHealthIncomplete(feeHealth, ['payments', 'payouts'])
+      || (sourceData?.sourceGaps?.missingPayoutEntryHealthCount ?? 0) > 0;
     const incompleteCoverage = !windowCovered(sourceData?.sourceCoverage?.windows, from, to);
     const missingParents = (sourceData?.sourceGaps?.missingParentOrderLineCount ?? 0) > 0;
-    if (missingFee || incompleteHealth || incompleteCoverage || missingParents || (sourceData?.openIssueCount ?? 0) > 0) {
+    const openIssues = (sourceData?.openIssueCount ?? 0) > 0;
+    if (missingFee || incompleteHealth || incompleteCoverage || missingParents || openIssues) {
       if (report.status !== 'failed') report.status = 'incomplete';
-      report.totals.costMinor = null; report.totals.netMinor = null;
-      if (report.status !== 'failed') for (const product of report.products) { product.netMinor = null; product.netRank = null; product.marginBps = null; }
-      for (const series of [...(report.daily ?? []), ...(report.monthly ?? [])]) { series.costMinor = null; series.netMinor = null; }
-      if (missingFee) {
-        report.totals.feesMinor = null; report.unallocated.feesMinor = null;
-        for (const product of report.products) { product.feesMinor = null; product.netMinor = null; product.netRank = null; product.marginBps = null; }
-        for (const series of [...(report.daily ?? []), ...(report.monthly ?? [])]) series.feesMinor = null;
-      }
-      if (incompleteHealth || incompleteCoverage || missingParents) {
-        report.totals.revenueMinor = null;
-        for (const product of report.products) { product.revenueMinor = null; product.grossMinor = null; product.discountMinor = null; product.refundsMinor = null; product.revenueRank = null; product.revenueShareBps = null; product.netMinor = null; product.netRank = null; product.marginBps = null; }
-        for (const series of [...(report.daily ?? []), ...(report.monthly ?? [])]) series.revenueMinor = null;
-      }
-      if (missingFee) report.issues.push({ code: 'PROCESSING_FEE_INCOMPLETE', sourceRefs: [] });
-      if (incompleteHealth) report.issues.push({ code: 'SOURCE_HEALTH_INCOMPLETE', sourceRefs: [] });
-      if (incompleteCoverage) report.issues.push({ code: 'SOURCE_WINDOW_UNVERIFIED', sourceRefs: [] });
-      if (missingParents) report.issues.push({ code: 'SOURCE_PARENT_MISSING', sourceRefs: [] });
-      if ((sourceData?.openIssueCount ?? 0) > 0) report.issues.push({ code: 'OPEN_SOURCE_ISSUES', sourceRefs: [] });
     }
+    if (incompleteCoverage || missingParents || incompleteRevenueHealth) {
+      report.totals.revenueMinor = null; report.totals.costMinor = null; report.totals.netMinor = null;
+      if (report.status !== 'failed') for (const product of report.products) {
+        product.revenueMinor = null; product.grossMinor = null; product.discountMinor = null; product.refundsMinor = null;
+        product.revenueRank = null; product.revenueShareBps = null; product.costMinor = null;
+        product.netMinor = null; product.netRank = null; product.marginBps = null;
+      }
+      for (const series of [...(report.daily ?? []), ...(report.monthly ?? [])]) {
+        series.revenueMinor = null; series.costMinor = null; series.netMinor = null;
+      }
+    }
+    if (missingFee || incompleteFeeHealth) {
+      report.totals.netMinor = null;
+      for (const product of report.products) { product.netMinor = null; product.netRank = null; product.marginBps = null; }
+      for (const series of [...(report.daily ?? []), ...(report.monthly ?? [])]) series.netMinor = null;
+      report.totals.feesMinor = null; report.unallocated.feesMinor = null;
+      for (const product of report.products) { product.feesMinor = null; product.netMinor = null; product.netRank = null; product.marginBps = null; }
+      for (const series of [...(report.daily ?? []), ...(report.monthly ?? [])]) series.feesMinor = null;
+    }
+    if (openIssues) {
+      report.totals.costMinor = null; report.totals.netMinor = null;
+      for (const product of report.products) { product.costMinor = null; product.netMinor = null; product.netRank = null; product.marginBps = null; }
+      for (const series of [...(report.daily ?? []), ...(report.monthly ?? [])]) { series.costMinor = null; series.netMinor = null; }
+    }
+    if (missingFee || incompleteFeeHealth) report.issues.push({ code: 'PROCESSING_FEE_INCOMPLETE', sourceRefs: [] });
+    if (incompleteHealth) report.issues.push({ code: 'SOURCE_HEALTH_INCOMPLETE', sourceRefs: [] });
+    if (incompleteCoverage) report.issues.push({ code: 'SOURCE_WINDOW_UNVERIFIED', sourceRefs: [] });
+    if (missingParents) report.issues.push({ code: 'SOURCE_PARENT_MISSING', sourceRefs: [] });
+    if (openIssues) report.issues.push({ code: 'OPEN_SOURCE_ISSUES', sourceRefs: [] });
     return ok({ analytics: { ...report, sourceRevision: sourceData?.sourceRevision ?? null,
       sourceCoverage: sourceData?.sourceCoverage ?? null, sourceHealth: health, incomePolicy } });
   });
