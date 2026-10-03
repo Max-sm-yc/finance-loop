@@ -578,6 +578,10 @@ export function createSupabaseAdapters({ url, publishableKey, secretKey, tokenEn
         ...manualItems.map(item => ({ ...item, square_catalog_object_id: null, effective_from: null, effective_until: null, unit_cost_minor: null, item_kind: 'manual' }))
       ].sort((a, b) => a.name.localeCompare(b.name) || a.item_kind.localeCompare(b.item_kind));
     },
+    async hasEvidenceFile({ organizationId, evidenceFileId, accessToken }) {
+      const query = new URLSearchParams({ select: 'id', organization_id: eq(organizationId), id: eq(evidenceFileId), limit: '2' });
+      return Boolean(one(await table(userRest(accessToken), 'evidence_files', query), 'evidence file'));
+    },
     async recordInventoryItem(args) {
       const { data, error } = await userRest(args.accessToken).rpc('record_inventory_item', {
         organization_id: args.organizationId, sku: args.sku, name: args.name,
@@ -586,6 +590,26 @@ export function createSupabaseAdapters({ url, publishableKey, secretKey, tokenEn
       });
       if (error) throw error;
       return { itemId: data };
+    },
+    async recordSquareCatalogItem(args) {
+      const { data, error } = await userRest(args.accessToken).rpc('record_square_catalog_item', {
+        organization_id: args.organizationId, idempotency_key: args.idempotencyKey,
+        square_catalog_object_id: args.squareCatalogObjectId, name: args.name, sku: args.sku,
+        unit_cost_minor: args.unitCostMinor, currency: args.currency, effective_from: args.effectiveFrom,
+        evidence_file_id: args.evidenceFileId, reason: args.reason, square_price_minor: args.squarePriceMinor
+      });
+      if (error) throw error;
+      return data;
+    },
+    async registerSquareCatalogCreationTicket(args) {
+      const { data, error } = await serviceRest().rpc('register_square_catalog_creation_ticket', {
+        organization_id: args.organizationId, idempotency_key: args.idempotencyKey,
+        square_item_id: args.squareItemId, square_catalog_object_id: args.squareCatalogObjectId,
+        name: args.name, variation_name: args.variationName, sku: args.sku,
+        currency: args.currency, price_minor: args.priceMinor
+      });
+      if (error) throw error;
+      return data === true;
     },
     async recordInventoryPurchase(args) {
       const { data, error } = await userRest(args.accessToken).rpc('record_inventory_purchase', {
@@ -856,11 +880,11 @@ export function createSupabaseAdapters({ url, publishableKey, secretKey, tokenEn
     }
   };
   const stateStore = {
-    async save({ state, organizationId, userId, redirectUri, expiresAt }) {
+    async save({ state, organizationId, userId, redirectUri, expiresAt, scopes }) {
       const stateSha256 = createHash('sha256').update(state).digest('hex');
       const { error } = await serviceRest().rpc('save_square_oauth_state', {
         state_sha256: stateSha256, organization_id: organizationId, user_id: userId,
-        redirect_uri: redirectUri, expires_at: expiresAt
+        redirect_uri: redirectUri, expires_at: expiresAt, scopes
       });
       if (error) throw error;
     },

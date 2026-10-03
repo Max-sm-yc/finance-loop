@@ -17,12 +17,12 @@ const response = (status, value) => new Response(JSON.stringify(value), { status
 const ok = data => response(200, data);
 const created = data => response(201, data);
 const bad = (status, code) => response(status, { error: code, code });
-function requireAdapters({ supabase, db, queue, config }) {
+function requireAdapters({ supabase, db, queue, config, squareCatalog }) {
   if (!supabase?.auth?.getUser || !db || !queue || !config) throw new TypeError('Supabase auth, durable DB/queue adapters, and config are required');
   const required = ['getMembership', 'getDashboard', 'listIssues', 'listManualMovements', 'listObservations', 'listAuditEvents', 'getSettings', 'getIssue', 'getIssueEvidence', 'recordItemDefinition', 'recordSaleLineCostOverride', 'recordRefundCostReview', 'createProposalAtomic', 'reserveModelBudget', 'recordModelUsage', 'getReplaySnapshot', 'saveProjectionRun', 'asUser'];
   for (const method of required) if (typeof db[method] !== 'function') throw new TypeError(`db.${method} durable adapter method is required`);
   for (const method of ['enqueueSquareSync', 'enqueueSquareWebhook', 'enqueueProjectionReplay']) if (typeof queue[method] !== 'function') throw new TypeError(`queue.${method} durable adapter method is required`);
-  return { supabase, db, queue, config };
+  return { supabase, db, queue, config, squareCatalog };
 }
 function exactObject(value, keys, required = keys) {
   return value && typeof value === 'object' && !Array.isArray(value) && Object.keys(value).every(k => keys.includes(k)) && required.every(k => own(value, k));
@@ -104,7 +104,7 @@ function safeThrown(error) {
  * Adapter call shapes are intentionally explicit and are suitable for Supabase RPCs.
  */
 export function createHandlers(adapters) {
-  const { supabase, db, queue, config } = requireAdapters(adapters);
+  const { supabase, db, queue, config, squareCatalog } = requireAdapters(adapters);
   const authorize = async (req, organizationId, allowedRoles) => {
     const { data, error } = await supabase.auth.getUser(parseBearer(req));
     const user = data?.user;
@@ -545,6 +545,63 @@ export function createHandlers(adapters) {
       currency: body.currency, evidenceFileId: body.evidenceRef, reason: body.reason.trim(),
       idempotencyKey: key, accessToken: actor.accessToken }));
   });
+  const squareCatalogItem = run(async req => {
+    if (req.method !== 'POST') throw new HttpError(405, 'METHOD_NOT_ALLOWED');
+    const body = await readJson(req), key = idempotency(req);
+    const allowed = ['organizationId','name','variationName','description','sku','priceMinor','unitCostMinor','currency','effectiveFrom','evidenceRef','reason','projectionStartAt','projectionEndAt'];
+    const required = ['organizationId','name','variationName','priceMinor','unitCostMinor','currency','effectiveFrom','evidenceRef','reason','projectionStartAt','projectionEndAt'];
+    if (!exactObject(body, allowed, required) || !UUID.test(body.organizationId ?? '')
+        || !text(body.name, 200) || !text(body.variationName, 200)
+        || (body.description !== undefined && (typeof body.description !== 'string' || body.description.length > 4096))
+        || (body.sku !== undefined && (typeof body.sku !== 'string' || body.sku.length > 100))
+        || !Number.isSafeInteger(body.priceMinor) || body.priceMinor <= 0 || body.priceMinor >= 1_000_000_000_000
+        || !Number.isSafeInteger(body.unitCostMinor) || body.unitCostMinor < 0 || body.unitCostMinor >= 1_000_000_000_000
+        || !/^[A-Z]{3}$/.test(body.currency) || !validDate(body.effectiveFrom)
+        || !validDate(body.projectionStartAt) || !validDate(body.projectionEndAt)
+        || Date.parse(body.projectionStartAt) >= Date.parse(body.projectionEndAt)
+        || Date.parse(body.projectionEndAt) - Date.parse(body.projectionStartAt) > MAX_SYNC_WINDOW_MS
+        || !UUID.test(body.evidenceRef ?? '') || !text(body.reason, 1000) || body.reason.trim().length < 10) {
+      throw new HttpError(400, 'INVALID_SQUARE_CATALOG_ITEM');
+    }
+    const actor = await authorize(req, body.organizationId, ['owner']);
+    await requireFeature(body.organizationId, actor.accessToken, 'inventoryTracking');
+    if (typeof db.hasEvidenceFile !== 'function' || typeof db.recordSquareCatalogItem !== 'function'
+        || typeof db.upsertSquareFacts !== 'function' || typeof db.registerSquareCatalogCreationTicket !== 'function'
+        || typeof squareCatalog?.createItem !== 'function') throw new HttpError(503, 'SQUARE_CATALOG_UNAVAILABLE');
+    if (!await db.hasEvidenceFile({ organizationId: body.organizationId, evidenceFileId: body.evidenceRef, accessToken: actor.accessToken })) {
+      throw new HttpError(400, 'INVALID_EVIDENCE_REF');
+    }
+
+    let squareItem;
+    try {
+      squareItem = await squareCatalog.createItem({ organizationId: body.organizationId, idempotencyKey: key,
+        name: body.name.trim(), variationName: body.variationName.trim(), description: body.description?.trim() || '',
+        sku: body.sku?.trim() || '', priceMinor: body.priceMinor, currency: body.currency });
+    } catch (error) {
+      const code = error?.code;
+      const expected = {
+        SQUARE_ENVIRONMENT_UNCONFIGURED: [503, 'SQUARE_CATALOG_UNAVAILABLE'],
+        SQUARE_CATALOG_UNAVAILABLE: [503, 'SQUARE_CATALOG_UNAVAILABLE'],
+        SQUARE_NOT_CONNECTED: [409, 'SQUARE_NOT_CONNECTED'],
+        SQUARE_RECONNECT_REQUIRED: [409, 'SQUARE_RECONNECT_REQUIRED'],
+        SQUARE_CATALOG_WRITE_PERMISSION_REQUIRED: [403, 'SQUARE_CATALOG_WRITE_PERMISSION_REQUIRED'],
+        SQUARE_CATALOG_WRITE_FAILED: [502, 'SQUARE_CATALOG_WRITE_FAILED'],
+        SQUARE_CATALOG_RESPONSE_INVALID: [502, 'SQUARE_CATALOG_WRITE_FAILED'],
+      }[code];
+      if (expected) throw new HttpError(expected[0], expected[1]);
+      throw error;
+    }
+
+    const definition = await db.recordSquareCatalogItem({ organizationId: body.organizationId,
+      idempotencyKey: key, squareCatalogObjectId: squareItem.squareCatalogObjectId,
+      name: body.name.trim(), sku: body.sku?.trim() || null, unitCostMinor: body.unitCostMinor,
+      currency: body.currency, effectiveFrom: body.effectiveFrom, evidenceFileId: body.evidenceRef,
+      reason: body.reason.trim(), squarePriceMinor: body.priceMinor, accessToken: actor.accessToken });
+    const replay = await queue.enqueueProjectionReplay({ organizationId: body.organizationId,
+      startAt: body.projectionStartAt, endAt: body.projectionEndAt,
+      idempotencyKey: `square-catalog-item:${createHash('sha256').update(`${body.organizationId}:${key}`).digest('hex')}`, requestedBy: actor.userId });
+    return created({ ...definition, projectionJobId: replay.id, projectionQueued: true });
+  });
   const analytics = run(async req => {
     if (req.method !== 'GET') throw new HttpError(405, 'METHOD_NOT_ALLOWED');
     const u = new URL(req.url), organizationId = u.searchParams.get('organizationId');
@@ -681,5 +738,5 @@ export function createHandlers(adapters) {
     return ok(result);
   });
 
-  return Object.freeze({ dashboard, issues, issueEvidence, audit, settings, inventory, inventoryPurchase, receiptDraft, receiptItemCosts, inventoryCorrection, inventoryOpening, inventoryItem, analytics, evidence, evidenceUrl, manualMovement, manualMovements, observation, observations, proposal, itemCost, saleLineCost, refundReview, decision, replay, sync, webhook });
+  return Object.freeze({ dashboard, issues, issueEvidence, audit, settings, inventory, inventoryPurchase, receiptDraft, receiptItemCosts, inventoryCorrection, inventoryOpening, inventoryItem, squareCatalogItem, analytics, evidence, evidenceUrl, manualMovement, manualMovements, observation, observations, proposal, itemCost, saleLineCost, refundReview, decision, replay, sync, webhook });
 }

@@ -14,7 +14,7 @@ Use this checklist before connecting a merchant, before production launch, and a
 
 ## Square and webhook boundary
 
-- [ ] OAuth requests only needed read scopes; API version is pinned; refresh/access tokens are encrypted and access logged.
+- [ ] OAuth requests only the needed scopes; `ITEMS_WRITE` is limited to owner-authorized Square catalog creation, with no other Square write scopes. API version is pinned; refresh/access tokens are encrypted and access logged.
 - [ ] Webhook verification covers the exact raw body and configured notification URL before any persistence or queue action. Invalid signatures never mutate source facts.
 - [ ] Notification IDs and object versions are idempotent; authoritative object fetch handles partial, duplicated, delayed, and out-of-order events.
 - [ ] Backfill pagination, overlap, cursors, rate limits, revoked access, gaps, and retry bounds are tested in Square sandbox.
@@ -29,6 +29,7 @@ Use this checklist before connecting a merchant, before production launch, and a
 - [ ] Inventory cost, tax, tips, discounts, gift cards, refunds, chargebacks, transfers, and COGS cash treatment have signed-off examples before they affect reporting.
 - [ ] Agent output is schema-validated, uses allowlisted source IDs/categories, has per-org rate/cost caps, and can only create a draft. No model output chooses arithmetic or writes canonical ledger facts.
 - [ ] Receipt extraction sends only bounded pasted text after common identifier redaction; a person selects the exact catalog identity and approves an evidence-linked, idempotent COGS write through the owner/reviewer RPC.
+- [ ] Sellable item creation is owner-only, uses the caller JWT for authorization, writes to Square with an idempotency key, preserves normalized catalog facts, and records an evidence-linked unit cost against the returned variation ID.
 - [ ] Projection replay from source facts and policy version is deterministic. Golden fixtures include duplicate/reordered events, partial refunds, missing costs, and payout fees.
 
 ## Evidence, privacy, and application security

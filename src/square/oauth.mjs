@@ -34,7 +34,7 @@ async function boundedText(request, limit) {
  * Square tokens at rest; no plaintext token storage implementation is provided.
  * @param {{
  *   authenticateOwner?: (request: Request, organizationId: string) => Promise<{userId: string, organizationId: string, role: string} | null>,
- *   stateStore?: {save: (value: {state: string, organizationId: string, userId: string, redirectUri: string, expiresAt: string}) => Promise<unknown>, consume: (value: {state: string}) => Promise<any>},
+ *   stateStore?: {save: (value: {state: string, organizationId: string, userId: string, redirectUri: string, expiresAt: string, scopes: string[]}) => Promise<unknown>, consume: (value: {state: string}) => Promise<any>},
  *   tokenVault?: {storeEncrypted: (value: {organizationId: string, connectedBy: string, merchantId: string, accessToken: string, refreshToken: string, expiresAt: string, scopes: string[], tokenType: string}) => Promise<unknown>},
  *   config?: {squareClientId: string, squareClientSecret: string, squareRedirectUri: string, squareBaseUrl?: string, squareReadScopes?: string[], oauthStateTtlMs?: number},
  *   fetchImpl?: typeof fetch,
@@ -46,8 +46,9 @@ export function createSquareOAuthHandlers({ authenticateOwner, stateStore, token
   if (typeof stateStore?.save !== 'function' || typeof stateStore?.consume !== 'function') throw new TypeError('durable single-use stateStore.save/consume are required');
   if (typeof tokenVault?.storeEncrypted !== 'function') throw new TypeError('encrypted tokenVault.storeEncrypted is required');
   for (const key of ['squareClientId', 'squareClientSecret', 'squareRedirectUri']) if (!config?.[key]) throw new TypeError(`${key} is required`);
-  const scopes = config.squareReadScopes ?? READ_SCOPES;
-  if (!Array.isArray(scopes) || scopes.length === 0 || scopes.some(scope => !READ_SCOPES.includes(scope)) || new Set(scopes).size !== scopes.length) throw new TypeError('squareReadScopes must contain only unique read-only Square scopes');
+  const readScopes = config.squareReadScopes ?? READ_SCOPES;
+  if (!Array.isArray(readScopes) || readScopes.length === 0 || readScopes.some(scope => !READ_SCOPES.includes(scope)) || new Set(readScopes).size !== readScopes.length) throw new TypeError('squareReadScopes must contain only unique read-only Square scopes');
+  const catalogWriteScopes = Object.freeze([...readScopes, 'ITEMS_WRITE']);
   const baseUrl = config.squareBaseUrl ?? 'https://connect.squareup.com';
   const stateTtlMs = Number.isInteger(config.oauthStateTtlMs) ? Math.max(60_000, Math.min(config.oauthStateTtlMs, 15 * 60_000)) : 10 * 60_000;
 
@@ -79,12 +80,16 @@ export function createSquareOAuthHandlers({ authenticateOwner, stateStore, token
     const raw = await boundedText(request, 4_000);
     let body;
     try { body = JSON.parse(raw); } catch { throw new OAuthHandlerError(400, 'INVALID_JSON'); }
-    if (!body || typeof body !== 'object' || Array.isArray(body) || Object.keys(body).length !== 1 || !UUID.test(body.organizationId ?? '')) throw new OAuthHandlerError(400, 'INVALID_INPUT');
+    if (!body || typeof body !== 'object' || Array.isArray(body)
+        || Object.keys(body).some(key => !['organizationId', 'catalogWrite'].includes(key))
+        || !Object.hasOwn(body, 'organizationId') || !UUID.test(body.organizationId ?? '')
+        || (body.catalogWrite !== undefined && typeof body.catalogWrite !== 'boolean')) throw new OAuthHandlerError(400, 'INVALID_INPUT');
     const actor = await authenticateOwner(request, body.organizationId);
     if (!actor?.userId || actor.organizationId !== body.organizationId || actor.role !== 'owner') throw new OAuthHandlerError(403, 'FORBIDDEN');
+    const scopes = body.catalogWrite === true ? catalogWriteScopes : readScopes;
     const state = randomBytes(32).toString('base64url');
     const expiresAt = new Date(now().getTime() + stateTtlMs).toISOString();
-    await stateStore.save({ state, organizationId: body.organizationId, userId: actor.userId, redirectUri: config.squareRedirectUri, expiresAt });
+    await stateStore.save({ state, organizationId: body.organizationId, userId: actor.userId, redirectUri: config.squareRedirectUri, expiresAt, scopes });
     const authorizationUrl = createAuthorizationUrl({ clientId: config.squareClientId, redirectUri: config.squareRedirectUri, state, scopes, baseUrl });
     return json(200, { authorizationUrl });
   });
@@ -101,11 +106,12 @@ export function createSquareOAuthHandlers({ authenticateOwner, stateStore, token
     if (providerError || !code || code.length > 4_000) throw new OAuthHandlerError(400, providerError === 'access_denied' ? 'OAUTH_DENIED' : 'INVALID_OAUTH_CALLBACK');
     const tokenResponse = await exchangeAuthorizationCode({ code, clientId: config.squareClientId, clientSecret: config.squareClientSecret, redirectUri: config.squareRedirectUri, fetchImpl, baseUrl });
     if (!tokenResponse.access_token || !tokenResponse.refresh_token || !tokenResponse.merchant_id || !tokenResponse.expires_at) throw new OAuthHandlerError(502, 'INVALID_TOKEN_RESPONSE');
-    // ObtainToken doesn't include scopes in the normal code-flow response. We
-    // requested only this read-only set in the authorization URL; use returned
-    // scopes when present (for providers/API versions that include them).
-    const returnedScopes = tokenResponse.scopes ?? scopes;
-    if (returnedScopes.some(scope => !scopes.includes(scope))) throw new OAuthHandlerError(502, 'UNEXPECTED_OAUTH_SCOPE');
+    // ObtainToken doesn't include scopes in the normal code-flow response.
+    // Persist the exact scopes requested for this single-use OAuth state.
+    const requestedScopes = Array.isArray(pending.scopes) ? pending.scopes : readScopes;
+    const returnedScopes = tokenResponse.scopes ?? requestedScopes;
+    if (returnedScopes.some(scope => !requestedScopes.includes(scope))) throw new OAuthHandlerError(502, 'UNEXPECTED_OAUTH_SCOPE');
+    if (requestedScopes.some(scope => !returnedScopes.includes(scope))) throw new OAuthHandlerError(502, 'OAUTH_SCOPE_NOT_GRANTED');
     await tokenVault.storeEncrypted({
       organizationId: pending.organizationId,
       connectedBy: pending.userId,
@@ -119,5 +125,5 @@ export function createSquareOAuthHandlers({ authenticateOwner, stateStore, token
     return json(200, { connected: true, organizationId: pending.organizationId, merchantId: tokenResponse.merchant_id, scopes: returnedScopes, expiresAt: tokenResponse.expires_at });
   });
 
-  return Object.freeze({ start, callback, readScopes: scopes });
+  return Object.freeze({ start, callback, readScopes, catalogWriteScopes });
 }

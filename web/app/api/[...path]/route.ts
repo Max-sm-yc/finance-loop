@@ -2,6 +2,7 @@ import { createHandlers } from '../../../../src/server/index.mjs';
 import { createSupabaseAdapters } from '../../../../src/adapters/supabase.mjs';
 import { replayAccounting } from '../../../../src/engine/index.mjs';
 import { createSquareOAuthHandlers } from '../../../../src/square/oauth.mjs';
+import { createSquareCatalogItem as upsertSquareCatalogItem } from '../../../../src/square/catalog.mjs';
 import { refreshAccessToken, SquareApiClient } from '../../../../src/square/client.mjs';
 
 export const runtime = 'nodejs';
@@ -78,6 +79,85 @@ async function listActiveSquareLocations(organizationId: string, adapters: Retur
   throw codedError('SQUARE_LOCATIONS_UNAVAILABLE');
 }
 
+async function createSquareCatalogItemForOrganization(args: {
+  organizationId: string; idempotencyKey: string; name: string; variationName: string;
+  description: string; sku: string; priceMinor: number; currency: string;
+}, adapters: ReturnType<typeof createSupabaseAdapters>) {
+  const squareEnvironment = process.env.SQUARE_ENVIRONMENT;
+  if (squareEnvironment !== 'sandbox' && squareEnvironment !== 'production') throw codedError('SQUARE_ENVIRONMENT_UNCONFIGURED');
+  const squareBaseUrl = squareEnvironment === 'sandbox' ? 'https://connect.squareupsandbox.com' : 'https://connect.squareup.com';
+  let connection;
+  try { connection = await adapters.tokenVault.getDecrypted({ organizationId: args.organizationId }); }
+  catch { throw codedError('SQUARE_CATALOG_UNAVAILABLE'); }
+  if (!connection?.accessToken) throw codedError('SQUARE_NOT_CONNECTED');
+  if (!Array.isArray(connection.scopes) || !connection.scopes.includes('ITEMS_WRITE')) {
+    throw codedError('SQUARE_CATALOG_WRITE_PERMISSION_REQUIRED');
+  }
+
+  const expiresAt = Date.parse(connection.expiresAt ?? '');
+  if (Number.isFinite(expiresAt) && expiresAt <= Date.now() + 5 * 60_000) {
+    const clientId = process.env.SQUARE_CLIENT_ID;
+    const clientSecret = process.env.SQUARE_CLIENT_SECRET;
+    if (!connection.refreshToken || !clientId || !clientSecret) throw codedError('SQUARE_RECONNECT_REQUIRED');
+    let refreshed: SquareTokenRefresh;
+    try {
+      refreshed = await refreshAccessToken({ refreshToken: connection.refreshToken, clientId, clientSecret, baseUrl: squareBaseUrl }) as SquareTokenRefresh;
+    } catch (error) {
+      const status = typeof error === 'object' && error !== null && 'status' in error ? Number(error.status) : undefined;
+      if (status === 400 || status === 401) throw codedError('SQUARE_RECONNECT_REQUIRED');
+      throw codedError('SQUARE_CATALOG_UNAVAILABLE');
+    }
+    if (!refreshed.access_token || !refreshed.refresh_token || !refreshed.expires_at) throw codedError('SQUARE_RECONNECT_REQUIRED');
+    await adapters.tokenVault.storeEncrypted({
+      organizationId: args.organizationId, connectedBy: connection.connectedBy,
+      merchantId: refreshed.merchant_id ?? connection.merchantId,
+      accessToken: refreshed.access_token, refreshToken: refreshed.refresh_token,
+      expiresAt: refreshed.expires_at, scopes: refreshed.scopes ?? connection.scopes,
+      tokenType: refreshed.token_type ?? connection.tokenType,
+    });
+    connection = { ...connection, accessToken: refreshed.access_token, expiresAt: refreshed.expires_at };
+  }
+
+  const client = new SquareApiClient({
+    accessToken: connection.accessToken, baseUrl: squareBaseUrl,
+    apiVersion: process.env.SQUARE_API_VERSION ?? '2026-09-16',
+  });
+  let squareItem;
+  try {
+    squareItem = await upsertSquareCatalogItem({ client, organizationId: args.organizationId,
+      idempotencyKey: args.idempotencyKey, name: args.name, variationName: args.variationName,
+      description: args.description, sku: args.sku, priceMinor: args.priceMinor, currency: args.currency });
+  } catch (error) {
+    const status = typeof error === 'object' && error !== null && 'status' in error ? Number(error.status) : undefined;
+    const providerCodes = Array.isArray((error as { errors?: Array<{ code?: unknown }> } | null)?.errors)
+      ? (error as { errors: Array<{ code?: unknown }> }).errors.map(item => item?.code)
+        .filter((code): code is string => typeof code === 'string' && /^[A-Z0-9_]{1,80}$/.test(code)).slice(0, 8)
+      : [];
+    console.error('Square catalog item write failed', {
+      status,
+      code: typeof (error as { code?: unknown } | null)?.code === 'string' && /^[A-Za-z0-9_-]{1,80}$/.test(String((error as { code: string }).code))
+        ? (error as { code: string }).code : undefined,
+      squareRequestId: typeof (error as { squareRequestId?: unknown } | null)?.squareRequestId === 'string'
+        && /^[A-Za-z0-9-]{1,120}$/.test(String((error as { squareRequestId: string }).squareRequestId))
+        ? (error as { squareRequestId: string }).squareRequestId : undefined,
+      providerCodes,
+    });
+    if (status === 401) throw codedError('SQUARE_RECONNECT_REQUIRED');
+    if (status === 403) throw codedError('SQUARE_CATALOG_WRITE_PERMISSION_REQUIRED');
+    throw codedError('SQUARE_CATALOG_WRITE_FAILED');
+  }
+
+  await adapters.db.upsertSquareFacts({ organizationId: args.organizationId, facts: squareItem.facts,
+    cause: `catalog-create:${args.idempotencyKey}` });
+  await adapters.db.registerSquareCatalogCreationTicket({
+    organizationId: args.organizationId, idempotencyKey: args.idempotencyKey,
+    squareItemId: squareItem.squareItemId, squareCatalogObjectId: squareItem.squareCatalogObjectId,
+    name: args.name, variationName: args.variationName, sku: args.sku || null,
+    currency: args.currency, priceMinor: args.priceMinor,
+  });
+  return squareItem;
+}
+
 function handlers() {
   const squareEnvironment = process.env.SQUARE_ENVIRONMENT;
   const adapters = createSupabaseAdapters({
@@ -90,6 +170,7 @@ function handlers() {
   });
   const route = createHandlers({
     ...adapters,
+    squareCatalog: { createItem: (args: Parameters<typeof createSquareCatalogItemForOrganization>[0]) => createSquareCatalogItemForOrganization(args, adapters) },
     listSquareLocations: ({ organizationId }: { organizationId: string }) => listActiveSquareLocations(organizationId, adapters),
     engine: { replayAccounting },
     config: {
@@ -159,6 +240,7 @@ async function dispatch(request: Request) {
   if (resource === 'inventory' && id === 'corrections' && method === 'POST') return route.inventoryCorrection(request);
   if (resource === 'inventory' && id === 'openings' && method === 'POST') return route.inventoryOpening(request);
   if (resource === 'inventory' && id === 'items' && method === 'POST') return route.inventoryItem(request);
+  if (resource === 'inventory' && id === 'catalog-items' && method === 'POST') return route.squareCatalogItem(request);
   if (resource === 'analytics' && method === 'GET') return route.analytics(request);
   if (resource === 'evidence' && !id && method === 'POST') return route.evidence(request);
   if (resource === 'evidence' && !id && method === 'GET') return route.evidenceUrl(request);

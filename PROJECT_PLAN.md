@@ -17,7 +17,7 @@ For an MVP, choose **cash-basis operational reporting** (completed payments, ref
 
 | Role | Can do | Cannot do |
 |---|---|---|
-| Owner/admin | Connect Square, set account and period, manage users, approve corrections, close periods | Edit immutable source payloads |
+| Owner/admin | Connect Square, create sellable Square catalog items, set account and period, manage users, approve corrections, close periods | Edit immutable source payloads |
 | Operator | Enter cash events and balance observations; answer review questions; propose item definitions | Approve own high-risk corrections or change closed periods |
 | Reviewer | Approve or reject proposed classifications and inferred transactions; reopen with reason | Alter Square facts |
 | Read-only | Inspect dashboard, evidence, exports, audit trail | Mutate data |
@@ -25,7 +25,7 @@ For an MVP, choose **cash-basis operational reporting** (completed payments, ref
 ### Human interactions in the diagram
 
 1. Enter cash deposits, purchases, pay, miscellaneous spend, transfers out, and observed balances with date, account, amount, currency, memo and evidence.
-2. Answer unknown-item and unclassified-transaction questions. A proposed item records SKU/catalog ID, units, cost basis, effective date, and provenance. Approval precedes canonical use.
+2. Answer unknown-item and unclassified-transaction questions. A proposed item records SKU/catalog ID, units, cost basis, effective date, and provenance. Approval precedes canonical use. An owner can also create a sellable Square catalog item by entering its name, variation, sale price, and optional SKU; a supplier-backed unit cost and evidence are saved in Finance Loop at the same time. Opening stock is recorded separately.
 3. Inspect discrepancy investigations, compare source records, accept or reject a proposed missing transaction, and rerun reconciliation.
 4. See failure states and manually resolve them with a reason and audit record.
 
@@ -64,7 +64,7 @@ The UI in this repository is deliberately dependency-free to make the workflow r
 
 ## 4. Square ingestion contract
 
-Use OAuth with minimum read scopes required for Orders, Payments, Refunds, Catalog, Locations, and Payouts. Store tokens encrypted server-side. Do not ask for write scopes during MVP. Pin a Square API version and test sandbox and production behavior before launch.
+Use OAuth with the minimum scopes required for Orders, Payments, Refunds, Catalog, Locations, and Payouts. Square catalog creation additionally requires `ITEMS_WRITE`; do not request other write scopes. Only an authenticated owner can create an item. Store tokens encrypted server-side. Pin a Square API version and test sandbox and production behavior before launch.
 
 1. Subscribe to relevant webhooks. Verify the **raw body** with Square's signature and configured notification URL before processing. Persist notification ID, event type, merchant/location, received time, payload and signature result. Acknowledge quickly; enqueue work.
 2. Upsert by Square object ID and version/update timestamp. Deduplicate notification IDs; tolerate reordered delivery. Fetch the authoritative object after a webhook, rather than trusting a partial event payload.
@@ -182,7 +182,7 @@ readiness requirements. See [the inventory and analytics rollout
 contract](docs/STAGED_INVENTORY_ANALYTICS.md).
 
 1. **Overview:** income, cash, sync freshness, unresolved issues, period and account selector; each metric links to its calculation.
-2. **Income & inventory:** Square sales by item, unit cost status, fees, margin, item definition review.
+2. **Income & inventory:** Square sales by item, unit cost status, fees, margin, item definition review, and owner-only creation of a Square sellable item with an evidence-linked Finance Loop cost.
 3. **Cash flow:** dated inflow/outflow register, cash category breakdown, expected vs observed balance, manual entry form.
 4. **Review queue:** unknown items, unclassified transactions, suspected missing cash entries; source evidence and approve/reject/request clarification.
 5. **Ledger / audit:** read-only event timeline, versions, actor and decision trail, export.
@@ -199,6 +199,7 @@ The prototype implements the first five as local demo workflows. Each demo contr
 | `GET /api/dashboard` | Account, date range | Projection version, source freshness, incomplete flags |
 | `POST /api/manual-movements` | Type, amount, account, date, memo, evidence, idempotency key | Validate and audit; two-person approval for threshold categories |
 | `POST /api/observations` | Account, timestamp, amount, evidence | Validate cutoff and create reconciliation run |
+| `POST /api/inventory/catalog-items` | Item, variation, sale price, optional SKU, supported unit cost, effective date, supplier evidence, idempotency key | Owner-only; upsert Square Catalog, persist the returned variation fact, record audited COGS, and queue a projection replay |
 | `POST /api/issues/:id/proposals` | Agent structured output | Validate against source IDs and policy; draft only |
 | `POST /api/proposals/:id/decision` | approve/reject, reason | Reviewer authorization, optimistic version check, audit, recompute |
 | `POST /api/runs/:id/replay` | Existing run ID, new policy version | Deterministic rebuild; compare diffs |

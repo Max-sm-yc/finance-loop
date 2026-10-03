@@ -7,7 +7,7 @@ const org = '11111111-1111-4111-8111-111111111111';
 const account = '22222222-2222-4222-8222-222222222222';
 const user = '33333333-3333-4333-8333-333333333333';
 
-function setup({ role = 'operator', proposalFixture = false, proposalType = 'unknown_item', proposalPolicyVersion = 'policy-v1', fetchImpl, budgetAllowed = true, inventoryFlag = false, analyticsFlag = false, inventoryServerFlag = false, analyticsServerFlag = false, squareLocations = [{ id: 'square-location-1' }] } = {}) {
+function setup({ role = 'operator', proposalFixture = false, proposalType = 'unknown_item', proposalPolicyVersion = 'policy-v1', fetchImpl, budgetAllowed = true, inventoryFlag = false, analyticsFlag = false, inventoryServerFlag = false, analyticsServerFlag = false, squareLocations = [{ id: 'square-location-1' }], squareCatalog } = {}) {
   const calls = [];
   const inboxIds = new Set();
   const db = {
@@ -24,6 +24,10 @@ function setup({ role = 'operator', proposalFixture = false, proposalType = 'unk
     async listProductAnalyticsFacts(arg) { calls.push(['analytics-facts', arg]); return { facts: [], sourceHealth: [], policy: {} }; },
     async recordInventoryPurchase(arg) { calls.push(['inventory-purchase', arg]); return { cashMovementId: 'cash-1', inventoryMovementIds: ['stock-1'] }; },
     async recordInventoryCorrection(arg) { calls.push(['inventory-correction', arg]); return { movementId: 'stock-2' }; },
+    async hasEvidenceFile(arg) { calls.push(['evidence-exists', arg]); return arg.evidenceFileId === '44444444-4444-4444-8444-444444444444'; },
+    async recordSquareCatalogItem(arg) { calls.push(['square-catalog-cost', arg]); return { id: 'item-definition-1', version: 1, squareCatalogObjectId: arg.squareCatalogObjectId }; },
+    async upsertSquareFacts(arg) { calls.push(['square-facts', arg]); return { changed: true, revision: 1 }; },
+    async registerSquareCatalogCreationTicket(arg) { calls.push(['square-ticket', arg]); return true; },
     async getIssue() { return proposalFixture ? { id: '44444444-4444-4444-8444-444444444444', type: proposalType, code: proposalType === 'refund_cogs_review' ? 'REFUND_COGS_REVIEW' : 'UNKNOWN_ITEM', source_refs: proposalType === 'refund_cogs_review' ? ['refund-1','order-1'] : ['order-1:line-1'], details: { message: 'Human decision needed.', period_start: '2026-07-03T04:00:00Z', period_end: '2026-10-02T04:00:00Z' }, policyVersion: proposalPolicyVersion, allowedCategories: proposalType === 'unknown_item' ? ['inventory_item'] : [] } : null; },
     async getIssueEvidence() { return proposalFixture ? [{ id: 'source-1', type: 'sale_line', catalog_object_id: null, quantity: 1.5 }] : []; },
     async recordItemDefinition(arg) { calls.push(['item-definition', arg]); return { id: 'item-definition-1', version: 1 }; },
@@ -37,7 +41,7 @@ function setup({ role = 'operator', proposalFixture = false, proposalType = 'unk
   const queue = { async enqueueSquareSync(arg) { calls.push(['sync', arg]); return { id: 'job-1' }; }, async enqueueSquareWebhook(arg) { calls.push(['webhook-job', arg]); }, async enqueueProjectionReplay(arg) { calls.push(['projection-replay', arg]); return { id: 'replay-1' }; } };
   const webhookInbox = { async putIfAbsent(id, record) { calls.push(['inbox', id]); const inserted = !inboxIds.has(id); inboxIds.add(id); return { inserted, record }; } };
   const supabase = { auth: { async getUser(token) { calls.push(['auth', token]); return { data: { user: { id: user } }, error: null }; } } };
-  return { handlers: createHandlers({ supabase, db, queue, webhookInbox, fetchImpl, engine: { replayAccounting: () => ({}) }, listSquareLocations: async args => { calls.push(['square-locations', args]); return squareLocations; }, config: { squareWebhookSignatureKey: 'key', squareNotificationUrl: 'https://example.test/webhook', openRouterApiKey: 'test-key', inventoryTrackingEnabled: inventoryServerFlag, productAnalyticsEnabled: analyticsServerFlag } }), calls };
+  return { handlers: createHandlers({ supabase, db, queue, webhookInbox, fetchImpl, squareCatalog, engine: { replayAccounting: () => ({}) }, listSquareLocations: async args => { calls.push(['square-locations', args]); return squareLocations; }, config: { squareWebhookSignatureKey: 'key', squareNotificationUrl: 'https://example.test/webhook', openRouterApiKey: 'test-key', inventoryTrackingEnabled: inventoryServerFlag, productAnalyticsEnabled: analyticsServerFlag } }), calls };
 }
 const auth = { authorization: 'Bearer valid.jwt.token' };
 const post = (path, body, headers = {}) => new Request(`https://app.test${path}`, { method: 'POST', headers: { ...auth, 'content-type': 'application/json', ...headers }, body: JSON.stringify(body) });
@@ -87,6 +91,38 @@ test('inventory correction and analytics routes enforce feature flags, bounds, a
   assert.equal(report.status, 200); assert.equal((await read(report)).analytics.status, 'incomplete');
   const tooLong = await reviewer.handlers.analytics(new Request(`https://app.test/api/analytics?organizationId=${org}&from=2025-01-01T00:00:00Z&to=2026-02-01T00:00:00Z&currency=USD`, { headers: auth }));
   assert.equal(tooLong.status, 400);
+});
+
+test('Square item creation is owner-only and records Square identity, evidenced COGS, and a replay', async () => {
+  const evidenceRef = '44444444-4444-4444-8444-444444444444';
+  const body = {
+    organizationId: org, name: 'Canvas Tote', variationName: 'Regular', description: '', sku: 'TOTE-01',
+    priceMinor: 1299, unitCostMinor: 525, currency: 'USD', effectiveFrom: '2026-10-01T04:00:00Z',
+    evidenceRef, reason: 'Supplier invoice shows unit acquisition cost.',
+    projectionStartAt: '2026-09-01T00:00:00Z', projectionEndAt: '2026-10-02T00:00:00Z',
+  };
+  const squareCalls = [];
+  const squareCatalog = { async createItem(args) {
+    squareCalls.push(['square-create', args]);
+    return { squareItemId: 'square-item-1', squareCatalogObjectId: 'square-variation-1', facts: [] };
+  } };
+  const reviewer = setup({ role: 'reviewer', inventoryFlag: true, inventoryServerFlag: true, squareCatalog });
+  assert.equal((await reviewer.handlers.squareCatalogItem(post('/api/inventory/catalog-items', body, { 'idempotency-key': 'square-item:denied' }))).status, 403);
+  assert.equal(squareCalls.length, 0);
+
+  const owner = setup({ role: 'owner', inventoryFlag: true, inventoryServerFlag: true, squareCatalog });
+  const response = await owner.handlers.squareCatalogItem(post('/api/inventory/catalog-items', body, { 'idempotency-key': 'square-item:create-1' }));
+  assert.equal(response.status, 201);
+  assert.equal((await read(response)).projectionQueued, true);
+  const createdItem = squareCalls[0][1];
+  assert.equal(createdItem.priceMinor, 1299);
+  assert.equal(createdItem.currency, 'USD');
+  assert.equal(createdItem.accessToken, undefined);
+  const savedCost = owner.calls.find(call => call[0] === 'square-catalog-cost')[1];
+  assert.equal(savedCost.squareCatalogObjectId, 'square-variation-1');
+  assert.equal(savedCost.unitCostMinor, 525);
+  assert.equal(savedCost.accessToken, 'valid.jwt.token');
+  assert.equal(owner.calls.find(call => call[0] === 'projection-replay')[1].startAt, body.projectionStartAt);
 });
 
 test('manual movement validates strict shape/idempotency and calls authenticated transactional RPC', async () => {

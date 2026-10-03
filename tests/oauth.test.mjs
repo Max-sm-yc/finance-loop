@@ -5,8 +5,9 @@ import { createSquareOAuthHandlers } from '../src/square/index.mjs';
 const organizationId = '11111111-1111-4111-8111-111111111111';
 const config = { squareClientId: 'square-client', squareClientSecret: 'server-secret', squareRedirectUri: 'https://app.test/api/square/oauth/callback', squareBaseUrl: 'https://connect.squareup.com' };
 const scopes = ['ORDERS_READ', 'PAYMENTS_READ', 'ITEMS_READ', 'PAYOUTS_READ', 'MERCHANT_PROFILE_READ', 'GIFTCARDS_READ'];
+const catalogWriteScopes = [...scopes, 'ITEMS_WRITE'];
 
-function setup({ role = 'owner', expired = false } = {}) {
+function setup({ role = 'owner', expired = false, tokenScopes = scopes } = {}) {
   const pending = new Map(); const persisted = []; const calls = [];
   let currentTime = new Date('2026-09-30T12:00:00Z');
   const stateStore = {
@@ -16,14 +17,14 @@ function setup({ role = 'owner', expired = false } = {}) {
   const tokenVault = { async storeEncrypted(record) { persisted.push(record); } };
   const fetchImpl = async (_url, init) => {
     calls.push(['token-request', JSON.parse(init.body)]);
-    return new Response(JSON.stringify({ access_token: 'access-secret', refresh_token: 'refresh-secret', expires_at: '2026-10-01T12:00:00Z', merchant_id: 'merchant-1', scopes }), { status: 200 });
+    return new Response(JSON.stringify({ access_token: 'access-secret', refresh_token: 'refresh-secret', expires_at: '2026-10-01T12:00:00Z', merchant_id: 'merchant-1', scopes: tokenScopes }), { status: 200 });
   };
   const handlers = createSquareOAuthHandlers({ authenticateOwner: async (_req, org) => ({ organizationId: org, userId: 'user-1', role }), stateStore, tokenVault, config, fetchImpl, now: () => currentTime });
-  const startRequest = () => new Request('https://app.test/api/square/oauth/start', { method: 'POST', headers: { authorization: 'Bearer valid', 'content-type': 'application/json' }, body: JSON.stringify({ organizationId }) });
+  const startRequest = (body = { organizationId }) => new Request('https://app.test/api/square/oauth/start', { method: 'POST', headers: { authorization: 'Bearer valid', 'content-type': 'application/json' }, body: JSON.stringify(body) });
   return { handlers, pending, persisted, calls, startRequest, setNow: d => { currentTime = new Date(d); } };
 }
 
-test('OAuth start is owner-only, uses read scopes and durable unpredictable state', async () => {
+test('OAuth start is owner-only, requests required read and catalog-write scopes, and uses durable unpredictable state', async () => {
   const denied = setup({ role: 'operator' });
   assert.equal((await denied.handlers.start(denied.startRequest())).status, 403);
   const stateful = setup();
@@ -64,4 +65,19 @@ test('OAuth callback rejects expired state and constructor refuses write scopes'
   assert.equal(response.status, 400);
   assert.equal(expired.persisted.length, 0);
   assert.throws(() => createSquareOAuthHandlers({ authenticateOwner: async () => ({}), stateStore: { save() {}, consume() {} }, tokenVault: { storeEncrypted() {} }, config: { ...config, squareReadScopes: ['PAYMENTS_WRITE'] } }), /read-only Square scopes/);
+});
+
+test('catalog write permission is requested only for an owner-authorized catalog setup', async () => {
+  const stateful = setup({ tokenScopes: catalogWriteScopes });
+  const response = await stateful.handlers.start(stateful.startRequest({ organizationId, catalogWrite: true }));
+  assert.equal(response.status, 200);
+  const { authorizationUrl } = await response.json();
+  assert.equal(new URL(authorizationUrl).searchParams.get('scope'), catalogWriteScopes.join(' '));
+  const state = new URL(authorizationUrl).searchParams.get('state');
+  const callback = await stateful.handlers.callback(new Request(`https://app.test/api/square/oauth/callback?code=authorization-code&state=${encodeURIComponent(state)}`));
+  assert.equal(callback.status, 200);
+  assert.deepEqual(stateful.persisted[0].scopes, catalogWriteScopes);
+  const readOnly = setup();
+  const readResponse = await readOnly.handlers.start(readOnly.startRequest());
+  assert.equal(new URL((await readResponse.json()).authorizationUrl).searchParams.get('scope'), scopes.join(' '));
 });
