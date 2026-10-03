@@ -117,6 +117,7 @@ The agent receives only necessary records with stable IDs and redacted sensitive
 `monitoring → diagnosing → [item_proposed | awaiting_clarification | resolved | failed] → monitoring`
 
 - Unknown Square catalog variation: locate exact catalog ID and candidate metadata. If approved cost is absent, hold COGS for affected sales. The agent may draft an item definition; the reviewer supplies cost and effective date.
+- Receipt cost helper: a user may paste bounded, unstructured receipt text for extraction into an editable draft. The model does not identify catalog items or write costs. A human maps a line to an exact Square catalog variation, confirms its unit acquisition cost and effective date, attaches receipt evidence, and approves the effective-dated COGS update. The update is audited and triggers a projection replay when it can affect current reports; purchase cash and stock are recorded separately.
 - Unnamed sale line with no catalog variation: offer the Square-supported unit price as a pass-through cost for that exact line, with the assumption recorded in the human approval reason. If source amounts do not support an exact per-unit value, leave the cost unresolved.
 - Ambiguous transaction: ask a targeted question showing the source record and why classification matters. After human response, recompute affected projections.
 - Invalid or missing source facts: fail with a reason code and retry policy. Do not fabricate an item or classify from a plausible name alone.
@@ -160,18 +161,22 @@ Key invariants:
 
 ## 8. Screens and workflow
 
-### Staged next update (October 2, 2026)
+### Inventory and analytics release (October 2, 2026)
 
-Inventory quantity tracking and product analytics are being prepared behind
-disabled server and organization feature gates. They must remain inactive while
-the current product is being debugged. Supply receipts link to one actual
-purchase cash outflow; evidence-backed opening stock and manual corrections
-append quantity records without changing cash. Product reports show revenue,
-approved COGS, and operational net, preserving missing-data exceptions and
-unallocated refunds/fees. These capabilities are deterministic and do not use
-agent loops. See [the staged update contract](docs/STAGED_INVENTORY_ANALYTICS.md)
-for boundaries and the future rollout gate. Quantity tracking does not establish
-formal inventory valuation or an accounting net-income statement.
+Inventory quantity tracking and product analytics are enabled in the release
+configuration. Server environment examples default both flags on, and migration
+`202610020006_enable_inventory_and_product_analytics.sql` enables current and
+future organizations. Deployments must also set both server-side Vercel
+variables to `true`. Supply receipts link to one actual purchase cash outflow;
+evidence-backed opening stock and manual corrections append quantity records
+without changing cash. Product reports show revenue, approved COGS, and
+operational net, preserving missing-data exceptions and unallocated refunds and
+fees. The receipt text helper drafts extraction only; a human maps catalog
+identity and approves any effective-dated COGS update. Product analytics remains
+deterministic. Quantity tracking does not establish formal inventory valuation
+or an accounting net-income statement; pilot reconciliation and merchant and
+accounting-adviser sign-off remain separate readiness requirements. See [the
+inventory and analytics rollout contract](docs/STAGED_INVENTORY_ANALYTICS.md).
 
 1. **Overview:** income, cash, sync freshness, unresolved issues, period and account selector; each metric links to its calculation.
 2. **Income & inventory:** Square sales by item, unit cost status, fees, margin, item definition review.

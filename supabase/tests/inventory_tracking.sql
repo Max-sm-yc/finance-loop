@@ -11,25 +11,26 @@ select has_function('public','record_inventory_opening',array['uuid','uuid','num
 select has_function('public','record_inventory_item',array['uuid','text','text','text','uuid','text','text'],'authorized standalone supply registration RPC exists');
 select has_function('public','get_inventory_snapshot',array['uuid','timestamp with time zone','timestamp with time zone','text'],'inventory snapshot is feature gated');
 select has_function('public','get_product_analytics_facts',array['uuid','timestamp with time zone','timestamp with time zone'],'analytics facts are feature gated');
-select ok(not has_table_privilege('authenticated','public.organization_feature_flags','UPDATE'),'authenticated cannot enable staged features');
+select ok(not has_table_privilege('authenticated','public.organization_feature_flags','UPDATE'),'authenticated cannot change feature flags');
 select ok(not has_table_privilege('authenticated','public.inventory_movements','INSERT'),'inventory ledger has no direct browser writes');
 select ok(not has_table_privilege('authenticated','public.inventory_items','INSERT'),'standalone items can only be registered through the audited RPC');
 select ok(not has_table_privilege('authenticated','private.inventory_requests','SELECT'),'idempotency payloads stay private');
 select ok((select relrowsecurity from pg_class where oid='public.inventory_movements'::regclass),'inventory ledger RLS is enabled');
 select ok((select count(*)=2 from pg_trigger where tgname in ('inventory_movements_append_only','inventory_movements_audit') and not tgisinternal),'inventory writes are audited and append-only');
 
--- Exercise the default-off gate and tenant membership path with a real tenant.
+-- Exercise enabled defaults, explicit kill switches, and tenant membership.
 insert into auth.users(id,aud,role,email,encrypted_password,email_confirmed_at,created_at,updated_at)
 values('e284f8b5-f143-4b44-9a16-16399cf3e5a1','authenticated','authenticated','inventory-test@example.invalid','',now(),now(),now());
 insert into public.organizations(id,name) values('0a568874-0aae-431f-b85f-ef7219e1441c','Inventory test');
 insert into public.memberships(organization_id,user_id,role) values('0a568874-0aae-431f-b85f-ef7219e1441c','e284f8b5-f143-4b44-9a16-16399cf3e5a1','owner');
-select is((select inventory_tracking from public.organization_feature_flags where organization_id='0a568874-0aae-431f-b85f-ef7219e1441c'),false,'new organizations start with inventory tracking disabled');
-select ok((select not inventory_tracking and not product_analytics from public.organization_feature_flags where organization_id='0a568874-0aae-431f-b85f-ef7219e1441c'),'all staged features default off');
+select is((select inventory_tracking from public.organization_feature_flags where organization_id='0a568874-0aae-431f-b85f-ef7219e1441c'),true,'new organizations start with inventory tracking enabled');
+select ok((select inventory_tracking and product_analytics from public.organization_feature_flags where organization_id='0a568874-0aae-431f-b85f-ef7219e1441c'),'all released features default on');
+update public.organization_feature_flags set inventory_tracking=false,product_analytics=false where organization_id='0a568874-0aae-431f-b85f-ef7219e1441c';
 select set_config('request.jwt.claims','{"sub":"e284f8b5-f143-4b44-9a16-16399cf3e5a1","role":"authenticated"}',true);
 select throws_ok($$select public.get_inventory_snapshot('0a568874-0aae-431f-b85f-ef7219e1441c',now()-interval '1 day',now(),'USD')$$,'P0001','FEATURE_DISABLED: inventory_tracking','inventory reads fail closed while disabled');
 select throws_ok($$select public.get_product_analytics_facts('0a568874-0aae-431f-b85f-ef7219e1441c',now()-interval '1 day',now())$$,'P0001','FEATURE_DISABLED: product_analytics','analytics reads fail closed while disabled');
 
--- Admin-side test setup simulates an explicitly enabled staged feature.
+-- Enable inventory for the rest of this tenant's movement tests.
 update public.organization_feature_flags set inventory_tracking=true where organization_id='0a568874-0aae-431f-b85f-ef7219e1441c';
 insert into public.accounts(organization_id,name,kind,currency) values('0a568874-0aae-431f-b85f-ef7219e1441c','Inventory test cash','bank','USD');
 insert into public.evidence_files(id,organization_id,object_key,sha256_hex,mime_type,byte_size,uploaded_by)

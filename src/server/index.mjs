@@ -1,5 +1,6 @@
 import { acceptSquareWebhook } from '../square/webhooks.mjs';
 import { diagnoseIssue, DiagnosisError, SUPPORTED_DIAGNOSIS_ISSUE_TYPES } from '../agent/diagnosis.mjs';
+import { extractReceipt } from '../agent/receipt.mjs';
 import { createHash, randomUUID } from 'node:crypto';
 import { calculateProductAnalytics } from '../engine/analytics.mjs';
 import { calculateInventory } from '../engine/inventory.mjs';
@@ -449,6 +450,59 @@ export function createHandlers(adapters) {
       evidenceFileId: body.evidenceRef, idempotencyKey: key, lines: body.lines.map(line => ({ ...line, itemId: line.itemId.trim(), itemName: line.itemName.trim() })) , accessToken: actor.accessToken });
     return created(result);
   });
+  const receiptDraft = run(async req => {
+    if (req.method !== 'POST') throw new HttpError(405, 'METHOD_NOT_ALLOWED');
+    const body = await readJson(req, 40_000);
+    if (!exactObject(body, ['organizationId','currency','text']) || !UUID.test(body.organizationId ?? '')
+        || !/^[A-Z]{3}$/.test(body.currency ?? '') || typeof body.text !== 'string'
+        || !body.text.trim() || body.text.length > 8_000) throw new HttpError(400, 'INVALID_RECEIPT_TEXT');
+    const actor = await authorize(req, body.organizationId, ['owner','operator','reviewer']);
+    await requireFeature(body.organizationId, actor.accessToken, 'inventoryTracking');
+    if (typeof db.reserveReceiptModelBudget !== 'function' || typeof db.recordReceiptModelUsage !== 'function'
+        || typeof db.listReceiptCatalogCandidates !== 'function') throw new HttpError(503, 'RECEIPT_AGENT_UNAVAILABLE');
+    const candidates = await db.listReceiptCatalogCandidates({ organizationId: body.organizationId, currency: body.currency, accessToken: actor.accessToken });
+    const runId = randomUUID();
+    const draft = await extractReceipt({ text: body.text, currency: body.currency }, {
+      apiKey: config.openRouterApiKey,
+      reserveBudget: args => db.reserveReceiptModelBudget({ organizationId: body.organizationId, runId, ...args, accessToken: actor.accessToken }),
+      recordUsage: args => db.recordReceiptModelUsage({ organizationId: body.organizationId, runId, ...args, accessToken: actor.accessToken })
+    });
+    return ok({ draft, candidates });
+  });
+  const receiptItemCosts = run(async req => {
+    if (req.method !== 'POST') throw new HttpError(405, 'METHOD_NOT_ALLOWED');
+    const body = await readJson(req), key = idempotency(req);
+    if (!exactObject(body, ['organizationId','evidenceRef','reason','updates']) || !UUID.test(body.organizationId ?? '')
+        || !UUID.test(body.evidenceRef ?? '') || !text(body.reason, 1000) || body.reason.trim().length < 10
+        || !Array.isArray(body.updates) || body.updates.length < 1 || body.updates.length > 50) throw new HttpError(400, 'INVALID_RECEIPT_COST_APPROVAL');
+    const itemIds = new Set();
+    for (const update of body.updates) {
+      if (!exactObject(update, ['catalogObjectId','name','unitCostMinor','currency','effectiveFrom']) || !text(update.catalogObjectId, 200)
+          || !text(update.name, 200)
+          || !Number.isSafeInteger(update.unitCostMinor) || update.unitCostMinor < 0 || update.unitCostMinor >= 1_000_000_000_000
+          || !/^[A-Z]{3}$/.test(update.currency ?? '') || !validDate(update.effectiveFrom)) throw new HttpError(400, 'INVALID_RECEIPT_COST_APPROVAL');
+      if (itemIds.has(update.catalogObjectId)) throw new HttpError(400, 'DUPLICATE_RECEIPT_COST_ITEM');
+      itemIds.add(update.catalogObjectId);
+    }
+    const actor = await authorize(req, body.organizationId, ['owner','reviewer']);
+    await requireFeature(body.organizationId, actor.accessToken, 'inventoryTracking');
+    const replayEndMs = Date.now() + 1_000;
+    if (body.updates.some(update => Date.parse(update.effectiveFrom) <= Date.now() && replayEndMs - Date.parse(update.effectiveFrom) > 370 * 24 * 60 * 60 * 1000)) {
+      throw new HttpError(400, 'RECEIPT_COST_DATE_OUTSIDE_REPLAY_WINDOW');
+    }
+    if (typeof db.recordReceiptItemCosts !== 'function') throw new HttpError(503, 'RECEIPT_COST_APPROVAL_UNAVAILABLE');
+    const result = await db.recordReceiptItemCosts({ organizationId: body.organizationId, evidenceFileId: body.evidenceRef,
+      reason: body.reason.trim(), idempotencyKey: key,
+      updates: body.updates.map(update => ({ ...update, catalogObjectId: update.catalogObjectId.trim(), name: update.name.trim(), effectiveFrom: new Date(update.effectiveFrom).toISOString() })),
+      accessToken: actor.accessToken });
+    let replay = null;
+    if (result?.replayStartAt && result?.replayEndAt) {
+      replay = await queue.enqueueProjectionReplay({ organizationId: body.organizationId,
+        startAt: result.replayStartAt, endAt: result.replayEndAt,
+        idempotencyKey: `receipt-cost:${key}`, requestedBy: actor.userId });
+    }
+    return created({ updates: result?.updates ?? [], projectionJobId: replay?.id ?? null, projectionQueued: Boolean(replay) });
+  });
   const inventoryCorrection = run(async req => {
     if (req.method !== 'POST') throw new HttpError(405, 'METHOD_NOT_ALLOWED');
     const body = await readJson(req), key = idempotency(req);
@@ -577,7 +631,7 @@ export function createHandlers(adapters) {
     const isJpeg = file.type === 'image/jpeg' && bytes.length >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff;
     const isPng = file.type === 'image/png' && bytes.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]));
     if (!isPdf && !isJpeg && !isPng) throw new HttpError(415, 'EVIDENCE_TYPE_MISMATCH');
-    const actor = await authorize(req, organizationId, ['owner', 'operator']);
+    const actor = await authorize(req, organizationId, ['owner', 'operator', 'reviewer']);
     const filename = String(file.name ?? 'evidence').split(/[\\/]/).pop().replace(/[^A-Za-z0-9._-]/g, '_').slice(0, 160) || 'evidence';
     const stored = await db.uploadEvidence({
       organizationId, uploadedBy: actor.userId, bytes, mimeType: file.type,
@@ -598,5 +652,5 @@ export function createHandlers(adapters) {
     return ok(result);
   });
 
-  return Object.freeze({ dashboard, issues, issueEvidence, audit, settings, inventory, inventoryPurchase, inventoryCorrection, inventoryOpening, inventoryItem, analytics, evidence, evidenceUrl, manualMovement, manualMovements, observation, observations, proposal, itemCost, saleLineCost, refundReview, decision, replay, sync, webhook });
+  return Object.freeze({ dashboard, issues, issueEvidence, audit, settings, inventory, inventoryPurchase, receiptDraft, receiptItemCosts, inventoryCorrection, inventoryOpening, inventoryItem, analytics, evidence, evidenceUrl, manualMovement, manualMovements, observation, observations, proposal, itemCost, saleLineCost, refundReview, decision, replay, sync, webhook });
 }

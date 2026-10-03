@@ -18,8 +18,14 @@ The browser adapter sends `Authorization: Bearer <Supabase access token>` on eve
 - `POST /api/proposals/:proposalId/decision` records an authorized approve/reject decision with issue, revision, reason, and idempotency key.
 - `POST /api/manual-movements` records an audited cash movement. The request includes `organizationId`, `accountId`, `kind`, signed `amountMinor`, `currency`, `occurredAt`, `description`, and `evidenceRef` (an uploaded evidence file UUID); it also has an `Idempotency-Key` header.
 - `POST /api/observations` records an audited observed account balance with `organizationId`, `accountId`, integer `amountMinor`, `currency`, `observedAt`, and `evidenceRef` (an uploaded evidence file UUID), plus an `Idempotency-Key` header.
-- `POST /api/evidence` accepts multipart `organizationId` and `file` fields from an owner or operator. It stores a private PDF, JPEG, or PNG (up to 10 MiB), records its SHA-256 and metadata, and returns the evidence UUID used by the cash entry forms.
+- `POST /api/evidence` accepts multipart `organizationId` and `file` fields from an owner, operator, or reviewer. It stores a private PDF, JPEG, or PNG (up to 10 MiB), records its SHA-256 and metadata, and returns the evidence UUID used by the cash entry forms.
+- `POST /api/inventory/receipt-drafts` accepts `{ organizationId, currency, text }` and returns a bounded model extraction draft plus exact catalog candidates from synced Square sale facts. The model does not see candidates, read uploaded files, match items, or write financial data; the inventory feature gates and organization AI token budget apply.
+- `POST /api/inventory/receipt-costs` accepts an evidence UUID, a human reason, and mapped `{ catalogObjectId, name, unitCostMinor, currency, effectiveFrom }` updates. An owner or reviewer approves the effective-dated item costs; the database audits and idempotently records them, then the server queues a projection replay.
 - `GET /api/evidence?organizationId=&evidenceId=` checks organization membership and returns a private Storage link that expires after 60 seconds.
 - `POST /api/square/oauth/start` returns a Square authorization URL for an authenticated owner; `GET /api/square/oauth/callback` consumes single-use state and stores encrypted tokens server side.
 
 The shell reads organization memberships with the signed in user's Supabase session. Data access and role enforcement remain server side. The API uploads evidence through the server secret into the private `finance-evidence` Storage bucket; clients have no direct bucket access. Cash records can open their evidence through a 60-second signed link. Malware scanning, retention/deletion, and account settings that require policy decisions remain to be implemented.
+
+Inventory tracking and product analytics are enabled by default in the server
+environment examples. Configure both variables as `true` in Vercel's production
+project settings as well; changing those values requires a new deployment.

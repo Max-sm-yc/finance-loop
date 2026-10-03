@@ -1,20 +1,24 @@
-# Staged inventory and product analytics
+# Inventory tracking and product analytics rollout
 
-This update is staged for review while the current product is being debugged.
-Neither capability is enabled, deployed, or migrated by this change. The root
-browser-local demo and the existing accounting worker retain their current behavior.
+This release enables inventory tracking, product analytics, and the receipt text
+helper. The root browser-local demo remains separate from the authenticated app.
+Activation requires both server-side environment flags and the organization
+database flags; this file does not claim pilot reconciliation or accountant
+sign-off.
 
-## Disabled by default
+## Feature gates
 
-`INVENTORY_TRACKING_ENABLED=false` and `PRODUCT_ANALYTICS_ENABLED=false` are
-server-only settings in both environment examples. A capability also requires
-its organization's database flag. The new migration initializes every flag to
-false, including for future organizations. Authenticated users cannot change
-flags. There is no feature activation control in the app.
+`INVENTORY_TRACKING_ENABLED=true` and `PRODUCT_ANALYTICS_ENABLED=true` are
+server-only defaults in both environment examples. Production Vercel settings
+must also set them to `true`; environment changes require a new deployment. A
+capability additionally requires its organization's database flag. Migration
+`202610020006_enable_inventory_and_product_analytics.sql` enables every existing
+organization and sets both flags on for future organizations. Authenticated
+users cannot change organization flags. Setting either server flag to `false`
+or clearing an organization flag disables the corresponding capability.
 
-With server flags absent or false, feature availability does not query the new
-tables. New routes fail closed and new navigation/forms stay hidden. Keeping the
-server flags off allows the existing app to run before the new migration is applied.
+Routes still fail closed unless both layers are enabled. Keep production
+environment values consistent with the database migration.
 
 ## Inventory and cash
 
@@ -24,6 +28,21 @@ transaction. A receipt can contain multiple item lines with one total paid.
 Acquisition unit cost excludes
 purchase tax and miscellaneous charges; the recorded cash paid may include them.
 Receipt costs do not silently replace effective-dated approved sale costs.
+
+The receipt text helper accepts user-pasted receipt text and returns a bounded,
+editable extraction draft. It does not read uploaded receipt files, identify
+Square catalog items, or write financial records. A human must map each line to
+an exact catalog variation, attach receipt evidence, review the unit cost and
+effective date, and approve. Approval can create a first approved cost for a
+variation or revise an existing cost; it writes an audited effective-dated item
+cost and queues a projection replay for effective dates that can affect current
+reports. A future-dated approval takes effect on that date. The helper does not record the purchase
+cash outflow or stock receipt; those remain a separate receipt entry. Model
+requests use the organization's daily AI token budget. Common email, phone,
+card-number, and tax-identifier patterns are redacted before extraction; users
+should still avoid pasting unrelated personal or payment details. Effective
+dates that require replaying more than 370 days are rejected; older cost
+corrections require a separately planned historical replay.
 
 Opening stock and corrections require evidence, an authorized owner or reviewer,
 a reason, and an idempotency key. Corrections append signed quantity deltas; they
@@ -52,8 +71,10 @@ an operational margin, not an accounting net-income statement.
 
 Order-level refunds and payment-level fees remain explicitly unallocated when
 their sources do not identify a product. Missing cost, processing fee, return
-review, or source-health evidence makes affected results incomplete. No amounts
-are inferred by a model and no agent jobs are created by either capability.
+review, or source-health evidence makes affected results incomplete. Product
+analytics does not use model-inferred amounts or create agent jobs. The receipt
+helper is a user-triggered extraction request only; it cannot approve or post a
+cost.
 Source readiness requires fresh health for the required resources and payout
 entries, plus a completed sync window
 covering the requested period. Stock additionally requires source coverage from
@@ -62,23 +83,28 @@ historical coverage.
 
 ## Review and future rollout
 
-The new ordered migration is `202610020003_inventory_tracking.sql`. Before any
-future activation, run the full migration chain and pgTAP tests on a disposable
-Supabase stack, then exercise two organizations and every role. Verify atomic
+The ordered migrations include `202610020003_inventory_tracking.sql`,
+`202610020004_snapshot_sale_line_cost_overrides_from_facts.sql`,
+`202610020005_receipt_agent_cost_approval.sql`, and
+`202610020006_enable_inventory_and_product_analytics.sql`. Run the full
+migration chain and pgTAP tests on a disposable Supabase stack, then exercise
+two organizations and every role. Verify atomic
 purchase rollback, identical and conflicting retries, evidence isolation,
 immutable audit rows, closed periods, stock roll-forward, and report totals
-against independent source records. Compare UI reports and exported data.
+against independent source records. For receipt cost approval, also verify
+catalog candidate tenant isolation, no writes during extraction, owner/reviewer
+authorization, initial and revised effective-dated costs, changed retries, and
+projection replay after approval. Compare UI reports and exported data.
 
-Applying this migration to production and changing feature flags require a
-separate explicit rollout instruction. Confirm the linked project and migration
-history then; this document is not authorization to push a schema or enable a
-feature. Keep both flags off throughout the current debugging work.
+Production rollout also requires confirming the linked project, current migration
+history, both Vercel environment values, deployment health, and pilot readiness.
+Applying migrations does not establish a completed pilot or accounting sign-off.
 
-## Verification of this staged change
+## Verification status
 
-The Next.js type check and production build pass. The Node suite passes 96 of
-99 tests; the same three adapter/server failures were present before this update.
-The 25 newly added tests pass. The migration and its 40 pgTAP assertions remain
-unexecuted because a disposable local Docker/Supabase stack is unavailable.
-Neither database execution nor live merchant integration is verified by these
-code checks.
+The previous inventory and analytics update documented a Next.js production
+build and Node results of 96/99 tests, with three pre-existing failures. Those
+checks predate the receipt helper and do not verify it. The new migration,
+receipt parsing route, approval RPC, and UI have not been run through automated
+tests, a local Supabase stack, or live merchant integration. No remote migration
+was applied and neither feature flag was enabled for this implementation.

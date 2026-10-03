@@ -598,6 +598,39 @@ export function createSupabaseAdapters({ url, publishableKey, secretKey, tokenEn
       if (error) throw error;
       return data;
     },
+    async reserveReceiptModelBudget(args) {
+      const { data, error } = await userRest(args.accessToken).rpc('reserve_receipt_agent_budget', {
+        organization_id: args.organizationId, run_id: args.runId, model_id: args.model,
+        max_input_tokens: args.maxInputTokens, max_output_tokens: args.maxOutputTokens, max_attempts: args.maxAttempts
+      });
+      if (error) throw error;
+      return data === true;
+    },
+    async recordReceiptModelUsage(args) {
+      const { data, error } = await userRest(args.accessToken).rpc('record_receipt_agent_usage', {
+        organization_id: args.organizationId, run_id: args.runId, model_id: args.model,
+        usage: args.usage ?? {}, attempt: args.attempt
+      });
+      if (error) throw error;
+      return data === true;
+    },
+    async listReceiptCatalogCandidates(args) {
+      const { data, error } = await userRest(args.accessToken).rpc('list_receipt_catalog_candidates', {
+        organization_id: args.organizationId, currency: args.currency
+      });
+      if (error) throw error;
+      return Array.isArray(data) ? data : [];
+    },
+    async recordReceiptItemCosts(args) {
+      const { data, error } = await userRest(args.accessToken).rpc('record_receipt_item_costs', {
+        organization_id: args.organizationId, evidence_file_id: args.evidenceFileId,
+        reason: args.reason, idempotency_key: args.idempotencyKey,
+        updates: args.updates.map(update => ({ catalogObjectId: update.catalogObjectId, name: update.name, unitCostMinor: update.unitCostMinor,
+          currency: update.currency, effectiveFrom: update.effectiveFrom }))
+      });
+      if (error) throw error;
+      return data;
+    },
     async recordInventoryCorrection(args) {
       const { data, error } = await userRest(args.accessToken).rpc('record_inventory_correction', {
         organization_id: args.organizationId, item_id: args.itemId,

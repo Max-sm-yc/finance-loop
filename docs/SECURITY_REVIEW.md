@@ -28,6 +28,7 @@ Use this checklist before connecting a merchant, before production launch, and a
 - [ ] Closed periods block writes. Reopen has authorized actor/reason; subsequent close requires complete source sync and unresolved-issue review.
 - [ ] Inventory cost, tax, tips, discounts, gift cards, refunds, chargebacks, transfers, and COGS cash treatment have signed-off examples before they affect reporting.
 - [ ] Agent output is schema-validated, uses allowlisted source IDs/categories, has per-org rate/cost caps, and can only create a draft. No model output chooses arithmetic or writes canonical ledger facts.
+- [ ] Receipt extraction sends only bounded pasted text after common identifier redaction; a person selects the exact catalog identity and approves an evidence-linked, idempotent COGS write through the owner/reviewer RPC.
 - [ ] Projection replay from source facts and policy version is deterministic. Golden fixtures include duplicate/reordered events, partial refunds, missing costs, and payout fees.
 
 ## Evidence, privacy, and application security

@@ -154,6 +154,8 @@ async function dispatch(request: Request) {
   if (resource === 'settings' && method === 'GET') return route.settings(request);
   if (resource === 'inventory' && !id && method === 'GET') return route.inventory(request);
   if (resource === 'inventory' && id === 'purchases' && method === 'POST') return route.inventoryPurchase(request);
+  if (resource === 'inventory' && id === 'receipt-drafts' && method === 'POST') return route.receiptDraft(request);
+  if (resource === 'inventory' && id === 'receipt-costs' && method === 'POST') return route.receiptItemCosts(request);
   if (resource === 'inventory' && id === 'corrections' && method === 'POST') return route.inventoryCorrection(request);
   if (resource === 'inventory' && id === 'openings' && method === 'POST') return route.inventoryOpening(request);
   if (resource === 'inventory' && id === 'items' && method === 'POST') return route.inventoryItem(request);
