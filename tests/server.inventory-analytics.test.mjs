@@ -83,6 +83,21 @@ test('analytics missing card fees never become zero and incomplete source covera
   const missingOrders = await (await handlers({ facts }).analytics(get('analytics'))).json();
   assert.equal(missingOrders.analytics.totals.revenueMinor, null);
   assert.equal(missingOrders.analytics.products[0].revenueMinor, null);
+
+  facts.sourceHealth = ready().sourceHealth;
+  facts.facts[1] = { kind: 'payment', objectId: 'payment', fact: { orderId: 'order', status: 'COMPLETED', occurredAt: from, currency: 'USD', feeMinor: 35 } };
+  const knownAmountWithoutStatus = await (await handlers({ facts }).analytics(get('analytics'))).json();
+  assert.equal(knownAmountWithoutStatus.analytics.totals.feesMinor, 35);
+  assert.equal(knownAmountWithoutStatus.analytics.products[0].feesMinor, 35);
+  assert.equal(knownAmountWithoutStatus.analytics.products[0].netMinor, 665);
+
+  facts.sourceHealth = ready().sourceHealth.map(row => row.resource === 'payments'
+    ? { ...row, status: 'incomplete', gap: { code: 'PROCESSING_FEE_UNAVAILABLE' }, lastSuccessfulSyncAt: null } : row);
+  const stalePaymentHealth = await (await handlers({ facts }).analytics(get('analytics'))).json();
+  assert.equal(stalePaymentHealth.analytics.status, 'incomplete');
+  assert.equal(stalePaymentHealth.analytics.totals.feesMinor, 35);
+  assert.equal(stalePaymentHealth.analytics.products[0].feesMinor, 35);
+  assert.equal(stalePaymentHealth.analytics.products[0].netMinor, null);
 });
 
 test('opening counts and supply registration permit reviewers while rejecting operator writes and foreign membership', async () => {

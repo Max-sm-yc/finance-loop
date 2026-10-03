@@ -137,6 +137,44 @@ test('product analytics reconciles recognized sales, COGS and fees; unsupported 
   assert.equal(typeof result.products[0].revenueRank, 'number');
 });
 
+test('payment fees allocate to a single-product order and stay unallocated for mixed-product orders', () => {
+  const lines = [
+    { id: 'single-line', orderId: 'single-order', lineItemUid: 'single-uid', status: 'completed', currency: 'USD', occurredAt: from,
+      quantity: 1, catalogObjectId: 'A', grossMinor: 1000, discountMinor: 0, unitCostMinor: 300, costCurrency: 'USD' },
+    { id: 'mixed-line-a', orderId: 'mixed-order', lineItemUid: 'mixed-uid-a', status: 'completed', currency: 'USD', occurredAt: from,
+      quantity: 1, catalogObjectId: 'A', grossMinor: 500, discountMinor: 0, unitCostMinor: 200, costCurrency: 'USD' },
+    { id: 'mixed-line-b', orderId: 'mixed-order', lineItemUid: 'mixed-uid-b', status: 'completed', currency: 'USD', occurredAt: from,
+      quantity: 1, catalogObjectId: 'B', grossMinor: 500, discountMinor: 0, unitCostMinor: 200, costCurrency: 'USD' },
+  ];
+  const result = calculateProductAnalytics({ from, to, lines, fees: [
+    { id: 'single-fee', orderId: 'single-order', status: 'completed', currency: 'USD', occurredAt: from, amountMinor: 25 },
+    { id: 'mixed-fee', orderId: 'mixed-order', status: 'completed', currency: 'USD', occurredAt: from, amountMinor: 40 },
+  ] });
+  const productA = result.products.find(product => product.productId === 'A');
+  const productB = result.products.find(product => product.productId === 'B');
+  assert.equal(productA.feesMinor, null);
+  assert.equal(productA.feesAllocationComplete, false);
+  assert.equal(productA.netMinor, null);
+  assert.equal(productB.feesMinor, null);
+  assert.equal(productB.feesAllocationComplete, false);
+  assert.equal(productB.netMinor, null);
+  assert.equal(result.unallocated.feesMinor, 40);
+  assert.equal(result.totals.feesMinor, 65);
+  assert.equal(result.totals.netMinor, 1235);
+  assert.ok(result.issues.some(issue => issue.code === 'FEE_ALLOCATION_INCOMPLETE'));
+
+  const exact = calculateProductAnalytics({ from, to, lines: [lines[0]], fees: [{ id: 'exact-fee', orderId: 'single-order', status: 'completed', currency: 'USD', occurredAt: from, amountMinor: 25 }] });
+  assert.equal(exact.products[0].feesMinor, 25);
+  assert.equal(exact.products[0].feesAllocationComplete, true);
+
+  const partlyIdentified = calculateProductAnalytics({ from, to, lines: [lines[0],
+    { id: 'unknown-line', orderId: 'single-order', status: 'completed', currency: 'USD', occurredAt: from, quantity: 1, grossMinor: 500, discountMinor: 0 }],
+    fees: [{ id: 'partly-identified-fee', orderId: 'single-order', status: 'completed', currency: 'USD', occurredAt: from, amountMinor: 25 }] });
+  assert.equal(partlyIdentified.products[0].feesMinor, null);
+  assert.equal(partlyIdentified.products[0].feesAllocationComplete, false);
+  assert.equal(partlyIdentified.unallocated.feesMinor, 25);
+});
+
 test('missing refund return disposition leaves product COGS and net incomplete', () => {
   const result = calculateProductAnalytics({ from, to,
     lines: [{ id: 'line', orderId: 'order', status: 'completed', currency: 'USD', occurredAt: from, quantity: 1, grossMinor: 500, discountMinor: 0, unitCostMinor: 200, costCurrency: 'USD' }],

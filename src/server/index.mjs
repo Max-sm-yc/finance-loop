@@ -572,7 +572,11 @@ export function createHandlers(adapters) {
         refunds.push(normalized);
       } else if (row.kind === 'payment') {
         if (String(fact.status).toLowerCase() !== 'completed') continue;
-        if (fact.feeMinor == null || !['provided','provided_from_payout_entry','provided_from_payout_charge_entry','not_applicable_cash','not_applicable_no_sale'].includes(fact.feeStatus)) { missingFee = true; continue; }
+        const invalidFeeStatus = ['missing_processing_fee', 'invalid_processing_fee_amount', 'processing_fee_currency_mismatch', 'processing_fee_out_of_range'].includes(fact.feeStatus);
+        // Older normalized payment facts can have a valid Square fee amount
+        // without the later-added feeStatus marker. The amount is still source
+        // evidence; only explicit invalid statuses or an invalid amount fail.
+        if (!Number.isSafeInteger(fact.feeMinor) || fact.feeMinor < 0 || invalidFeeStatus) { missingFee = true; continue; }
         fees.push({ id: normalized.id, version: normalized.version, orderId: fact.orderId, occurredAt: fact.occurredAt, currency: fact.currency, amountMinor: fact.feeMinor, status: 'completed' });
       } else if (row.kind === 'fee' || row.kind === 'payment_fee' || row.kind === 'payout_entry') fees.push(normalized);
     }
@@ -607,10 +611,17 @@ export function createHandlers(adapters) {
         series.revenueMinor = null; series.costMinor = null; series.netMinor = null;
       }
     }
+    if (incompleteCoverage) {
+      report.totals.feesMinor = null; report.unallocated.feesMinor = null;
+      for (const product of report.products) product.feesMinor = null;
+      for (const series of [...(report.daily ?? []), ...(report.monthly ?? [])]) series.feesMinor = null;
+    }
     if (missingFee || incompleteFeeHealth) {
       report.totals.netMinor = null;
       for (const product of report.products) { product.netMinor = null; product.netRank = null; product.marginBps = null; }
       for (const series of [...(report.daily ?? []), ...(report.monthly ?? [])]) series.netMinor = null;
+    }
+    if (missingFee) {
       report.totals.feesMinor = null; report.unallocated.feesMinor = null;
       for (const product of report.products) { product.feesMinor = null; product.netMinor = null; product.netRank = null; product.marginBps = null; }
       for (const series of [...(report.daily ?? []), ...(report.monthly ?? [])]) series.feesMinor = null;

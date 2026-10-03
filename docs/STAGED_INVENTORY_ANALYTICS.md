@@ -70,11 +70,14 @@ ratios, and CSV export. Net is
 an operational margin, not an accounting net-income statement.
 
 Order-level refunds and payment-level fees remain explicitly unallocated when
-their sources do not identify a product. Missing cost, processing fee, return
-review, or source-health evidence makes affected results incomplete. Product
-analytics does not use model-inferred amounts or create agent jobs. The receipt
-helper is a user-triggered extraction request only; it cannot approve or post a
-cost.
+their sources do not identify a product. A payment fee can be attributed to an
+order's product when every recognized sale line in that order identifies the
+same product; fees for multi-product orders remain unallocated. Known fee
+amounts stay visible when health is stale, while the report and net results
+remain incomplete until readiness is restored. Missing fee amounts or an
+uncovered source window make fee totals incomplete. Product analytics does not
+use model-inferred amounts or create agent jobs. The receipt helper is a
+user-triggered extraction request only; it cannot approve or post a cost.
 Source readiness requires fresh health for the required resources and payout
 entries, plus a completed sync window
 covering the requested period. Stock additionally requires source coverage from
