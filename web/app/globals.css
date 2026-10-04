@@ -152,6 +152,14 @@ td small.cell-sub { display: block; margin-top: 4px; color: var(--subtle); font-
 .error-box b, .error { color: var(--red); }
 .compact-notice { margin-top: 13px; }
 .filter-panel { display: flex; align-items: flex-end; justify-content: space-between; gap: 10px; }
+.catalog-toolbar { display: flex; align-items: flex-end; flex-wrap: wrap; gap: 10px; margin: 14px 0; }
+.catalog-toolbar > label { display: grid; flex: 1 1 220px; max-width: 360px; gap: 7px; color: #aab5ac; font-size: 12px; font-weight: 550; }
+.catalog-toolbar input[type="search"] { width: 100%; min-width: 160px; padding: 8px 9px; border: 1px solid var(--line); border-radius: 5px; color: #d5ded7; background: #131815; font-size: 12px; }
+.catalog-tabs { display: inline-flex; gap: 3px; padding: 3px; border: 1px solid var(--line-soft); border-radius: 6px; background: #131815; }
+.catalog-tab { display: inline-flex; align-items: center; gap: 7px; padding: 7px 9px; border: 0; border-radius: 4px; color: var(--muted); background: transparent; font-size: 11px; cursor: pointer; }
+.catalog-tab span { color: var(--subtle); font-variant-numeric: tabular-nums; }
+.catalog-tab.selected { color: var(--text-strong); background: #26312a; }
+.catalog-tab.selected span { color: var(--green); }
 .cash-account-empty { display: grid; flex: 1; gap: 4px; }
 .cash-account-empty strong { color: var(--text); font-size: 14px; font-weight: 590; }
 .cash-account-empty span { max-width: 570px; color: var(--muted); font-size: 12px; line-height: 1.5; }

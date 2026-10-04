@@ -602,6 +602,143 @@ export function createHandlers(adapters) {
       idempotencyKey: `square-catalog-item:${createHash('sha256').update(`${body.organizationId}:${key}`).digest('hex')}`, requestedBy: actor.userId });
     return created({ ...definition, projectionJobId: replay.id, projectionQueued: true });
   });
+  const squareCatalogCreate = run(async req => {
+    if (req.method !== 'POST') throw new HttpError(405, 'METHOD_NOT_ALLOWED');
+    const body = await readJson(req), key = idempotency(req);
+    if (!exactObject(body, ['organizationId','name','description','variations','reason'])
+        || !UUID.test(body.organizationId ?? '') || !text(body.name, 200)
+        || (body.description !== undefined && (typeof body.description !== 'string' || body.description.length > 4096))
+        || !text(body.reason, 1000) || body.reason.trim().length < 10
+        || !Array.isArray(body.variations) || body.variations.length < 1 || body.variations.length > 250) {
+      throw new HttpError(400, 'INVALID_SQUARE_CATALOG_ITEM');
+    }
+    for (const variation of body.variations) {
+      if (!exactObject(variation, ['name','sku','pricingType','priceMinor','currency'], ['name','pricingType'])
+          || !text(variation.name, 200)
+          || (variation.sku !== undefined && (typeof variation.sku !== 'string' || variation.sku.length > 100))
+          || !['FIXED_PRICING','VARIABLE_PRICING'].includes(variation.pricingType)
+          || (variation.pricingType === 'FIXED_PRICING'
+            ? !Number.isSafeInteger(variation.priceMinor) || variation.priceMinor < 0 || variation.priceMinor >= 1_000_000_000_000 || !/^[A-Z]{3}$/.test(variation.currency ?? '')
+            : variation.priceMinor !== undefined && variation.priceMinor !== null)) {
+        throw new HttpError(400, 'INVALID_SQUARE_CATALOG_VARIATION');
+      }
+    }
+    const actor = await authorize(req, body.organizationId, ['owner']);
+    await requireFeature(body.organizationId, actor.accessToken, 'inventoryTracking');
+    if (typeof squareCatalog?.createProduct !== 'function' || typeof db.upsertSquareFacts !== 'function'
+        || typeof db.recordSquareCatalogManagementEvent !== 'function') throw new HttpError(503, 'SQUARE_CATALOG_UNAVAILABLE');
+
+    let result;
+    try {
+      result = await squareCatalog.createProduct({ organizationId: body.organizationId, idempotencyKey: key,
+        name: body.name.trim(), description: body.description?.trim() ?? '',
+        variations: body.variations.map(variation => ({ name: variation.name.trim(), sku: variation.sku?.trim() ?? '',
+          pricingType: variation.pricingType, priceMinor: variation.priceMinor ?? null, currency: variation.currency ?? null })) });
+    } catch (error) {
+      throw catalogSquareError(error);
+    }
+    await persistSquareCatalogChange({ organizationId: body.organizationId, accessToken: actor.accessToken,
+      idempotencyKey: key, cause: 'create', action: 'create', squareObjectId: result.squareItemId,
+      beforeState: {},
+      facts: result.facts, afterState: { squareItemId: result.squareItemId, variationCount: result.variationIds.length,
+        name: body.name.trim(), description: body.description?.trim() ?? '' }, reason: body.reason.trim() });
+    return created({ squareItemId: result.squareItemId, variationIds: result.variationIds });
+  });
+  const squareCatalogManage = run(async req => {
+    if (req.method !== 'PATCH') throw new HttpError(405, 'METHOD_NOT_ALLOWED');
+    const body = await readJson(req), key = idempotency(req);
+    const fields = ['organizationId','action','squareItemId','squareCatalogObjectId','name','description',
+      'variationName','sku','pricingType','priceMinor','currency','reason'];
+    if (!exactObject(body, fields) || !UUID.test(body.organizationId ?? '')
+        || !['update_item','update_variation','add_variation','archive','restore'].includes(body.action)
+        || !text(body.squareItemId, 200) || !text(body.reason, 1000) || body.reason.trim().length < 10) {
+      throw new HttpError(400, 'INVALID_SQUARE_CATALOG_CHANGE');
+    }
+    const validVariation = needsId => text(body.variationName, 200)
+      && (body.sku === undefined || typeof body.sku === 'string' && body.sku.length <= 100)
+      && ['FIXED_PRICING','VARIABLE_PRICING'].includes(body.pricingType)
+      && (body.pricingType === 'FIXED_PRICING'
+        ? Number.isSafeInteger(body.priceMinor) && body.priceMinor >= 0 && body.priceMinor < 1_000_000_000_000 && /^[A-Z]{3}$/.test(body.currency ?? '')
+        : body.priceMinor === null || body.priceMinor === undefined)
+      && (!needsId || text(body.squareCatalogObjectId, 200));
+    if ((body.action === 'update_item' && (!text(body.name, 200)
+          || body.description !== undefined && (typeof body.description !== 'string' || body.description.length > 4096)))
+        || ((body.action === 'update_variation' || body.action === 'add_variation') && !validVariation(body.action === 'update_variation'))
+        || ((body.action === 'archive' || body.action === 'restore')
+          && (body.squareCatalogObjectId !== undefined || body.name !== undefined || body.description !== undefined
+            || body.variationName !== undefined || body.sku !== undefined || body.pricingType !== undefined
+            || body.priceMinor !== undefined || body.currency !== undefined))) {
+      throw new HttpError(400, 'INVALID_SQUARE_CATALOG_CHANGE');
+    }
+    const actor = await authorize(req, body.organizationId, ['owner']);
+    await requireFeature(body.organizationId, actor.accessToken, 'inventoryTracking');
+    if (typeof squareCatalog?.manageItem !== 'function' || typeof db.upsertSquareFacts !== 'function'
+        || typeof db.recordSquareCatalogManagementEvent !== 'function') throw new HttpError(503, 'SQUARE_CATALOG_UNAVAILABLE');
+    let result;
+    try {
+      result = await squareCatalog.manageItem({ organizationId: body.organizationId, idempotencyKey: key,
+        action: body.action, squareItemId: body.squareItemId.trim(), squareCatalogObjectId: body.squareCatalogObjectId?.trim(),
+        name: body.name?.trim(), description: body.description?.trim() ?? '', variationName: body.variationName?.trim(),
+        sku: body.sku?.trim() ?? '', pricingType: body.pricingType, priceMinor: body.priceMinor ?? null, currency: body.currency });
+    } catch (error) {
+      throw catalogSquareError(error);
+    }
+    const auditAction = body.action === 'update_item' || body.action === 'update_variation' ? 'update'
+      : body.action === 'add_variation' ? 'add_variation' : body.action;
+    await persistSquareCatalogChange({ organizationId: body.organizationId, accessToken: actor.accessToken,
+      idempotencyKey: key, cause: auditAction, action: auditAction,
+      squareObjectId: result.squareCatalogObjectId ?? result.squareItemId,
+      beforeState: result.before ?? {},
+      facts: result.facts, afterState: { squareItemId: result.squareItemId,
+        ...(result.squareCatalogObjectId ? { squareCatalogObjectId: result.squareCatalogObjectId } : {}),
+        ...(result.after ?? {}) }, reason: body.reason.trim() });
+    return ok({ squareItemId: result.squareItemId, squareCatalogObjectId: result.squareCatalogObjectId ?? null });
+  });
+
+  async function persistSquareCatalogChange({ organizationId, accessToken, idempotencyKey, cause, action,
+    squareObjectId, beforeState, facts, afterState, reason }) {
+    try {
+      await db.upsertSquareFacts({ organizationId, facts, cause: `catalog-${cause}:${idempotencyKey}` });
+    } catch (error) {
+      const code = typeof error?.code === 'string' && /^[A-Z0-9]{1,10}$/.test(error.code) ? error.code : 'UNKNOWN';
+      console.error(JSON.stringify({ event: 'square_catalog_change_failed', stage: 'fact_write', code }));
+      throw new HttpError(503, 'SQUARE_CATALOG_SAVED_REFRESH_PENDING');
+    }
+    try {
+      await db.recordSquareCatalogManagementEvent({ organizationId, accessToken, idempotencyKey,
+        action, squareObjectId, beforeState: beforeState ?? {}, afterState, reason });
+    } catch (error) {
+      const code = typeof error?.code === 'string' && /^[A-Z0-9]{1,10}$/.test(error.code) ? error.code : 'UNKNOWN';
+      console.error(JSON.stringify({ event: 'square_catalog_change_failed', stage: 'audit_write', code }));
+      throw new HttpError(503, 'SQUARE_CATALOG_SAVED_AUDIT_PENDING');
+    }
+  }
+
+  function catalogSquareError(error) {
+    const code = error?.code;
+    const status = Number(error?.status);
+    const mapped = {
+      SQUARE_ENVIRONMENT_UNCONFIGURED: [503, 'SQUARE_CATALOG_UNAVAILABLE'],
+      SQUARE_CATALOG_UNAVAILABLE: [503, 'SQUARE_CATALOG_UNAVAILABLE'],
+      SQUARE_NOT_CONNECTED: [409, 'SQUARE_NOT_CONNECTED'],
+      SQUARE_RECONNECT_REQUIRED: [409, 'SQUARE_RECONNECT_REQUIRED'],
+      SQUARE_CATALOG_WRITE_PERMISSION_REQUIRED: [403, 'SQUARE_CATALOG_WRITE_PERMISSION_REQUIRED'],
+      SQUARE_CATALOG_OBJECT_UNAVAILABLE: [404, 'SQUARE_CATALOG_OBJECT_UNAVAILABLE'],
+      SQUARE_CATALOG_VARIATION_LIMIT: [400, 'SQUARE_CATALOG_VARIATION_LIMIT'],
+      SQUARE_CATALOG_RESPONSE_INVALID: [502, 'SQUARE_CATALOG_WRITE_FAILED'],
+      SQUARE_CATALOG_WRITE_FAILED: [502, 'SQUARE_CATALOG_WRITE_FAILED'],
+      SQUARE_CATALOG_CONFLICT: [409, 'SQUARE_CATALOG_CONFLICT'],
+      SQUARE_CATALOG_BUSY: [503, 'SQUARE_CATALOG_BUSY'],
+    }[code];
+    if (mapped) throw new HttpError(mapped[0], mapped[1]);
+    if (status === 401) throw new HttpError(409, 'SQUARE_RECONNECT_REQUIRED');
+    if (status === 403) throw new HttpError(403, 'SQUARE_CATALOG_WRITE_PERMISSION_REQUIRED');
+    if (status === 404) throw new HttpError(404, 'SQUARE_CATALOG_OBJECT_UNAVAILABLE');
+    if (status === 409) throw new HttpError(409, 'SQUARE_CATALOG_CONFLICT');
+    if (status === 429) throw new HttpError(503, 'SQUARE_CATALOG_BUSY');
+    if (Number.isInteger(status)) throw new HttpError(502, 'SQUARE_CATALOG_WRITE_FAILED');
+    throw error;
+  }
   const analytics = run(async req => {
     if (req.method !== 'GET') throw new HttpError(405, 'METHOD_NOT_ALLOWED');
     const u = new URL(req.url), organizationId = u.searchParams.get('organizationId');
@@ -753,5 +890,5 @@ export function createHandlers(adapters) {
     return ok(result);
   });
 
-  return Object.freeze({ dashboard, issues, issueEvidence, audit, settings, inventory, inventoryPurchase, receiptDraft, receiptItemCosts, inventoryCorrection, inventoryOpening, inventoryItem, squareCatalogItem, analytics, evidence, evidenceUrl, manualMovement, manualMovements, observation, observations, proposal, itemCost, saleLineCost, refundReview, decision, replay, sync, webhook });
+  return Object.freeze({ dashboard, issues, issueEvidence, audit, settings, inventory, inventoryPurchase, receiptDraft, receiptItemCosts, inventoryCorrection, inventoryOpening, inventoryItem, squareCatalogItem, squareCatalogCreate, squareCatalogManage, analytics, evidence, evidenceUrl, manualMovement, manualMovements, observation, observations, proposal, itemCost, saleLineCost, refundReview, decision, replay, sync, webhook });
 }

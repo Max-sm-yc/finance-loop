@@ -611,6 +611,15 @@ export function createSupabaseAdapters({ url, publishableKey, secretKey, tokenEn
       if (error) throw error;
       return data === true;
     },
+    async recordSquareCatalogManagementEvent(args) {
+      const { data, error } = await userRest(args.accessToken).rpc('record_square_catalog_management_event', {
+        organization_id: args.organizationId, idempotency_key: args.idempotencyKey,
+        action: args.action, square_object_id: args.squareObjectId,
+        before_state: args.beforeState ?? {}, after_state: args.afterState ?? {}, reason: args.reason,
+      });
+      if (error) throw error;
+      return data;
+    },
     async recordInventoryPurchase(args) {
       const { data, error } = await userRest(args.accessToken).rpc('record_inventory_purchase', {
         organization_id: args.organizationId, account_id: args.accountId,

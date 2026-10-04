@@ -182,7 +182,7 @@ readiness requirements. See [the inventory and analytics rollout
 contract](docs/STAGED_INVENTORY_ANALYTICS.md).
 
 1. **Overview:** income, cash, sync freshness, unresolved issues, period and account selector; each metric links to its calculation.
-2. **Income & inventory:** Square sales by item, unit cost status, fees, margin, item definition review, and owner-only creation of a Square sellable item with an evidence-linked Finance Loop cost.
+2. **Income & inventory:** Square sales by item, unit cost status, fees, margin, item definition review, and owner-only in-app management of Square items and variations. Item costs remain separate effective-dated, evidence-linked approvals; archived items stay available to historical calculations.
 3. **Cash flow:** dated inflow/outflow register, cash category breakdown, expected vs observed balance, manual entry form.
 4. **Review queue:** unknown items, unclassified transactions, suspected missing cash entries; source evidence and approve/reject/request clarification.
 5. **Ledger / audit:** read-only event timeline, versions, actor and decision trail, export.
@@ -199,6 +199,7 @@ The prototype implements the first five as local demo workflows. Each demo contr
 | `GET /api/dashboard` | Account, date range | Projection version, source freshness, incomplete flags |
 | `POST /api/manual-movements` | Type, amount, account, date, memo, evidence, idempotency key | Validate and audit; two-person approval for threshold categories |
 | `POST /api/observations` | Account, timestamp, amount, evidence | Validate cutoff and create reconciliation run |
+| `POST /api/square/catalog-items` / `PATCH /api/square/catalog-items` | Item details and variations, archive/restore action, reason, idempotency key | Owner-only Square Catalog writes; versioned source facts and audit event. Never hard-delete an item with historical references. |
 | `POST /api/inventory/catalog-items` | Item, variation, sale price, optional SKU, supported unit cost, effective date, supplier evidence, idempotency key | Owner-only; upsert Square Catalog, persist the returned variation fact, record audited COGS, and queue a projection replay |
 | `POST /api/issues/:id/proposals` | Agent structured output | Validate against source IDs and policy; draft only |
 | `POST /api/proposals/:id/decision` | approve/reject, reason | Reviewer authorization, optimistic version check, audit, recompute |

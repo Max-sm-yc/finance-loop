@@ -132,15 +132,17 @@ export function normalizeCatalog(obj) {
   const variation = obj.type === 'ITEM_VARIATION' ? obj.item_variation_data : null;
   const priceMoney = variation?.price_money;
   return [{ kind: 'catalog', objectId: obj.id,
-    version: sourceVersion ? `${sourceVersion}|normalization-2` : '',
+    version: sourceVersion ? `${sourceVersion}|normalization-3` : '',
     objectType: obj.type ?? null,
     name: obj.item_data?.name ?? variation?.name ?? obj.category_data?.name ?? null,
+    description: obj.item_data?.description_plaintext ?? obj.item_data?.description ?? null,
     itemId: variation?.item_id ?? null,
     sku: variation?.sku ?? null,
     priceMinor: variation ? minor(priceMoney) : null,
     currency: variation ? moneyCurrency(priceMoney) : null,
     pricingType: variation?.pricing_type ?? null,
     isDeleted: obj.is_deleted === true,
+    isArchived: obj.item_data?.is_archived === true,
     raw: obj }];
 }
 export function normalizePayout(p) {

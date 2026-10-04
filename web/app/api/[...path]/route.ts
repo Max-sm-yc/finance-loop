@@ -2,7 +2,8 @@ import { createHandlers } from '../../../../src/server/index.mjs';
 import { createSupabaseAdapters } from '../../../../src/adapters/supabase.mjs';
 import { replayAccounting } from '../../../../src/engine/index.mjs';
 import { createSquareOAuthHandlers } from '../../../../src/square/oauth.mjs';
-import { createSquareCatalogItem as upsertSquareCatalogItem } from '../../../../src/square/catalog.mjs';
+import { createSquareCatalogItem as upsertSquareCatalogItem, createSquareCatalogProduct as createSquareCatalogProductEntry,
+  updateSquareCatalogItem, updateSquareCatalogVariation, addSquareCatalogVariation, setSquareCatalogItemArchived } from '../../../../src/square/catalog.mjs';
 import { refreshAccessToken, SquareApiClient } from '../../../../src/square/client.mjs';
 
 export const runtime = 'nodejs';
@@ -158,6 +159,90 @@ async function createSquareCatalogItemForOrganization(args: {
   return squareItem;
 }
 
+async function withSquareCatalogWrite<T>(organizationId: string, adapters: ReturnType<typeof createSupabaseAdapters>,
+  operation: (client: SquareApiClient) => Promise<T>): Promise<T> {
+  const squareEnvironment = process.env.SQUARE_ENVIRONMENT;
+  if (squareEnvironment !== 'sandbox' && squareEnvironment !== 'production') throw codedError('SQUARE_ENVIRONMENT_UNCONFIGURED');
+  const squareBaseUrl = squareEnvironment === 'sandbox' ? 'https://connect.squareupsandbox.com' : 'https://connect.squareup.com';
+  let connection;
+  try { connection = await adapters.tokenVault.getDecrypted({ organizationId }); }
+  catch { throw codedError('SQUARE_CATALOG_UNAVAILABLE'); }
+  if (!connection?.accessToken) throw codedError('SQUARE_NOT_CONNECTED');
+  if (!Array.isArray(connection.scopes) || !connection.scopes.includes('ITEMS_WRITE')) throw codedError('SQUARE_CATALOG_WRITE_PERMISSION_REQUIRED');
+
+  const expiresAt = Date.parse(connection.expiresAt ?? '');
+  if (Number.isFinite(expiresAt) && expiresAt <= Date.now() + 5 * 60_000) {
+    const clientId = process.env.SQUARE_CLIENT_ID, clientSecret = process.env.SQUARE_CLIENT_SECRET;
+    if (!connection.refreshToken || !clientId || !clientSecret) throw codedError('SQUARE_RECONNECT_REQUIRED');
+    let refreshed: SquareTokenRefresh;
+    try {
+      refreshed = await refreshAccessToken({ refreshToken: connection.refreshToken, clientId, clientSecret, baseUrl: squareBaseUrl }) as SquareTokenRefresh;
+    } catch (error) {
+      const status = typeof error === 'object' && error !== null && 'status' in error ? Number(error.status) : undefined;
+      if (status === 400 || status === 401) throw codedError('SQUARE_RECONNECT_REQUIRED');
+      throw codedError('SQUARE_CATALOG_UNAVAILABLE');
+    }
+    if (!refreshed.access_token || !refreshed.refresh_token || !refreshed.expires_at) throw codedError('SQUARE_RECONNECT_REQUIRED');
+    await adapters.tokenVault.storeEncrypted({
+      organizationId, connectedBy: connection.connectedBy,
+      merchantId: refreshed.merchant_id ?? connection.merchantId,
+      accessToken: refreshed.access_token, refreshToken: refreshed.refresh_token,
+      expiresAt: refreshed.expires_at, scopes: refreshed.scopes ?? connection.scopes,
+      tokenType: refreshed.token_type ?? connection.tokenType,
+    });
+    connection = { ...connection, accessToken: refreshed.access_token, expiresAt: refreshed.expires_at };
+  }
+
+  const client = new SquareApiClient({ accessToken: connection.accessToken, baseUrl: squareBaseUrl,
+    apiVersion: process.env.SQUARE_API_VERSION ?? '2026-09-16' });
+  try { return await operation(client); }
+  catch (error) {
+    const status = typeof error === 'object' && error !== null && 'status' in error ? Number(error.status) : undefined;
+    const code = typeof (error as { code?: unknown } | null)?.code === 'string'
+      && /^[A-Z0-9_-]{1,80}$/.test(String((error as { code: string }).code))
+      ? String((error as { code: string }).code) : undefined;
+    if (['SQUARE_CATALOG_OBJECT_UNAVAILABLE','SQUARE_CATALOG_RESPONSE_INVALID'].includes(code ?? '')) throw error;
+    const requestId = typeof (error as { squareRequestId?: unknown } | null)?.squareRequestId === 'string'
+      && /^[A-Za-z0-9-]{1,120}$/.test(String((error as { squareRequestId: string }).squareRequestId))
+      ? String((error as { squareRequestId: string }).squareRequestId) : undefined;
+    console.error('Square catalog management failed', { status, code, squareRequestId: requestId });
+    if (status === 401) throw codedError('SQUARE_RECONNECT_REQUIRED');
+    if (status === 403) throw codedError('SQUARE_CATALOG_WRITE_PERMISSION_REQUIRED');
+    if (status === 404) throw codedError('SQUARE_CATALOG_OBJECT_UNAVAILABLE');
+    if (status === 409) throw codedError('SQUARE_CATALOG_CONFLICT');
+    if (status === 429) throw codedError('SQUARE_CATALOG_BUSY');
+    throw codedError('SQUARE_CATALOG_WRITE_FAILED');
+  }
+}
+
+async function createSquareCatalogProductForOrganization(args: {
+  organizationId: string; idempotencyKey: string; name: string; description: string;
+  variations: Array<{ name: string; sku: string; pricingType: string; priceMinor: number | null; currency: string | null }>;
+}, adapters: ReturnType<typeof createSupabaseAdapters>) {
+  return withSquareCatalogWrite(args.organizationId, adapters, client => createSquareCatalogProductEntry({ client,
+    idempotencyKey: args.idempotencyKey, name: args.name, description: args.description, variations: args.variations }));
+}
+
+async function manageSquareCatalogItemForOrganization(args: {
+  organizationId: string; idempotencyKey: string; action: string; squareItemId: string;
+  squareCatalogObjectId?: string; name?: string; description?: string; variationName?: string;
+  sku?: string; pricingType?: string; priceMinor?: number | null; currency?: string;
+}, adapters: ReturnType<typeof createSupabaseAdapters>) {
+  return withSquareCatalogWrite(args.organizationId, adapters, async client => {
+    const variation = { client, idempotencyKey: args.idempotencyKey, itemId: args.squareItemId,
+      variationName: args.variationName ?? '', sku: args.sku ?? '', pricingType: args.pricingType ?? '',
+      priceMinor: args.priceMinor ?? null, currency: args.currency ?? '' };
+    if (args.action === 'update_item') return updateSquareCatalogItem({ client, idempotencyKey: args.idempotencyKey,
+      itemId: args.squareItemId, name: args.name ?? '', description: args.description ?? '' });
+    if (args.action === 'update_variation') return updateSquareCatalogVariation({ ...variation,
+      variationId: args.squareCatalogObjectId ?? '' });
+    if (args.action === 'add_variation') return addSquareCatalogVariation(variation);
+    if (args.action === 'archive' || args.action === 'restore') return setSquareCatalogItemArchived({ client,
+      idempotencyKey: args.idempotencyKey, itemId: args.squareItemId, archived: args.action === 'archive' });
+    throw codedError('SQUARE_CATALOG_WRITE_FAILED');
+  });
+}
+
 function handlers() {
   const squareEnvironment = process.env.SQUARE_ENVIRONMENT;
   const adapters = createSupabaseAdapters({
@@ -170,7 +255,11 @@ function handlers() {
   });
   const route = createHandlers({
     ...adapters,
-    squareCatalog: { createItem: (args: Parameters<typeof createSquareCatalogItemForOrganization>[0]) => createSquareCatalogItemForOrganization(args, adapters) },
+    squareCatalog: {
+      createItem: (args: Parameters<typeof createSquareCatalogItemForOrganization>[0]) => createSquareCatalogItemForOrganization(args, adapters),
+      createProduct: (args: Parameters<typeof createSquareCatalogProductForOrganization>[0]) => createSquareCatalogProductForOrganization(args, adapters),
+      manageItem: (args: Parameters<typeof manageSquareCatalogItemForOrganization>[0]) => manageSquareCatalogItemForOrganization(args, adapters),
+    },
     listSquareLocations: ({ organizationId }: { organizationId: string }) => listActiveSquareLocations(organizationId, adapters),
     engine: { replayAccounting },
     config: {
@@ -241,6 +330,8 @@ async function dispatch(request: Request) {
   if (resource === 'inventory' && id === 'openings' && method === 'POST') return route.inventoryOpening(request);
   if (resource === 'inventory' && id === 'items' && method === 'POST') return route.inventoryItem(request);
   if (resource === 'inventory' && id === 'catalog-items' && method === 'POST') return route.squareCatalogItem(request);
+  if (resource === 'square' && id === 'catalog-items' && method === 'POST') return route.squareCatalogCreate(request);
+  if (resource === 'square' && id === 'catalog-items' && method === 'PATCH') return route.squareCatalogManage(request);
   if (resource === 'analytics' && method === 'GET') return route.analytics(request);
   if (resource === 'evidence' && !id && method === 'POST') return route.evidence(request);
   if (resource === 'evidence' && !id && method === 'GET') return route.evidenceUrl(request);
@@ -252,3 +343,4 @@ async function dispatch(request: Request) {
 
 export const GET = dispatch;
 export const POST = dispatch;
+export const PATCH = dispatch;

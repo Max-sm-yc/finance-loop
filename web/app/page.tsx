@@ -15,9 +15,11 @@ type ReceiptDraft = { supplier: string | null; invoiceDate: string | null; curre
 type ReceiptDraftLineInput = ReceiptDraftLine & { itemId: string; unitCostText: string; unitsPerSquareItemText: string; catalogSearchText: string };
 type ReceiptCatalogCandidate = { catalogObjectId: string; name: string; sku: string | null; currency: string };
 type AnalyticsProduct = { productId: string; productName?: string | null; unitsSold: number; revenueMinor: number | null; costMinor: number | null; netMinor: number | null; grossMinor?: number | null; discountMinor?: number | null; refundsMinor?: number | null; revenueRank?: number | null; netRank?: number | null; revenueShareBps?: number | null; marginBps?: number | null; dailySales?: Array<{ period: string; revenueMinor: number | null }>; sourceRefs?: string[] };
-type AnalyticsCatalogItem = { id: string; itemName: string; variationName?: string | null; sku?: string | null; currency?: string | null; sellingPriceMinor: number | null; pricingType?: string | null; unitCostMinor: number | null; costEffectiveFrom?: string | null; itemKind: 'square' | 'supply' };
+type AnalyticsCatalogItem = { id: string; squareItemId?: string | null; itemName: string; variationName?: string | null; description?: string | null; sku?: string | null; currency?: string | null; sellingPriceMinor: number | null; pricingType?: string | null; unitCostMinor: number | null; costEffectiveFrom?: string | null; archived?: boolean; itemKind: 'square' | 'supply' };
 type AnalyticsSeries = { period: string; revenueMinor: number | null; costMinor: number | null; feesMinor: number | null; netMinor: number | null; unitsSold: number };
 type AnalyticsReport = { calculationVersion: string; status: string; currency: string | null; sourceRevision?: number | null; products: AnalyticsProduct[]; catalogItems?: AnalyticsCatalogItem[]; catalogStatus?: 'available' | 'unavailable'; totals: { revenueMinor: number | null; costMinor: number | null; netMinor: number | null; feesMinor: number | null; refundsMinor: number | null }; unallocated: { revenueMinor: number | null; refundsMinor: number | null; feesMinor: number | null; cogsReversalMinor?: number | null }; issues: Array<{ code: string; sourceRefs?: string[] }>; daily?: AnalyticsSeries[]; monthly?: AnalyticsSeries[] };
+type CatalogVariationDraft = { name: string; sku: string; pricingType: 'FIXED_PRICING' | 'VARIABLE_PRICING'; price: string; currency: string };
+type CatalogDialogMode = 'create' | 'edit_item' | 'edit_variation' | 'add_variation' | 'cost' | 'archive' | 'restore';
 const UUID_INPUT = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 type Organization = { id: string; name: string; base_currency?: string; timezone?: string; role?: string };
 type IssueEvidence = { id: string; type?: 'sale_line' | 'refund'; occurred_at?: string; currency?: string; quantity?: string | number; amount_minor?: string | number; gross_minor?: string | number; unit_price_minor?: string | number; discount_minor?: string | number; catalog_object_id?: string | null; item_name?: string | null; provider_object_id?: string; line_id?: string; refund_id?: string; order_id?: string; status?: string };
@@ -268,7 +270,7 @@ export default function Home() {
           {page === 'income' && <Income dashboard={dashboard} currency={currency} />}
           {page === 'income' && <GiftCardSummary income={dashboard.income} currency={currency} />}
           {page === 'cash' && <Cash key={organizationId} dashboard={dashboard} currency={currency} movements={movements} accounts={dashboard.accounts ?? []} accountId={accountId} organizationId={organizationId} inventoryEnabled={features.inventoryTracking} canManageSquareCatalog={organizations.find(org => org.id === organizationId)?.role === 'owner'} canAuthorizeSquareCatalog={organizations.find(org => org.id === organizationId)?.role === 'owner'} onAccount={setAccountId} onSaved={() => void load()} />}
-          {page === 'analytics' && features.productAnalytics && <Analytics key={organizationId} organizationId={organizationId} from={zonedMidnight(from, reportTimezone)} to={zonedMidnight(nextDate(to), reportTimezone)} currency={currency} />}
+          {page === 'analytics' && features.productAnalytics && <Analytics key={organizationId} organizationId={organizationId} from={zonedMidnight(from, reportTimezone)} to={zonedMidnight(nextDate(to), reportTimezone)} currency={currency} timezone={reportTimezone} role={organizations.find(org => org.id === organizationId)?.role ?? 'read_only'} />}
           {page === 'review' && <Review issues={openIssues} organizationId={organizationId} currency={currency} onSaved={() => void load()} />}
           {page === 'ledger' && <Ledger events={events} />}
           {page === 'settings' && <Settings dashboard={dashboard} accountId={accountId} onAccount={setAccountId} />}
@@ -613,8 +615,24 @@ function InventoryPanel({ organizationId, accountId, currency, timezone, account
     {snapshot?.balances?.length ? <section className="panel"><div className="panel-heading"><div><h3>Stock on hand</h3><p>Calculated from recorded openings, purchases, corrections, and completed sales.</p></div><span className={`pill ${snapshot.status === 'complete' ? 'good' : 'warn'}`}>{snapshot.status ?? 'incomplete'}</span></div>{snapshot.issues?.length ? <div className="notice compact-notice">Inventory needs review: {Array.from(new Set(snapshot.issues.map(issue => issue.code))).join(', ')}</div> : null}<div className="table-wrap"><table><thead><tr><th>Item</th><th>Currency</th><th className="numeric">Units</th></tr></thead><tbody>{snapshot.balances.map(balance => <tr key={balance.itemDefinitionId}><td>{balance.itemName}</td><td>{balance.currency}</td><td className="numeric">{balance.quantity ?? 'Unknown'}</td></tr>)}</tbody></table></div></section> : null}{error && !mode && <p className="error" role="alert">{error}</p>}{loading ? <div className="inline-empty">Loading inventory…</div> : rows.length ? <div className="table-wrap"><table><thead><tr><th>Date</th><th>Item</th><th className="numeric">Change</th><th>Type</th><th>Reason</th></tr></thead><tbody>{rows.map(row => <tr key={row.id}><td>{date(row.occurred_at)}</td><td>{row.item_name}</td><td className="numeric">{row.quantity_delta > 0 ? '+' : ''}{row.quantity_delta}</td><td>{(row.movement_type ?? 'movement').replaceAll('_', ' ')}</td><td>{row.reason ?? '—'}</td></tr>)}</tbody></table></div> : !loading && <div className="inline-empty">No inventory movements in this period. Existing item definitions appear here after their first recorded movement.</div>}
   </section>;
 }
-function Analytics({ organizationId, from, to, currency }: { organizationId: string; from: string; to: string; currency: string }) {
+function Analytics({ organizationId, from, to, currency, timezone, role }: { organizationId: string; from: string; to: string; currency: string; timezone: string; role: string }) {
   const [report, setReport] = useState<AnalyticsReport | null>(null), [error, setError] = useState(''), [loading, setLoading] = useState(false), [search, setSearch] = useState(''), [catalogSearch, setCatalogSearch] = useState(''), [sortBy, setSortBy] = useState<'revenue' | 'cost' | 'net' | 'units'>('revenue'), [seriesView, setSeriesView] = useState<'monthly' | 'daily'>('monthly'), [selectedProductId, setSelectedProductId] = useState('');
+  const [catalogView, setCatalogView] = useState<'active' | 'archived' | 'all'>('active');
+  const [catalogMode, setCatalogMode] = useState<CatalogDialogMode | null>(null);
+  const [catalogTarget, setCatalogTarget] = useState<AnalyticsCatalogItem | null>(null);
+  const [catalogName, setCatalogName] = useState(''), [catalogDescription, setCatalogDescription] = useState('');
+  const [catalogVariations, setCatalogVariations] = useState<CatalogVariationDraft[]>([]);
+  const [catalogVariationName, setCatalogVariationName] = useState(''), [catalogSku, setCatalogSku] = useState('');
+  const [catalogPricingType, setCatalogPricingType] = useState<'FIXED_PRICING' | 'VARIABLE_PRICING'>('FIXED_PRICING');
+  const [catalogPrice, setCatalogPrice] = useState(''), [catalogCurrency, setCatalogCurrency] = useState(currency);
+  const [catalogCost, setCatalogCost] = useState(''), [catalogCostDate, setCatalogCostDate] = useState(new Date().toISOString().slice(0, 10));
+  const [catalogEvidence, setCatalogEvidence] = useState<File | null>(null), [catalogEvidenceRef, setCatalogEvidenceRef] = useState('');
+  const [catalogReason, setCatalogReason] = useState(''), [catalogSaving, setCatalogSaving] = useState(false);
+  const [catalogError, setCatalogError] = useState(''), [catalogNotice, setCatalogNotice] = useState('');
+  const [catalogReconnectNeeded, setCatalogReconnectNeeded] = useState(false);
+  const catalogPending = useRef<{ fingerprint: string; key: string; evidenceId?: string } | null>(null);
+  const canManageCatalog = role === 'owner';
+  const canManageCosts = role === 'owner' || role === 'reviewer';
   useEffect(() => {
     let active = true; setLoading(true); setError(''); setReport(null); setSelectedProductId('');
     const query = new URLSearchParams({ organizationId, from, to, currency });
@@ -623,13 +641,152 @@ function Analytics({ organizationId, from, to, currency }: { organizationId: str
       .finally(() => { if (active) setLoading(false); });
     return () => { active = false; };
   }, [organizationId, from, to, currency]);
+  async function reloadCatalog() {
+    const query = new URLSearchParams({ organizationId, from, to, currency });
+    const result = await api<{ analytics: AnalyticsReport }>(`/api/analytics?${query}`);
+    setReport(result.analytics);
+  }
+  function openCatalogDialog(mode: CatalogDialogMode, item?: AnalyticsCatalogItem) {
+    setCatalogMode(mode); setCatalogTarget(item ?? null); setCatalogError(''); setCatalogNotice(''); setCatalogReason(''); setCatalogReconnectNeeded(false);
+    setCatalogEvidence(null); setCatalogEvidenceRef(''); catalogPending.current = null;
+    setCatalogName(item?.itemName ?? ''); setCatalogDescription(item?.description ?? '');
+    setCatalogVariationName(item?.variationName ?? 'Regular'); setCatalogSku(item?.sku ?? '');
+    setCatalogPricingType(item?.pricingType === 'VARIABLE_PRICING' ? 'VARIABLE_PRICING' : 'FIXED_PRICING');
+    setCatalogPrice(item?.sellingPriceMinor == null ? '' : minorInput(item.sellingPriceMinor, item.currency ?? currency));
+    setCatalogCurrency(item?.currency ?? currency);
+    setCatalogCost(item?.unitCostMinor == null ? '' : minorInput(item.unitCostMinor, item.currency ?? currency));
+    setCatalogCostDate(new Date().toISOString().slice(0, 10));
+    setCatalogVariations([{ name: '', sku: '', pricingType: 'FIXED_PRICING', price: '', currency }]);
+  }
+  function closeCatalogDialog() {
+    if (catalogSaving) return;
+    setCatalogMode(null); setCatalogTarget(null); setCatalogError(''); setCatalogEvidence(null); catalogPending.current = null;
+  }
   const visibleProducts = (report?.products ?? []).filter(product => `${product.productName ?? ''} ${product.productId}`.toLowerCase().includes(search.toLowerCase())).sort((a, b) => {
     const value = (p: AnalyticsProduct) => sortBy === 'cost' ? p.costMinor : sortBy === 'net' ? p.netMinor : sortBy === 'units' ? p.unitsSold : p.revenueMinor;
     const av = value(a), bv = value(b); return av == null ? 1 : bv == null ? -1 : bv - av || a.productId.localeCompare(b.productId);
   });
-  const visibleCatalogItems = (report?.catalogItems ?? []).filter(item => `${item.itemName} ${item.variationName ?? ''} ${item.sku ?? ''} ${item.id}`.toLowerCase().includes(catalogSearch.toLowerCase()));
+  const allCatalogItems = report?.catalogItems ?? [];
+  const activeCatalogCount = allCatalogItems.filter(item => item.archived !== true).length;
+  const archivedCatalogCount = allCatalogItems.filter(item => item.archived === true).length;
+  const visibleCatalogItems = allCatalogItems.filter(item => catalogView === 'all' || (catalogView === 'archived' ? item.archived === true : item.archived !== true))
+    .filter(item => `${item.itemName} ${item.variationName ?? ''} ${item.sku ?? ''} ${item.id}`.toLowerCase().includes(catalogSearch.toLowerCase()));
   const selectedProduct = report?.products.find(product => product.productId === selectedProductId);
   const feeHealthIncomplete = report?.issues.some(issue => issue.code === 'PROCESSING_FEE_INCOMPLETE') ?? false;
+  async function authorizeSquareCatalog() {
+    if (!canManageCatalog) return;
+    setCatalogSaving(true); setCatalogError(''); setCatalogReconnectNeeded(false);
+    try {
+      const result = await api<{ authorizationUrl: string }>('/api/square/oauth/start', {
+        method: 'POST', body: JSON.stringify({ organizationId, catalogWrite: true }),
+      });
+      window.location.assign(result.authorizationUrl);
+    } catch (err) {
+      setCatalogError(err instanceof Error ? err.message : 'Square authorization could not start.');
+      setCatalogSaving(false);
+    }
+  }
+  async function saveCatalogAction(event: FormEvent) {
+    event.preventDefault(); setCatalogError('');
+    if (!catalogMode) return;
+    const reason = catalogReason.trim();
+    if (reason.length < 10) { setCatalogError('Explain the item change in at least 10 characters.'); return; }
+    const target = catalogTarget;
+    let requestPath = '/api/square/catalog-items', method: 'POST' | 'PATCH' = 'PATCH', payload: Record<string, unknown>;
+    if (catalogMode === 'create') {
+      if (!catalogName.trim() || catalogName.trim().length > 200 || catalogVariations.length < 1) { setCatalogError('Enter an item name and at least one variation.'); return; }
+      const variations = [] as Array<Record<string, unknown>>;
+      for (const variation of catalogVariations) {
+        const fixedPrice = variation.pricingType === 'FIXED_PRICING' ? parseMinor(variation.price, variation.currency) : null;
+        if (!variation.name.trim() || variation.name.trim().length > 200 || variation.sku.trim().length > 100
+            || (variation.pricingType === 'FIXED_PRICING' && (fixedPrice === null || fixedPrice < 0))) {
+          setCatalogError('Each variation needs a name and a valid fixed price, or variable pricing.'); return;
+        }
+        variations.push({ name: variation.name.trim(), sku: variation.sku.trim(), pricingType: variation.pricingType,
+          priceMinor: fixedPrice, currency: variation.currency });
+      }
+      payload = { organizationId, name: catalogName.trim(), description: catalogDescription.trim(), variations, reason };
+      method = 'POST';
+    } else if (!target?.squareItemId) {
+      setCatalogError('This item is missing its Square item link. Refresh the catalogue and try again.'); return;
+    } else if (catalogMode === 'edit_item') {
+      if (!catalogName.trim() || catalogName.trim().length > 200 || catalogDescription.length > 4096) { setCatalogError('Enter a valid item name and description.'); return; }
+      payload = { organizationId, action: 'update_item', squareItemId: target.squareItemId,
+        name: catalogName.trim(), description: catalogDescription.trim(), reason };
+    } else if (catalogMode === 'edit_variation' || catalogMode === 'add_variation') {
+      const fixedPrice = catalogPricingType === 'FIXED_PRICING' ? parseMinor(catalogPrice, catalogCurrency) : null;
+      if (!catalogVariationName.trim() || catalogVariationName.trim().length > 200 || catalogSku.trim().length > 100
+          || (catalogPricingType === 'FIXED_PRICING' && (fixedPrice === null || fixedPrice < 0))) {
+        setCatalogError('Enter a variation name and a valid fixed price, or select variable pricing.'); return;
+      }
+      payload = { organizationId, action: catalogMode === 'add_variation' ? 'add_variation' : 'update_variation',
+        squareItemId: target.squareItemId, ...(catalogMode === 'edit_variation' ? { squareCatalogObjectId: target.id } : {}),
+        variationName: catalogVariationName.trim(), sku: catalogSku.trim(), pricingType: catalogPricingType,
+        priceMinor: fixedPrice, currency: catalogCurrency, reason };
+    } else if (catalogMode === 'cost') {
+      const unitCostMinor = parseMinor(catalogCost, target.currency ?? currency);
+      const effectiveFrom = /^\d{4}-\d\d-\d\d$/.test(catalogCostDate) ? zonedMidnight(catalogCostDate, timezone) : '';
+      if (unitCostMinor === null || unitCostMinor < 0 || !effectiveFrom || !Number.isFinite(Date.parse(effectiveFrom))) {
+        setCatalogError('Enter a valid acquisition cost and effective date.'); return;
+      }
+      if (!catalogEvidence && !UUID_INPUT.test(catalogEvidenceRef.trim())) { setCatalogError('Attach supplier evidence or enter an existing evidence ID.'); return; }
+      requestPath = '/api/inventory/receipt-costs'; method = 'POST';
+      payload = { organizationId, evidenceRef: catalogEvidenceRef.trim(), reason,
+        updates: [{ catalogObjectId: target.id, name: target.itemName, unitCostMinor,
+          currency: target.currency ?? currency, effectiveFrom }] };
+    } else {
+      payload = { organizationId, action: catalogMode, squareItemId: target.squareItemId, reason };
+    }
+    const evidenceKey = catalogEvidence ? `${catalogEvidence.name}:${catalogEvidence.size}:${catalogEvidence.lastModified}` : catalogEvidenceRef.trim();
+    const fingerprint = JSON.stringify([catalogMode, payload, evidenceKey]);
+    if (!catalogPending.current || catalogPending.current.fingerprint !== fingerprint) {
+      catalogPending.current = { fingerprint, key: crypto.randomUUID() };
+    }
+    setCatalogSaving(true); setCatalogReconnectNeeded(false);
+    try {
+      if (catalogMode === 'cost') {
+        if (!catalogPending.current.evidenceId) {
+          if (catalogEvidence) {
+            const upload = new FormData(); upload.set('organizationId', organizationId); upload.set('file', catalogEvidence);
+            const saved = await api<{ evidence: { id: string } }>('/api/evidence', { method: 'POST', body: upload });
+            catalogPending.current.evidenceId = saved.evidence.id;
+          } else catalogPending.current.evidenceId = catalogEvidenceRef.trim();
+        }
+        (payload as { evidenceRef: string }).evidenceRef = catalogPending.current.evidenceId!;
+      }
+      const result = await api<{ projectionQueued?: boolean }>(requestPath, {
+        method, headers: { 'Idempotency-Key': catalogPending.current.key }, body: JSON.stringify(payload),
+      });
+      catalogPending.current = null; setCatalogMode(null); setCatalogTarget(null); setCatalogEvidence(null);
+      const notices: Record<CatalogDialogMode, string> = {
+        create: 'Item and variations were added to the Square catalogue. Add an evidence-backed cost when you have supplier records.',
+        edit_item: 'Item details were updated in Square.', edit_variation: 'Variation details were updated in Square.',
+        add_variation: 'Variation was added to Square.', cost: result.projectionQueued ? 'Approved cost saved. A historical projection replay is queued.' : 'Approved cost saved.',
+        archive: 'Item archived. Its historical sales and item IDs remain available.', restore: 'Item restored to the active catalogue.',
+      };
+      setCatalogNotice(notices[catalogMode]);
+      try { await reloadCatalog(); }
+      catch { setCatalogError('The change was saved, but the catalogue could not refresh. Refresh the page to see it.'); }
+    } catch (err) {
+      const code = err instanceof Error ? err.message : '';
+      setCatalogReconnectNeeded(['SQUARE_NOT_CONNECTED','SQUARE_RECONNECT_REQUIRED','SQUARE_CATALOG_WRITE_PERMISSION_REQUIRED'].includes(code));
+      const messages: Record<string, string> = {
+        SQUARE_NOT_CONNECTED: 'Connect Square before changing the catalogue.',
+        SQUARE_RECONNECT_REQUIRED: 'Square authorization needs renewal. Reconnect it to continue.',
+        SQUARE_CATALOG_WRITE_PERMISSION_REQUIRED: 'Square item write access is needed. Reauthorize Square to grant it.',
+        SQUARE_CATALOG_CONFLICT: 'This item changed in Square after it was loaded. Refresh the catalogue and try again.',
+        SQUARE_CATALOG_BUSY: 'Square is processing another catalogue update. Wait a moment, then retry.',
+        SQUARE_CATALOG_OBJECT_UNAVAILABLE: 'Square could not find this item. Refresh the catalogue and try again.',
+        SQUARE_CATALOG_VARIATION_LIMIT: 'Square items support a maximum of 250 variations.',
+        SQUARE_CATALOG_SAVED_REFRESH_PENDING: 'Square saved the change, but Finance Loop could not refresh the historical item facts. Retry this same change or ask an owner to check the connection.',
+        SQUARE_CATALOG_SAVED_AUDIT_PENDING: 'Square saved the change, but Finance Loop could not record its audit event. Retry this same change so the audit can finish.',
+        RECEIPT_COST_APPROVAL_FAILED: 'Cost approval failed. Check the evidence, effective date, and your reviewer role.',
+        RECEIPT_COST_SAVED_REPLAY_PENDING: 'The cost was saved, but the historical replay could not be queued. Retry the same approval.',
+        RECEIPT_COST_DATE_OUTSIDE_REPLAY_WINDOW: 'That cost effective date is outside the supported historical replay window.',
+      };
+      setCatalogError(messages[code] ?? (code === 'INTERNAL_ERROR' ? 'The change failed unexpectedly. Your form is still here; retry once.' : code || 'Catalogue change could not be saved.'));
+    } finally { setCatalogSaving(false); }
+  }
   function exportCsv() {
     if (!report) return;
     const rows: unknown[][] = [['Period from', from], ['Period to', to], ['Requested currency', currency], ['Reported currency', report.currency ?? 'Mixed or unavailable'], ['Calculation version', report.calculationVersion], ['Calculation status', report.status], ['Source revision', report.sourceRevision ?? 'unavailable'], ['Aggregate Square processing fees', report.totals.feesMinor ?? 'incomplete'], ['Aggregate net after fees', report.totals.netMinor ?? 'incomplete'], ['Product result basis', 'Net and margin before processing fees'], [], ['Product','Product ID','Units sold','Revenue minor','Cost minor','Net before fees minor','Revenue rank','Net rank','Margin before fees bps','Source refs','Status'], ...report.products.map(p => [p.productName ?? 'Unidentified product', p.productId, p.unitsSold, p.revenueMinor, p.costMinor ?? '', p.netMinor ?? '', p.revenueRank ?? '', p.netRank ?? '', p.marginBps ?? '', p.sourceRefs?.join('|') ?? '', p.netMinor == null ? 'incomplete' : 'complete']), ['Unallocated revenue','','',report.unallocated.revenueMinor,'','','','','','','review'], ['Unallocated refunds','','',report.unallocated.refundsMinor,'','','','','','','review'], ['Unallocated COGS reversals','','','',report.unallocated.cogsReversalMinor ?? '','','','','','','review']];
@@ -637,10 +794,27 @@ function Analytics({ organizationId, from, to, currency }: { organizationId: str
     const href = URL.createObjectURL(new Blob([csv], { type: 'text/csv;charset=utf-8' })); const link = document.createElement('a'); link.href = href; link.download = `product-analytics-${from.slice(0,10)}-${to.slice(0,10)}.csv`; link.click(); URL.revokeObjectURL(href);
   }
   return <><section className="metric-grid"><Card label="Product revenue" value={money(report?.totals?.revenueMinor, currency)} hint="After known discounts and refunds" /><Card label="Product cost" value={money(report?.totals?.costMinor, currency)} hint={report?.totals?.costMinor == null ? 'Incomplete where cost evidence is missing' : 'Effective approved acquisition costs'} tone={report?.totals?.costMinor == null ? 'warn-text' : ''} /><Card label="Square processing fees" value={money(report?.totals?.feesMinor, currency)} hint={report?.totals?.feesMinor == null ? 'Incomplete source fee data' : feeHealthIncomplete ? 'Known fees; source health incomplete' : 'Deducted after product margins'} tone={report?.totals?.feesMinor == null ? 'warn-text' : feeHealthIncomplete ? 'warn-text' : ''} /><Card label="Net after fees" value={money(report?.totals?.netMinor, currency)} hint={feeHealthIncomplete && report?.totals?.netMinor != null ? 'Calculated from available fees; source health incomplete' : 'Product revenue − COGS − processing fees'} tone={feeHealthIncomplete ? 'warn-text' : report?.totals?.netMinor == null ? 'warn-text' : ''} /></section>
-    <section className="panel table-panel"><div className="panel-heading"><div><h2>Item catalog and pricing</h2><p>Latest synced Square selling prices and currently effective approved unit acquisition costs. Values retain each item’s currency.</p></div><span className="pill neutral">{report?.catalogStatus === 'unavailable' ? 'Unavailable' : `${report?.catalogItems?.length ?? 0} items`}</span></div>
-      <div className="filter-panel"><label>Find item<input type="search" value={catalogSearch} onChange={e => setCatalogSearch(e.target.value)} placeholder="Name, variation, SKU, or ID" /></label></div>
-      {loading ? <div className="inline-empty">Loading item catalog…</div> : report?.catalogStatus === 'unavailable' ? <div className="inline-empty">Item catalog pricing could not be loaded. Product performance data is still available.</div> : visibleCatalogItems.length ? <div className="table-wrap"><table><thead><tr><th>Item</th><th>SKU</th><th>Currency</th><th className="numeric">Selling price</th><th className="numeric">Approved unit cost</th></tr></thead><tbody>{visibleCatalogItems.map(item => <tr key={`${item.itemKind}:${item.id}:${item.currency ?? ''}`}><td>{item.itemName}<small className="cell-sub">{item.variationName ? `Variation: ${item.variationName}` : item.itemKind === 'supply' ? 'Manual supply item' : 'Square catalog item'}</small></td><td>{item.sku ?? '—'}</td><td>{item.currency ?? '—'}</td><td className="numeric">{item.itemKind === 'supply' ? 'Not applicable' : item.sellingPriceMinor == null ? item.pricingType === 'VARIABLE_PRICING' ? 'Variable price' : 'Not available' : money(item.sellingPriceMinor, item.currency ?? currency)}</td><td className="numeric">{item.itemKind === 'supply' ? 'Not tracked' : item.unitCostMinor == null ? <span className="pill warn">Cost unavailable</span> : <>{money(item.unitCostMinor, item.currency ?? currency)}{item.costEffectiveFrom && <small className="cell-sub">Effective {item.costEffectiveFrom.slice(0, 10)}</small>}</>}</td></tr>)}</tbody></table></div> : !error ? <div className="inline-empty">{report?.catalogItems?.length ? 'No items match this search.' : 'No synced Square items or registered supplies are available.'}</div> : null}
+    <section className="panel table-panel"><div className="panel-heading"><div><h2>Item catalog and pricing</h2><p>Manage Square items, sale variations, archive status, and evidence-backed costs from Zythe. Past sales keep their original item IDs.</p></div><span className="pill neutral">{report?.catalogStatus === 'unavailable' ? 'Unavailable' : `${activeCatalogCount} active · ${archivedCatalogCount} archived`}</span></div>
+      <div className="catalog-toolbar"><div className="catalog-tabs" role="group" aria-label="Catalogue status filter"><button type="button" className={catalogView === 'active' ? 'catalog-tab selected' : 'catalog-tab'} aria-pressed={catalogView === 'active'} onClick={() => setCatalogView('active')}>Active <span>{activeCatalogCount}</span></button><button type="button" className={catalogView === 'archived' ? 'catalog-tab selected' : 'catalog-tab'} aria-pressed={catalogView === 'archived'} onClick={() => setCatalogView('archived')}>Archived <span>{archivedCatalogCount}</span></button><button type="button" className={catalogView === 'all' ? 'catalog-tab selected' : 'catalog-tab'} aria-pressed={catalogView === 'all'} onClick={() => setCatalogView('all')}>All <span>{allCatalogItems.length}</span></button></div><label>Find item<input type="search" value={catalogSearch} onChange={e => setCatalogSearch(e.target.value)} placeholder="Name, variation, SKU, or ID" /></label>{canManageCatalog && <button type="button" className="primary" onClick={() => openCatalogDialog('create')}>＋ Add item</button>}</div>
+      {catalogNotice && <div className="notice" role="status">{catalogNotice}</div>}{catalogError && !catalogMode && <div className="notice error-box" role="alert">{catalogError}</div>}
+      {catalogReconnectNeeded && canManageCatalog && <button type="button" className="secondary" onClick={() => void authorizeSquareCatalog()} disabled={catalogSaving}>Connect or reauthorize Square</button>}
+      {loading ? <div className="inline-empty">Loading item catalog…</div> : report?.catalogStatus === 'unavailable' ? <div className="inline-empty">Item catalog pricing could not be loaded. Product performance data is still available.</div> : visibleCatalogItems.length ? <div className="table-wrap"><table><thead><tr><th>Item</th><th>SKU</th><th>Currency</th><th className="numeric">Selling price</th><th className="numeric">Approved unit cost</th><th>Manage</th></tr></thead><tbody>{visibleCatalogItems.map((item, index) => {
+        const firstForItem = item.itemKind === 'square' && Boolean(item.squareItemId)
+          && !visibleCatalogItems.slice(0, index).some(previous => previous.squareItemId === item.squareItemId);
+        return <tr key={`${item.itemKind}:${item.id}:${item.currency ?? ''}`}><td>{item.itemName}{item.archived && <span className="pill neutral catalog-state">Archived</span>}<small className="cell-sub">{item.variationName ? `Variation: ${item.variationName}` : item.itemKind === 'supply' ? 'Manual supply item' : 'Square catalog item'}{item.description && firstForItem ? ` · ${item.description}` : ''}</small></td><td>{item.sku ?? '—'}</td><td>{item.currency ?? '—'}</td><td className="numeric">{item.itemKind === 'supply' ? 'Not applicable' : item.sellingPriceMinor == null ? item.pricingType === 'VARIABLE_PRICING' ? 'Variable price' : 'Not available' : money(item.sellingPriceMinor, item.currency ?? currency)}</td><td className="numeric">{item.itemKind === 'supply' ? 'Not tracked' : item.unitCostMinor == null ? <span className="pill warn">Cost unavailable</span> : <>{money(item.unitCostMinor, item.currency ?? currency)}{item.costEffectiveFrom && <small className="cell-sub">Effective {item.costEffectiveFrom.slice(0, 10)}</small>}</>}</td><td><div className="catalog-actions">{item.itemKind === 'square' && canManageCatalog && <>{firstForItem && <><button type="button" className="secondary" onClick={() => openCatalogDialog('edit_item', item)}>Edit item</button><button type="button" className="secondary" onClick={() => openCatalogDialog('add_variation', item)}>Add variation</button><button type="button" className="secondary" onClick={() => openCatalogDialog(item.archived ? 'restore' : 'archive', item)}>{item.archived ? 'Restore item' : 'Archive item'}</button></>}<button type="button" className="secondary" onClick={() => openCatalogDialog('edit_variation', item)}>Edit variation</button></>}{item.itemKind === 'square' && canManageCosts && <button type="button" className="secondary" onClick={() => openCatalogDialog('cost', item)}>{item.unitCostMinor == null ? 'Add cost' : 'Update cost'}</button>}</div></td></tr>;
+      })}</tbody></table></div> : !error ? <div className="inline-empty">{allCatalogItems.length ? 'No items match this filter.' : 'No synced Square items or registered supplies are available.'}</div> : null}
     </section>
+    {catalogMode && <div className="dialog-backdrop" role="presentation"><section className="dialog catalog-dialog" role="dialog" aria-modal="true" aria-labelledby="catalog-dialog-title"><button type="button" className="icon-button dialog-close" onClick={closeCatalogDialog} disabled={catalogSaving} aria-label="Close catalogue editor">×</button><h2 id="catalog-dialog-title">{{ create: 'Add catalogue item', edit_item: 'Edit item details', edit_variation: 'Edit variation', add_variation: 'Add variation', cost: 'Approve item cost', archive: 'Archive item', restore: 'Restore item' }[catalogMode]}</h2>
+      <form className="entry-form" onSubmit={saveCatalogAction}>
+        {catalogMode === 'create' && <><label>Item name<input required maxLength={200} value={catalogName} onChange={event => setCatalogName(event.target.value)} /></label><label>Description (optional)<textarea rows={3} maxLength={4096} value={catalogDescription} onChange={event => setCatalogDescription(event.target.value)} /></label><div className="catalog-variation-list"><div className="catalog-section-head"><b>Sale variations</b><button type="button" className="secondary" disabled={catalogVariations.length >= 250} onClick={() => setCatalogVariations(current => [...current, { name: '', sku: '', pricingType: 'FIXED_PRICING', price: '', currency }])}>＋ Add variation</button></div>{catalogVariations.map((variation, index) => <div className="catalog-variation-draft" key={index}><label>Variation name<input required maxLength={200} value={variation.name} onChange={event => setCatalogVariations(current => current.map((row, rowIndex) => rowIndex === index ? { ...row, name: event.target.value } : row))} /></label><label>SKU<input maxLength={100} value={variation.sku} onChange={event => setCatalogVariations(current => current.map((row, rowIndex) => rowIndex === index ? { ...row, sku: event.target.value } : row))} /></label><label>Pricing<select value={variation.pricingType} onChange={event => setCatalogVariations(current => current.map((row, rowIndex) => rowIndex === index ? { ...row, pricingType: event.target.value as CatalogVariationDraft['pricingType'] } : row))}><option value="FIXED_PRICING">Fixed price</option><option value="VARIABLE_PRICING">Variable amount</option></select></label>{variation.pricingType === 'FIXED_PRICING' ? <><label>Sale price<input type="number" min="0" step="any" required value={variation.price} onChange={event => setCatalogVariations(current => current.map((row, rowIndex) => rowIndex === index ? { ...row, price: event.target.value } : row))} /></label><label>Currency<select value={variation.currency} onChange={event => setCatalogVariations(current => current.map((row, rowIndex) => rowIndex === index ? { ...row, currency: event.target.value } : row))}>{Array.from(new Set([currency, variation.currency])).map(value => <option key={value} value={value}>{value}</option>)}</select></label></> : <p className="field-hint">The customer enters the amount when this variation is sold.</p>}{catalogVariations.length > 1 && <button type="button" className="secondary" onClick={() => setCatalogVariations(current => current.filter((_, rowIndex) => rowIndex !== index))}>Remove variation</button>}</div>)}</div></>}
+        {catalogMode === 'edit_item' && <><label>Item name<input required maxLength={200} value={catalogName} onChange={event => setCatalogName(event.target.value)} /></label><label>Description (optional)<textarea rows={4} maxLength={4096} value={catalogDescription} onChange={event => setCatalogDescription(event.target.value)} /></label></>}
+        {(catalogMode === 'edit_variation' || catalogMode === 'add_variation') && <><label>Variation name<input required maxLength={200} value={catalogVariationName} onChange={event => setCatalogVariationName(event.target.value)} /></label><label>SKU<input maxLength={100} value={catalogSku} onChange={event => setCatalogSku(event.target.value)} /></label><label>Pricing<select value={catalogPricingType} onChange={event => setCatalogPricingType(event.target.value as typeof catalogPricingType)}><option value="FIXED_PRICING">Fixed price</option><option value="VARIABLE_PRICING">Variable amount</option></select></label>{catalogPricingType === 'FIXED_PRICING' ? <><label>Sale price ({catalogCurrency})<input type="number" min="0" step="any" required value={catalogPrice} onChange={event => setCatalogPrice(event.target.value)} /></label><label>Currency<select value={catalogCurrency} onChange={event => setCatalogCurrency(event.target.value)}>{Array.from(new Set([currency, catalogCurrency])).map(value => <option key={value} value={value}>{value}</option>)}</select></label></> : <p className="field-hint">The customer enters the amount when this variation is sold.</p>}</>}
+        {catalogMode === 'cost' && <><p className="muted">Approved costs affect historical COGS from the effective date. Use supplier evidence and enter the unit acquisition cost.</p><label>Approved unit acquisition cost ({catalogTarget?.currency ?? currency})<input type="number" min="0" step="any" required value={catalogCost} onChange={event => setCatalogCost(event.target.value)} /></label><label>Effective date ({timezone})<input type="date" required value={catalogCostDate} onChange={event => setCatalogCostDate(event.target.value)} /></label><label>Supplier evidence file<input type="file" accept="application/pdf,image/jpeg,image/png" onChange={event => setCatalogEvidence(event.target.files?.[0] ?? null)} /></label><label>Or existing evidence ID<input value={catalogEvidenceRef} onChange={event => setCatalogEvidenceRef(event.target.value)} maxLength={36} placeholder="Evidence UUID" /></label></>}
+        {(catalogMode === 'archive' || catalogMode === 'restore') && <p className="muted">{catalogMode === 'archive' ? 'This hides every variation of this item from the active catalogue and Square search. Historical sales continue to use the same item IDs.' : 'This returns the item and its variations to the active catalogue.'}</p>}
+        <label>Reason<textarea required minLength={10} maxLength={1000} value={catalogReason} onChange={event => setCatalogReason(event.target.value)} placeholder="Why are you changing this item?" /></label>
+        {catalogError && <p className="error" role="alert">{catalogError}</p>}{catalogReconnectNeeded && canManageCatalog && <button type="button" className="secondary" onClick={() => void authorizeSquareCatalog()} disabled={catalogSaving}>Connect or reauthorize Square</button>}
+        <div className="form-actions"><button type="button" className="secondary" onClick={closeCatalogDialog} disabled={catalogSaving}>Cancel</button><button type="submit" className="primary" disabled={catalogSaving}>{catalogSaving ? 'Saving…' : catalogMode === 'cost' ? 'Approve cost' : catalogMode === 'archive' ? 'Archive item' : catalogMode === 'restore' ? 'Restore item' : catalogMode === 'create' ? 'Create in Square' : 'Save changes'}</button></div>
+      </form></section></div>}
     <section className="panel table-panel"><div className="panel-heading"><div><h2>Product performance before fees</h2><p>Select an item name to chart its sales. Revenue, COGS and margin are before aggregate Square fees · {report?.calculationVersion ?? 'loading'} · source revision {report?.sourceRevision ?? 'unavailable'}</p></div><div className="form-actions"><span className={`pill ${report?.status === 'complete' ? 'good' : report?.status === 'failed' ? 'warn' : 'neutral'}`}>{report?.status ?? (loading ? 'Loading' : 'Unavailable')}</span><button className="secondary" onClick={exportCsv} disabled={!report}>Export CSV</button></div></div>
       {loading && <div className="inline-empty">Calculating product results…</div>}{error && <div className="notice error-box" role="alert">{error}</div>}{report?.currency == null && report?.status === 'failed' && <div className="notice error-box" role="alert">Mixed or invalid source currencies prevented a single-currency report.</div>}
       <div className="filter-panel"><label>Find product<input type="search" value={search} onChange={e => setSearch(e.target.value)} placeholder="Name or product ID" /></label><label>Rank by<select value={sortBy} onChange={e => setSortBy(e.target.value as typeof sortBy)}><option value="revenue">Revenue</option><option value="cost">Cost</option><option value="net">Net before fees</option><option value="units">Units sold</option></select></label></div>
