@@ -906,6 +906,10 @@ function ProductSalesChart({ product, from, to, currency, issues }: { product: A
 
 function Review({ issues, organizationId, currency, onSaved }: { issues: Issue[]; organizationId: string; currency: string; onSaved: () => void }) {
   const [selected, setSelected] = useState<Issue | null>(null);
+  const [issueDetails, setIssueDetails] = useState<Issue | null>(null);
+  const [issueEvidence, setIssueEvidence] = useState<IssueEvidence[]>([]);
+  const [issueEvidenceLoading, setIssueEvidenceLoading] = useState(false);
+  const [issueEvidenceError, setIssueEvidenceError] = useState('');
   const [correction, setCorrection] = useState<{ issue: Issue; kind: 'item' | 'refund' } | null>(null);
   const [reason, setReason] = useState(''); const [busyId, setBusyId] = useState(''); const [error, setError] = useState(''); const [notice, setNotice] = useState('');
   const [evidence, setEvidence] = useState<IssueEvidence[]>([]); const [evidenceLoading, setEvidenceLoading] = useState(false);
@@ -928,6 +932,16 @@ function Review({ issues, organizationId, currency, onSaved }: { issues: Issue[]
     setBusyId(issue.id); setError('');
     try { await api('/api/proposals', { method: 'POST', headers: { 'Idempotency-Key': crypto.randomUUID() }, body: JSON.stringify({ organizationId, issueId: issue.id }) }); onSaved(); }
     catch (err) { setError(err instanceof Error ? err.message : 'A proposal could not be generated.'); } finally { setBusyId(''); }
+  }
+  async function openIssue(issue: Issue) {
+    setIssueDetails(issue); setIssueEvidence([]); setIssueEvidenceError(''); setIssueEvidenceLoading(true);
+    try {
+      const query = new URLSearchParams({ organizationId });
+      const result = await api<{ evidence: IssueEvidence[] }>(`/api/issues/${encodeURIComponent(issue.id)}/evidence?${query}`);
+      setIssueEvidence(result.evidence ?? []);
+    } catch (err) {
+      setIssueEvidenceError(err instanceof Error ? err.message : 'Linked source evidence could not be loaded.');
+    } finally { setIssueEvidenceLoading(false); }
   }
   async function openCorrection(issue: Issue, kind: 'item' | 'refund') {
     setCorrection({ issue, kind }); setError(''); setNotice(''); setReason(''); setEvidence([]); setEvidenceLoading(true);
@@ -1029,6 +1043,7 @@ function Review({ issues, organizationId, currency, onSaved }: { issues: Issue[]
             {proposal && <details className="proposal-details"><summary>Proposed classification and evidence</summary><pre>{JSON.stringify(proposal.proposal ?? proposal.payload ?? proposal, null, 2)}</pre></details>}
           </div>
           <div className="form-actions review-actions">
+            <button className="secondary" onClick={() => void openIssue(issue)}>Open issue</button>
             {issue.code === 'UNKNOWN_ITEM' && <button className="secondary" disabled={busyId === issue.id} onClick={() => void openCorrection(issue, 'item')}>Record item cost</button>}
             {issue.code === 'REFUND_COGS_REVIEW' && <button className="secondary" disabled={busyId === issue.id} onClick={() => void openCorrection(issue, 'refund')}>Record refund decision</button>}
             {!['UNKNOWN_ITEM', 'REFUND_COGS_REVIEW'].includes(issue.code ?? '') && (proposal ? <button className="secondary" disabled={busyId === issue.id} onClick={() => { setSelected(issue); setReason(''); setError(''); }}>{busyId === issue.id ? 'Saving…' : 'Review proposal'}</button>
@@ -1036,6 +1051,18 @@ function Review({ issues, organizationId, currency, onSaved }: { issues: Issue[]
           </div>
         </article>;
       })}</div> : <div className="inline-empty">The API reported no open issues.</div>}
+      {issueDetails && <div className="dialog-backdrop" onMouseDown={e => { if (e.target === e.currentTarget) setIssueDetails(null); }}><section className="dialog issue-detail-dialog" role="dialog" aria-modal="true" aria-labelledby="issue-details-title">
+        <button className="icon-button dialog-close" onClick={() => setIssueDetails(null)} aria-label="Close issue details">×</button>
+        <p className="eyebrow">ISSUE DETAILS</p>
+        <h2 id="issue-details-title">{issueDetails.title ?? issueDetails.code?.replaceAll('_', ' ') ?? 'Review issue'}</h2>
+        <p className="issue-detail-state"><span className="pill warn">{issueDetails.state.replaceAll('_', ' ')}</span>{issueDetails.code && <span>{issueDetails.code}</span>}</p>
+        <dl className="issue-detail-meta"><div><dt>Issue ID</dt><dd>{issueDetails.id}</dd></div>{issueDetails.updated_at && <div><dt>Last updated</dt><dd>{date(issueDetails.updated_at)}</dd></div>}</dl>
+        {(issueDetails.details?.message || issueDetails.details?.description) && <section className="decision-context"><div className="decision-context-heading"><span>WHY THIS NEEDS REVIEW</span><strong>{String(issueDetails.details.message ?? issueDetails.details.description)}</strong></div></section>}
+        <section className="issue-detail-section"><h3>Linked source references</h3>{issueDetails.source_refs?.length ? <ul className="issue-source-refs">{issueDetails.source_refs.map((ref, index) => <li key={`${index}-${ref}`}><code>{ref}</code></li>)}</ul> : <p className="muted">No source references were attached to this issue.</p>}</section>
+        <section className="issue-detail-section"><h3>Linked source evidence</h3>{issueEvidenceLoading ? <p className="muted">Loading linked evidence…</p> : issueEvidenceError ? <p className="error" role="alert">{issueEvidenceError}</p> : issueEvidence.length ? <details className="proposal-details" open><summary>{issueEvidence.length} source record{issueEvidence.length === 1 ? '' : 's'}</summary><pre>{JSON.stringify(issueEvidence, null, 2)}</pre></details> : <p className="muted">No linked Square evidence was returned for this issue.</p>}</section>
+        <details className="proposal-details issue-record-details"><summary>Stored issue details</summary><pre>{JSON.stringify(issueDetails.details ?? {}, null, 2)}</pre></details>
+        <div className="form-actions"><button className="secondary" onClick={() => setIssueDetails(null)}>Close</button></div>
+      </section></div>}
       {selected && <div className="dialog-backdrop" onMouseDown={e => { if (e.target === e.currentTarget) setSelected(null); }}><section className="dialog" role="dialog" aria-modal="true" aria-labelledby="review-dialog-title"><button className="icon-button dialog-close" onClick={() => setSelected(null)} aria-label="Close review">×</button><p className="eyebrow">REVIEW DECISION</p><h2 id="review-dialog-title">{selected.title ?? selected.code ?? 'Review proposal'}</h2><p className="muted">This records a proposal decision. Use the source-backed correction form to update costs or refund treatment and recalculate.</p><label>Decision reason<textarea required rows={4} maxLength={1000} value={reason} onChange={e => setReason(e.target.value)} /></label><div className="form-actions"><button className="secondary" onClick={() => setSelected(null)}>Cancel</button>{(() => { const p = getProposal(selected); return <><button className="secondary reject-button" disabled={!p || !reason.trim() || busyId === selected.id} onClick={() => p && void decide(selected, p, 'reject')}>Reject</button><button className="primary" disabled={!p || !reason.trim() || busyId === selected.id} onClick={() => p && void decide(selected, p, 'approve')}>Record approval</button></>; })()}</div></section></div>}
     </section>
     {correction && <div className="dialog-backdrop" onMouseDown={e => { if (e.target === e.currentTarget) setCorrection(null); }}>

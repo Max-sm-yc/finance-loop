@@ -169,6 +169,7 @@ td small.cell-sub { display: block; margin-top: 4px; color: var(--subtle); font-
 .settings-card { margin: 0; }
 .review-list { display: grid; }
 .review-item { display: flex; align-items: flex-start; gap: 12px; padding: 14px 2px; border-top: 1px solid var(--line-soft); }
+.review-actions { flex-wrap: wrap; }
 .review-symbol { display: grid; flex: 0 0 30px; place-items: center; width: 30px; height: 30px; border-radius: 7px; color: var(--amber); background: var(--amber-soft); }
 .review-copy { flex: 1; min-width: 0; }
 .review-title { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; color: #e2e9e3; font-size: 11px; font-weight: 650; }
@@ -300,7 +301,8 @@ td small.cell-sub { display: block; margin-top: 4px; color: var(--subtle); font-
   .filter-panel select { width: 100%; }
   .item-sales-heading { flex-direction: column; }
   .review-item { gap: 8px; }
-  .review-item > .secondary { padding: 7px; }
+  .review-actions { justify-content: flex-start; }
+  .review-actions .secondary { padding: 7px; }
   .notice { display: block; }
   .notice b { display: block; margin-bottom: 3px; }
 }

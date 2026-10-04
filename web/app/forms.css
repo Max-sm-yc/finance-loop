@@ -11,6 +11,19 @@
 .field-hint { color: #849087; font-size: 11px; font-weight: 400; line-height: 1.5; }
 .dialog-backdrop { position: fixed; inset: 0; z-index: 10; display: grid; place-items: center; padding: 18px; background: #070a08c9; }
 .dialog { position: relative; width: min(540px, 100%); max-height: calc(100vh - 36px); overflow-y: auto; padding: 24px; border: 1px solid #364139; border-radius: 7px; background: #191e1b; }
+.issue-detail-dialog { width: min(700px, 100%); }
+.issue-detail-state { display: flex; align-items: center; flex-wrap: wrap; gap: 9px; margin: 9px 0 15px; color: #8e9b91; font-size: 11px; }
+.issue-detail-meta { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 10px; margin: 0; }
+.issue-detail-meta div { min-width: 0; padding: 9px 10px; border: 1px solid #2a332d; border-radius: 5px; background: #141916; }
+.issue-detail-meta dt { color: #849087; font-size: 10px; font-weight: 650; }
+.issue-detail-meta dd { overflow-wrap: anywhere; margin: 4px 0 0; color: #ced8d0; font-size: 10px; }
+.issue-detail-section { margin-top: 17px; }
+.issue-detail-section h3 { margin: 0 0 7px; color: #ced8d0; font-size: 11px; font-weight: 650; }
+.issue-source-refs { display: grid; gap: 6px; margin: 0; padding: 0; list-style: none; }
+.issue-source-refs li { min-width: 0; padding: 8px 10px; border: 1px solid #2a332d; border-radius: 5px; background: #141916; }
+.issue-source-refs code { overflow-wrap: anywhere; color: #a9cbb1; font-size: 10px; }
+.issue-record-details { margin-top: 15px; }
+.issue-detail-dialog .form-actions { margin-top: 17px; }
 .catalog-dialog { width: min(760px, 100%); }
 .catalog-dialog .entry-form { margin-top: 14px; }
 .catalog-dialog .entry-form > label { margin-top: 14px; }
