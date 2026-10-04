@@ -875,11 +875,9 @@ export function createHandlers(adapters) {
       report.totals.feesMinor = null; report.unallocated.feesMinor = null;
       for (const series of [...(report.daily ?? []), ...(report.monthly ?? [])]) series.feesMinor = null;
     }
-    // A health warning does not erase a net amount that can be calculated
-    // from the available facts. Keep the result visible and surface the
-    // incomplete fee-source status as an issue below. A missing fee amount
-    // still makes net unavailable because its value is unknown.
-    if (missingFee) {
+    // Fee-source health can mean the aggregate misses unsettled fees even when
+    // some known amounts are present. Keep product contribution before fees.
+    if (missingFee || incompleteFeeHealth) {
       report.totals.netMinor = null;
       for (const series of [...(report.daily ?? []), ...(report.monthly ?? [])]) series.netMinor = null;
     }
