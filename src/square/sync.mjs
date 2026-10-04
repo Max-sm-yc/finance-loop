@@ -126,7 +126,23 @@ export function normalizePayment(p) {
   return [{ kind: 'payment', objectId: p.id, version, orderId: p.order_id ?? null, locationId: p.location_id ?? null, sourceType, status: p.status ?? null, occurredAt: p.created_at ?? null, updatedAt: p.updated_at ?? null, currency, amountMinor, feeMinor, feeStatus, raw: p }];
 }
 export function normalizeRefund(r) { return r?.id ? [{ kind: 'refund', objectId: r.id, version: String(r.updated_at ?? r.created_at ?? ''), paymentId: r.payment_id ?? null, orderId: r.order_id ?? null, status: r.status ?? null, occurredAt: r.created_at ?? null, currency: r.amount_money?.currency ?? null, amountMinor: minor(r.amount_money), raw: r }] : []; }
-export function normalizeCatalog(obj) { return obj?.id ? [{ kind: 'catalog', objectId: obj.id, version: String(obj.version ?? obj.updated_at ?? ''), objectType: obj.type ?? null, name: obj.item_data?.name ?? obj.item_variation_data?.name ?? obj.category_data?.name ?? null, itemId: obj.item_variation_data?.item_id ?? null, sku: obj.item_variation_data?.sku ?? null, raw: obj }] : []; }
+export function normalizeCatalog(obj) {
+  if (!obj?.id) return [];
+  const sourceVersion = String(obj.version ?? obj.updated_at ?? '');
+  const variation = obj.type === 'ITEM_VARIATION' ? obj.item_variation_data : null;
+  const priceMoney = variation?.price_money;
+  return [{ kind: 'catalog', objectId: obj.id,
+    version: sourceVersion ? `${sourceVersion}|normalization-2` : '',
+    objectType: obj.type ?? null,
+    name: obj.item_data?.name ?? variation?.name ?? obj.category_data?.name ?? null,
+    itemId: variation?.item_id ?? null,
+    sku: variation?.sku ?? null,
+    priceMinor: variation ? minor(priceMoney) : null,
+    currency: variation ? moneyCurrency(priceMoney) : null,
+    pricingType: variation?.pricing_type ?? null,
+    isDeleted: obj.is_deleted === true,
+    raw: obj }];
+}
 export function normalizePayout(p) {
   if (!p?.id) return [];
   return [{

@@ -681,6 +681,13 @@ export function createSupabaseAdapters({ url, publishableKey, secretKey, tokenEn
       if (error) throw error;
       return data ?? { from, to, facts: [], policy: {}, sourceHealth: [], openIssueCount: 0 };
     },
+    async listProductCatalogItems({ organizationId, accessToken }) {
+      const { data, error } = await userRest(accessToken).rpc('get_product_catalog_items', {
+        organization_id: organizationId
+      });
+      if (error) throw error;
+      return Array.isArray(data) ? data : [];
+    },
     async listObservations({ organizationId, accountId, accessToken }) {
       const query = new URLSearchParams({ select: '*', organization_id: eq(organizationId), order: 'observed_at.desc', limit: '1000' });
       if (accountId) query.set('account_id', eq(accountId));

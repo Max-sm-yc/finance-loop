@@ -73,6 +73,14 @@ Product net and margin are before fees; report-wide net deducts
 COGS and aggregate fees from revenue. Net is an operational margin, not an
 accounting net-income statement.
 
+The analytics page also lists current Square catalog variations, including
+items with no sales in the selected period, plus registered manual supplies.
+Selling prices come from the latest synced Square catalog facts. Unit costs
+come only from the effective approved item definition in the matching currency;
+items without a supported price or approved cost remain visible with that value
+marked unavailable. Manual supplies do not claim a selling price or catalog
+COGS.
+
 Order-level refunds remain unallocated when their sources do not identify a
 product. Processing fees are always treated as an aggregate operating cost
 after product-level COGS; they are never allocated to a product, even when an

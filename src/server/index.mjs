@@ -610,7 +610,12 @@ export function createHandlers(adapters) {
     const actor = await authorize(req, organizationId);
     await requireFeature(organizationId, actor.accessToken, 'productAnalytics');
     if (typeof db.listProductAnalyticsFacts !== 'function') throw new HttpError(503, 'ANALYTICS_UNAVAILABLE');
-    const sourceData = await db.listProductAnalyticsFacts({ organizationId, from, to, currency, accessToken: actor.accessToken });
+    const [sourceData, catalogItems] = await Promise.all([
+      db.listProductAnalyticsFacts({ organizationId, from, to, currency, accessToken: actor.accessToken }),
+      typeof db.listProductCatalogItems === 'function'
+        ? db.listProductCatalogItems({ organizationId, accessToken: actor.accessToken })
+        : Promise.resolve([]),
+    ]);
     const rows = Array.isArray(sourceData) ? sourceData : Array.isArray(sourceData?.facts) ? sourceData.facts : [];
     const lines = [], refunds = [], fees = [];
     const orderStatuses = new Map(rows.filter(row => row?.kind === 'order').map(row => [row.objectId, row.fact?.status]));
@@ -673,7 +678,11 @@ export function createHandlers(adapters) {
       report.totals.feesMinor = null; report.unallocated.feesMinor = null;
       for (const series of [...(report.daily ?? []), ...(report.monthly ?? [])]) series.feesMinor = null;
     }
-    if (missingFee || incompleteFeeHealth) {
+    // A health warning does not erase a net amount that can be calculated
+    // from the available facts. Keep the result visible and surface the
+    // incomplete fee-source status as an issue below. A missing fee amount
+    // still makes net unavailable because its value is unknown.
+    if (missingFee) {
       report.totals.netMinor = null;
       for (const series of [...(report.daily ?? []), ...(report.monthly ?? [])]) series.netMinor = null;
     }
@@ -691,7 +700,7 @@ export function createHandlers(adapters) {
     if (incompleteCoverage) report.issues.push({ code: 'SOURCE_WINDOW_UNVERIFIED', sourceRefs: [] });
     if (missingParents) report.issues.push({ code: 'SOURCE_PARENT_MISSING', sourceRefs: [] });
     if (openIssues) report.issues.push({ code: 'OPEN_SOURCE_ISSUES', sourceRefs: [] });
-    return ok({ analytics: { ...report, sourceRevision: sourceData?.sourceRevision ?? null,
+    return ok({ analytics: { ...report, catalogItems, sourceRevision: sourceData?.sourceRevision ?? null,
       sourceCoverage: sourceData?.sourceCoverage ?? null, sourceHealth: health, incomePolicy } });
   });
 
