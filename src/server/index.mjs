@@ -610,12 +610,18 @@ export function createHandlers(adapters) {
     const actor = await authorize(req, organizationId);
     await requireFeature(organizationId, actor.accessToken, 'productAnalytics');
     if (typeof db.listProductAnalyticsFacts !== 'function') throw new HttpError(503, 'ANALYTICS_UNAVAILABLE');
-    const [sourceData, catalogItems] = await Promise.all([
-      db.listProductAnalyticsFacts({ organizationId, from, to, currency, accessToken: actor.accessToken }),
-      typeof db.listProductCatalogItems === 'function'
-        ? db.listProductCatalogItems({ organizationId, accessToken: actor.accessToken })
-        : Promise.resolve([]),
-    ]);
+    const sourceData = await db.listProductAnalyticsFacts({ organizationId, from, to, currency, accessToken: actor.accessToken });
+    let catalogItems = [], catalogStatus = 'available';
+    if (typeof db.listProductCatalogItems === 'function') {
+      try {
+        catalogItems = await db.listProductCatalogItems({ organizationId, accessToken: actor.accessToken });
+        if (!Array.isArray(catalogItems)) catalogItems = [];
+      } catch (error) {
+        catalogStatus = 'unavailable';
+        const code = typeof error?.code === 'string' && /^[A-Z0-9]{1,10}$/.test(error.code) ? error.code : 'UNKNOWN';
+        console.error(JSON.stringify({ event: 'product_catalog_listing_failed', code }));
+      }
+    } else catalogStatus = 'unavailable';
     const rows = Array.isArray(sourceData) ? sourceData : Array.isArray(sourceData?.facts) ? sourceData.facts : [];
     const lines = [], refunds = [], fees = [];
     const orderStatuses = new Map(rows.filter(row => row?.kind === 'order').map(row => [row.objectId, row.fact?.status]));
@@ -700,7 +706,7 @@ export function createHandlers(adapters) {
     if (incompleteCoverage) report.issues.push({ code: 'SOURCE_WINDOW_UNVERIFIED', sourceRefs: [] });
     if (missingParents) report.issues.push({ code: 'SOURCE_PARENT_MISSING', sourceRefs: [] });
     if (openIssues) report.issues.push({ code: 'OPEN_SOURCE_ISSUES', sourceRefs: [] });
-    return ok({ analytics: { ...report, catalogItems, sourceRevision: sourceData?.sourceRevision ?? null,
+    return ok({ analytics: { ...report, catalogItems, catalogStatus, sourceRevision: sourceData?.sourceRevision ?? null,
       sourceCoverage: sourceData?.sourceCoverage ?? null, sourceHealth: health, incomePolicy } });
   });
 
