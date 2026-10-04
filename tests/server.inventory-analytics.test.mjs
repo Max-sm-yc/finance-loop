@@ -106,6 +106,8 @@ test('analytics missing card fees never become zero and incomplete source covera
   assert.equal(stalePaymentHealth.analytics.products[0].netMinor, 700);
   assert.equal(stalePaymentHealth.analytics.products[0].marginBps, 7000);
   assert.equal(stalePaymentHealth.analytics.totals.netMinor, null);
+  assert.equal(stalePaymentHealth.analytics.daily[0].netMinor, null);
+  assert.equal(stalePaymentHealth.analytics.monthly[0].netMinor, null);
 });
 
 test('opening counts and supply registration permit reviewers while rejecting operator writes and foreign membership', async () => {
