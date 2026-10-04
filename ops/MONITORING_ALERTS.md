@@ -26,6 +26,18 @@ Create separate views for service health and financial completeness. The on-call
 
 Each alert needs a named owner, severity, runbook link, deduplication key, and resolved condition. Route security, data-integrity, and missed-close alerts to a human; avoid paging for normal model unavailability if the human queue is healthy. Review noisy alerts weekly during pilot and record threshold changes.
 
+## Purchase receipt operations
+
+Track receipt submissions awaiting upload, processing queue age, OCR/extraction
+failures, budget-denied jobs, duplicate detections, human review backlog, and
+approved receipts waiting for projection replay. Separate document-processing
+failure from financial completeness: a processed receipt may still have pending
+delivery or payment. Correlate sanitized receipt/job IDs; never log document text,
+integration tokens, payment identifiers, or signed upload URLs. Alert on repeated
+processing failures and terminal replay failure; route unresolved financial
+questions to the review inbox. Test receipt-only credentials for revocation and
+cross-organization denials as part of the security gate.
+
 ## Infrastructure verification gates
 
 - [ ] Provider webhook signature verification uses raw request bytes, configured notification URL, and secret rotation procedure.

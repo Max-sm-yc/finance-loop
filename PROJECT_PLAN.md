@@ -221,6 +221,40 @@ Every write uses CSRF/session checks, request validation, authorization, idempot
 
 ## 11. Tests and operational controls
 
+### Purchase Receipt Inbox
+
+Supplier purchase documents can enter through authenticated manual upload or an
+organization-bound integration credential. Integration credentials permit intake
+and status reads only; they cannot approve costs, inventory, or cash. The upload
+flow registers an immutable submission, transfers bytes to a restricted private
+storage destination, verifies the file, and durably queues document processing.
+The same workflow supports Power Automate without depending on its Teams/email
+trigger implementation. See `docs/PURCHASE_RECEIPTS.md` and
+`docs/POWER_AUTOMATE_SETUP.md` for the API and deployment contract.
+
+Document extraction and catalog matching produce persisted, evidence-linked
+drafts. A verified owner/reviewer approves an explicit draft version, reason, and
+selected effects through one transactional database boundary. Receiving stock,
+updating an effective-dated cost, and confirming a payment are separate decisions
+and can occur on separate dates. A document total or authorization hold does not
+prove an account cash outflow. Linking an existing purchase movement must not
+create another payment; a credit-card purchase must not deduct checking before
+its actual settlement. Later approvals can finish pending receipt/payment effects
+without duplicating earlier effects.
+
+Keep original goods amounts and printed totals in integer minor units; preserve
+package-to-selling-unit conversions and explain any approved per-unit rounding
+variance. Purchase tax/shipping remain separate from item cost under the confirmed
+merchant policy. Discounts already reflected in line amounts are not subtracted
+again. Unknown pack composition, item identity, currency, or amounts stay visible
+until supported by evidence. COGS on sale never deducts purchase cash a second time.
+
+Acceptance covers cross-organization isolation, restricted credential scope,
+duplicate delivery and approvals, independent delivery/payment timing, existing
+movement links, immutable draft evidence, closed periods, projection replay, OCR
+failures, and bounded per-organization model spending. Live migrations and pilot
+sign-off remain explicit deployment gates.
+
 - Golden fixture tests for discounts, tax/tips, partial refunds, returns, split tenders, missing costs, failed payouts, duplicate webhooks and out-of-order updates.
 - Property tests for replay idempotence, unchanged balance under internal transfers, and no COGS double deduction.
 - Authorization tests for RLS, reviewer separation, closed periods, and immutable source data.

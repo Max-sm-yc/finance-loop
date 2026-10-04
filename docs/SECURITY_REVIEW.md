@@ -49,6 +49,17 @@ Use this checklist before connecting a merchant, before production launch, and a
 - [ ] Reviewer approvals, high-risk thresholds, manual adjustment policy, service-account actions, and separation-of-duties exceptions are approved by the merchant.
 - [ ] Pilot exit includes independent comparison to Square and bank evidence and sign-off by merchant/accounting adviser.
 
+## Purchase receipt intake and approval checks
+
+- [ ] Owner-created integration credentials are hashed at rest, revocable, organization-bound, and restricted to receipt submission/status. Machine submissions retain integration attribution rather than impersonating a human.
+- [ ] Signed uploads address a single private object; completion validates actual bytes, checksum, MIME, size and processing bounds. Expired/incomplete uploads have an operational recovery path.
+- [ ] PDF/OCR processing is bounded by time, pages, output and file size; document contents are untrusted data and cannot supply instructions or approve financial effects.
+- [ ] Extraction versions and human decisions preserve source evidence. Model calls redact unnecessary identifiers and obey durable per-organization budget reservations.
+- [ ] Owner/reviewer approval checks draft version, evidence, role, reason, idempotency, closed periods and cross-organization item/account/payment links inside the database transaction.
+- [ ] Delivery, cost updates and payments remain independent. Duplicate submission, concurrent approval, partial receipt, and existing-payment linking cannot duplicate stock or cash.
+- [ ] Exact goods totals remain separate from rounded unit costs; tax/shipping and discounts reconcile without an invented balancing entry. Card authorization does not become checking outflow.
+- [ ] Power Automate secrets and signed upload URLs use protected action inputs/outputs; integration responses/logs never expose service keys or another organization's documents.
+
 ## Review record
 
 Record reviewer, date, release/commit, environment, evidence links, findings by severity, exception owner, due date, and re-review date. Mark each checkbox only after examining evidence in the target environment. Do not mark this checklist complete based on local prototype behavior.

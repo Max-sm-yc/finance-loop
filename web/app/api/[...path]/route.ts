@@ -309,6 +309,18 @@ async function dispatch(request: Request) {
     if (action === 'callback' && method === 'GET') return oauth.callback(request);
   }
   if (resource === 'dashboard' && method === 'GET') return route.dashboard(request);
+  if (resource === 'purchase-receipt-integrations' && ['GET', 'POST', 'DELETE'].includes(method)) return route.receiptIntegration(request);
+  if (resource === 'purchase-receipts' && !id && method === 'GET') return route.purchaseReceipts(request);
+  if (resource === 'purchase-receipts' && !id && method === 'POST') return route.purchaseReceipts(request);
+  if (resource === 'purchase-receipts' && id === 'intake' && method === 'POST') return route.manualPurchaseReceiptIntake(request);
+  if (resource === 'purchase-receipts' && id && !['intake'].includes(id) && (method === 'GET' || method === 'POST')) return route.purchaseReceipts(request);
+  if (resource === 'integrations' && id === 'purchase-receipts') {
+    const receiptId = parts[3];
+    const integrationAction = parts[4];
+    if (!receiptId && method === 'POST') return route.purchaseReceiptIntake(request);
+    if (receiptId && integrationAction === 'complete' && method === 'POST') return route.purchaseReceiptComplete(request);
+    if (receiptId && !integrationAction && method === 'GET') return route.purchaseReceiptStatus(request);
+  }
   if (resource === 'issues' && !id && method === 'GET') return route.issues(request);
   if (resource === 'issues' && id && action === 'evidence' && method === 'GET') return route.issueEvidence(request);
   if (resource === 'issues' && id && action === 'item-cost' && method === 'POST') return route.itemCost(request);
@@ -344,3 +356,4 @@ async function dispatch(request: Request) {
 export const GET = dispatch;
 export const POST = dispatch;
 export const PATCH = dispatch;
+export const DELETE = dispatch;

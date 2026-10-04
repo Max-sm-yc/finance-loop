@@ -254,6 +254,25 @@ test('projection replay honors a correction job historical window', async () => 
   });
 });
 
+test('receipt projection replay is not acknowledged when projection was not persisted', async () => {
+  const state = harness();
+  state.db.getProjectionSnapshot = async ({ sourceRevision }) => ({ sourceRevision, snapshot: {
+    incomePolicy: { tax: 'exclude', tips: 'exclude' },
+    lines: [{ id: 'gift-line', status: 'completed', itemType: 'GIFT_CARD', orderId: 'gift-order', lineItemUid: 'gift-line' }],
+    giftCardActivities: [], fees: [], accounts: [],
+  } });
+  state.queue.claim = async () => ({ id: 'receipt-replay', type: 'projection.replay', organizationId: org,
+    attempts: 1, maxAttempts: 3, leaseToken: 'receipt-replay-lease', payload: {
+      sourceRevision: 1, receiptId: 'receipt-1', decisionId: 'decision-1',
+    } });
+  const result = await state.worker.runOne({ workerId: 'worker-1' });
+  assert.equal(result.status, 'retrying');
+  assert.ok(state.events.some(event => event[0] === 'health' && event[1].gap?.code === 'GIFT_CARD_ACTIVITY_LINKAGE_MISSING'));
+  assert.equal(state.events.some(event => event[0] === 'projection'), false);
+  assert.equal(state.events.some(event => event[0] === 'ack'), false);
+  assert.equal(state.events.some(event => event[0] === 'retry'), true);
+});
+
 test('worker fails closed when queue cannot provide a fencing token', async () => {
   const state = harness();
   state.queue.claim = async () => ({ id: 'lease-job', type: 'projection.replay', organizationId: org, payload: { sourceRevision: 1 } });

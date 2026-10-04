@@ -3,8 +3,10 @@ import { replayAccounting } from '../engine/index.mjs';
 import { backfillSquare, normalizeOrder, normalizePayment, normalizeRefund, normalizeCatalog, normalizePayout, normalizePayoutEntry, normalizeGiftCardActivity } from '../square/sync.mjs';
 import { refreshAccessToken } from '../square/client.mjs';
 import { diagnoseIssue } from '../agent/diagnosis.mjs';
+import { extractPurchaseReceipt } from '../agent/purchase-receipt.mjs';
+import { extractDocumentText } from './purchase-receipt-document.mjs';
 
-const JOBS = new Set(['square.webhook', 'square.sync', 'projection.replay', 'issue.investigate']);
+const JOBS = new Set(['square.webhook', 'square.sync', 'projection.replay', 'issue.investigate', 'receipt.process']);
 const EVENT_KIND = new Map([['order', 'order'], ['payment', 'payment'], ['refund', 'refund'], ['catalog', 'catalog'], ['payout', 'payout']]);
 const defaultSleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
@@ -82,6 +84,7 @@ function normalizeResource(resource, value, parentId) {
  */
 export function createWorker(dependencies) {
   const { queue, db, tokenVault, config, makeSquareClient, engine = { replayAccounting }, fetchImpl = fetch,
+    extractReceiptDocumentTextFn = extractDocumentText,
     sleep = defaultSleep, now = () => new Date(), random = Math.random } = requireInterface(dependencies);
   if (typeof makeSquareClient !== 'function') throw new TypeError('makeSquareClient is required');
   const retryLimit = Number.isInteger(config.maxJobAttempts) ? Math.max(1, Math.min(config.maxJobAttempts, 12)) : 5;
@@ -176,12 +179,13 @@ export function createWorker(dependencies) {
       const gap = { code: 'GIFT_CARD_ACTIVITY_LINKAGE_MISSING', sourceRefs: unlinkedLines.map(line => String(line.id)) };
       await db.recordSourceHealth({ organizationId, resource: 'square', status: 'incomplete', lastSuccessfulSyncAt: null, gap, sourceRevision, checkedAt: now().toISOString() });
       await db.upsertSourceIssue({ organizationId, code: 'SOURCE_GAP', state: 'awaiting_human', revision: sourceRevision, details: gap, sourceRefs: gap.sourceRefs });
-      return { incomplete: true, gap };
+    return { incomplete: true, projectionSaved: false, gap };
     }
     const result = engine.replayAccounting(sourceSnapshot);
     const replayableSnapshot = { ...sourceSnapshot, sourceRevision, projectionCause: cause };
     await db.saveProjectionRunSystem({ organizationId, sourceRevision, calculationVersion: result.calculationVersion, result, sourceSnapshot: replayableSnapshot, cause, idempotencyKey: `projection:${sourceRevision}:${result.calculationVersion}:${window.startAt ?? 'all'}:${window.endAt ?? 'all'}:${cause}` });
     await db.syncProjectionIssues({ organizationId, sourceRevision, calculationVersion: result.calculationVersion, periodStart: sourceSnapshot.periodStart ?? null, periodEnd: sourceSnapshot.periodEnd ?? null, issues: result.issues.map(issue => ({ code: issue.code, message: issue.message, sourceRefs: issue.sourceRefs ?? [], state: 'awaiting_human' })) });
+    return { projectionSaved: true, sourceRevision };
   }
 
   async function recordGap(organizationId, resource, code, details = {}) {
@@ -374,7 +378,12 @@ export function createWorker(dependencies) {
       }
       window = { startAt: new Date(startAt).toISOString(), endAt: new Date(endAt).toISOString() };
     }
-    await recomputeProjection(job.organizationId, revision, `job:${job.id}`, window);
+    const projection = await recomputeProjection(job.organizationId, revision, `job:${job.id}`, window);
+    if (job.payload?.receiptId && projection?.projectionSaved !== true) {
+      throw Object.assign(new Error('Receipt projection could not be saved because source evidence is incomplete'), {
+        code: 'RECEIPT_PROJECTION_INCOMPLETE', retryableGap: true,
+      });
+    }
     return { revision, ...window };
   }
 
@@ -408,11 +417,49 @@ export function createWorker(dependencies) {
     }
   }
 
+  async function handlePurchaseReceipt(job) {
+    const receiptId = job.payload?.receiptId;
+    if (typeof receiptId !== 'string' || !receiptId) throw Object.assign(new Error('Invalid purchase receipt job'), { permanent: true });
+    for (const method of ['getPurchaseReceiptForProcessing','downloadPurchaseReceiptObject','reservePurchaseReceiptModelBudget','recordPurchaseReceiptModelUsage','savePurchaseReceiptDraftSystem','failPurchaseReceiptProcessing']) {
+      if (typeof db[method] !== 'function') throw Object.assign(new Error('Purchase receipt worker adapter unavailable'), { permanent: true });
+    }
+    let receipt;
+    try {
+      receipt = await db.getPurchaseReceiptForProcessing({ organizationId: job.organizationId, receiptId });
+      if (!receipt) return { receiptId, outcome: 'missing_or_already_processed' };
+      const objectKey = receipt.objectKey ?? receipt.object_key;
+      const mimeType = receipt.mimeType ?? receipt.mime_type;
+      const bytes = await db.downloadPurchaseReceiptObject({ objectKey });
+      const actualHash=createHash('sha256').update(bytes).digest('hex');
+      const expectedHash=receipt.sha256Hex ?? receipt.sha256_hex;
+      if(typeof expectedHash!=='string'||actualHash!==expectedHash) throw Object.assign(new Error('Receipt evidence checksum mismatch'),{code:'RECEIPT_CHECKSUM_MISMATCH',permanent:true});
+      const text = await extractReceiptDocumentTextFn({ bytes, mimeType });
+      if (!config.openRouterApiKey) throw Object.assign(new Error('Receipt model is not configured'), { code: 'RECEIPT_MODEL_UNAVAILABLE', permanent: true });
+      const expectedVersion = Number(receipt.activeDraftVersion ?? receipt.active_draft_version ?? 0);
+      const draft = await extractPurchaseReceipt({ text }, {
+        apiKey: config.openRouterApiKey, fetchImpl, model: config.openRouterModel,
+        maxOutputTokens: config.openRouterMaxOutputTokens ?? 1400,
+        reserveBudget: args => db.reservePurchaseReceiptModelBudget({ organizationId: job.organizationId, receiptId, ...args }),
+        recordUsage: args => db.recordPurchaseReceiptModelUsage({ organizationId: job.organizationId, receiptId, ...args }),
+      });
+      const result = await db.savePurchaseReceiptDraftSystem({ organizationId: job.organizationId, receiptId, expectedVersion, draft });
+      return { receiptId, outcome: 'needs_review', draftVersion: result?.version ?? result?.draftVersion ?? expectedVersion + 1 };
+    } catch (error) {
+      const code = typeof error?.code === 'string' && /^[A-Z0-9_.-]{1,80}$/.test(error.code) ? error.code : 'RECEIPT_PROCESSING_FAILED';
+      if (receipt && (error.permanent || code === 'BUDGET_EXCEEDED' || code === 'MODEL_UNAVAILABLE')) {
+        await db.failPurchaseReceiptProcessing({ organizationId: job.organizationId, receiptId, code });
+        error.permanent = true;
+      }
+      throw error;
+    }
+  }
+
   async function processJob(job) {
     if (!job || !job.id || !job.organizationId || !JOBS.has(job.type)) throw Object.assign(new Error('Invalid or unsupported job'), { permanent: true });
     if (job.type === 'square.webhook') return handleWebhook(job);
     if (job.type === 'square.sync') return handleSync(job);
     if (job.type === 'projection.replay') return handleReplay(job);
+    if (job.type === 'receipt.process') return handlePurchaseReceipt(job);
     return handleInvestigation(job);
   }
 
@@ -439,12 +486,23 @@ export function createWorker(dependencies) {
       if (!ownsLease) return { status: 'lease_lost', jobId: job.id };
       const acknowledged = await queue.ack({ jobId: job.id, workerId, leaseToken: job.leaseToken });
       if (acknowledged === false) return { status: 'lease_lost', jobId: job.id };
-      return { status: 'completed', jobId: job.id, result };
+      let receiptFinalizationPending=false;
+      const receiptId=job.type==='projection.replay'?job.payload?.receiptId:null;
+      const decisionId=job.type==='projection.replay'?job.payload?.decisionId:null;
+      if(receiptId&&decisionId&&typeof db.finalizePurchaseReceiptProjection==='function') {
+        try { await db.finalizePurchaseReceiptProjection({organizationId:job.organizationId,receiptId,decisionId,succeeded:true}); }
+        catch { receiptFinalizationPending=true; }
+      }
+      return { status: 'completed', jobId: job.id, result, receiptFinalizationPending };
     } catch (error) {
       if (heartbeat) { clearInterval(heartbeat); await renewal; }
       if (!ownsLease) return { status: 'lease_lost', jobId: job.id };
       const attempts = Number(job.attempts ?? 1);
       if (error.permanent || attempts >= retryLimit || attempts >= Number(job.maxAttempts ?? retryLimit)) {
+        if (job.type === 'receipt.process') {
+          try { await db.failPurchaseReceiptProcessing({ organizationId: job.organizationId, receiptId: job.payload?.receiptId, code: error.code ?? 'RECEIPT_PROCESSING_FAILED' }); }
+          catch { /* Dead-letter remains authoritative if status metadata cannot be updated. */ }
+        }
         if (job.type === 'square.webhook' || job.type === 'square.sync') {
           try { await recordGap(job.organizationId, job.type, 'SOURCE_GAP', { jobId: job.id, reason: errorMessage(error) }); }
           catch (gapError) {
@@ -463,6 +521,10 @@ export function createWorker(dependencies) {
         }
         const failed = await queue.deadLetter({ jobId: job.id, workerId, leaseToken: job.leaseToken, code: error.code ?? 'WORKER_JOB_FAILED', message: errorMessage(error) });
         if (failed === false) return { status: 'lease_lost', jobId: job.id };
+        if(job.type==='projection.replay'&&job.payload?.receiptId&&job.payload?.decisionId&&typeof db.finalizePurchaseReceiptProjection==='function') {
+          try { await db.finalizePurchaseReceiptProjection({organizationId:job.organizationId,receiptId:job.payload.receiptId,decisionId:job.payload.decisionId,succeeded:false,errorCode:error.code??'PROJECTION_REPLAY_FAILED'}); }
+          catch { /* The receipt remains visibly projection-pending. */ }
+        }
         const failure = failureMetadata(error);
         return { status: 'dead_lettered', jobId: job.id, code: error.code ?? 'WORKER_JOB_FAILED', failureStatus: failure.status, failureCode: failure.code };
       }

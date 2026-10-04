@@ -4,8 +4,9 @@ import { browserSupabase } from '@/lib/browser-supabase';
 import { api, type AuditEvent, type Dashboard, type Issue, type Movement } from '@/lib/api';
 import { rankReceiptCatalogCandidates } from '../../src/agent/receipt-matching.mjs';
 import { calculatePackageUnitCostMinor } from '../../src/agent/receipt-units.mjs';
+import PurchaseReceipts from './PurchaseReceipts';
 
-type Page = 'overview' | 'income' | 'cash' | 'review' | 'ledger' | 'settings' | 'analytics';
+type Page = 'overview' | 'income' | 'cash' | 'purchases' | 'review' | 'ledger' | 'settings' | 'analytics';
 type Features = { inventoryTracking: boolean; productAnalytics: boolean };
 type InventoryMovement = { id: string; item_id: string; item_name: string; quantity_delta: number; occurred_at: string; movement_type?: string; reason?: string };
 type InventorySnapshot = { asOf: string; status?: string; issues?: Array<{ code: string }>; sourceCoverage?: unknown; sourceHealth?: unknown[]; items?: Array<{ id: string; name: string; currency: string; sku?: string | null; square_catalog_object_id?: string | null; item_kind?: string }>; balances?: Array<{ itemDefinitionId: string; itemName: string; currency: string; quantity: number | null }> };
@@ -105,6 +106,7 @@ function issueFieldLabel(field: string) { return ISSUE_FIELD_LABELS[field] ?? fi
 const NAV: Array<{ id: Page; label: string }> = [
   { id: 'overview', label: 'Overview' }, { id: 'income', label: 'Income & inventory' },
   { id: 'cash', label: 'Cash flow' }, { id: 'analytics', label: 'Business analytics' }, { id: 'review', label: 'Review queue' },
+  { id: 'purchases', label: 'Purchase receipts' },
   { id: 'ledger', label: 'Activity ledger' }, { id: 'settings', label: 'Settings' },
 ];
 const money = (minor?: number | null, currency = 'USD') => {
@@ -189,6 +191,8 @@ export default function Home() {
   const [loadingAuth, setLoadingAuth] = useState(true);
   const [page, setPage] = useState<Page>('overview');
   const [visitedPages, setVisitedPages] = useState<Set<Page>>(() => new Set(['overview']));
+  const [purchaseReceiptId, setPurchaseReceiptId] = useState('');
+  const pendingReceiptOrganizationId = useRef('');
   const [dashboard, setDashboard] = useState<Dashboard | null>(null);
   const [issues, setIssues] = useState<Issue[]>([]);
   const [movements, setMovements] = useState<Movement[]>([]);
@@ -220,6 +224,15 @@ export default function Home() {
   }, [supabase]);
 
   useEffect(() => {
+    const receiptId = new URLSearchParams(window.location.search).get('purchaseReceipt');
+    if (!receiptId) return;
+    pendingReceiptOrganizationId.current = new URLSearchParams(window.location.search).get('organizationId') ?? '';
+    setPurchaseReceiptId(receiptId);
+    setPage('purchases');
+    setVisitedPages(current => current.has('purchases') ? current : new Set(current).add('purchases'));
+  }, []);
+
+  useEffect(() => {
     if (!user || !supabase) { setOrganizations([]); setOrganizationId(''); return; }
     let active = true;
     void (async () => {
@@ -236,7 +249,11 @@ export default function Home() {
       const roleByOrganization = new Map((memberships ?? []).map(row => [row.organization_id as string, row.role as string | undefined]));
       const options = ((orgRows ?? []) as Organization[]).map(org => ({ ...org, role: roleByOrganization.get(org.id) }));
       setOrganizations(options);
-      setOrganizationId(current => options.some(org => org.id === current) ? current : options[0]?.id ?? '');
+      const requestedReceiptOrganizationId = pendingReceiptOrganizationId.current;
+      pendingReceiptOrganizationId.current = '';
+      setOrganizationId(current => requestedReceiptOrganizationId && options.some(org => org.id === requestedReceiptOrganizationId)
+        ? requestedReceiptOrganizationId
+        : options.some(org => org.id === current) ? current : options[0]?.id ?? '');
     })();
     return () => { active = false; };
   }, [user, supabase]);
@@ -366,6 +383,7 @@ export default function Home() {
           {visitedPages.has('overview') && <div hidden={page !== 'overview'}><Overview dashboard={dashboard} currency={currency} issues={openIssues} events={events} accountId={accountId} onNavigate={navigate} /></div>}
           {visitedPages.has('income') && <div hidden={page !== 'income'}><Income dashboard={dashboard} currency={currency} /><GiftCardSummary income={dashboard.income} currency={currency} /></div>}
           {visitedPages.has('cash') && <div hidden={page !== 'cash'}><Cash key={organizationId} dashboard={dashboard} currency={currency} movements={movements} accounts={dashboard.accounts ?? []} accountId={accountId} organizationId={organizationId} inventoryEnabled={features.inventoryTracking} canManageSquareCatalog={organizations.find(org => org.id === organizationId)?.role === 'owner'} canAuthorizeSquareCatalog={organizations.find(org => org.id === organizationId)?.role === 'owner'} onAccount={setAccountId} onSaved={() => void load()} /></div>}
+          {visitedPages.has('purchases') && <div hidden={page !== 'purchases'}><PurchaseReceipts key={organizationId} organizationId={organizationId} role={organizations.find(org => org.id === organizationId)?.role ?? 'read_only'} accounts={dashboard.accounts ?? []} currency={currency} initialReceiptId={purchaseReceiptId} onSaved={() => void load()} /></div>}
           {visitedPages.has('analytics') && features.productAnalytics && <div hidden={page !== 'analytics'}><Analytics key={organizationId} organizationId={organizationId} from={zonedMidnight(from, reportTimezone)} to={zonedMidnight(nextDate(to), reportTimezone)} currency={currency} timezone={reportTimezone} role={organizations.find(org => org.id === organizationId)?.role ?? 'read_only'} /></div>}
           {visitedPages.has('review') && <div hidden={page !== 'review'}><Review key={organizationId} issues={openIssues} organizationId={organizationId} currency={currency} canSync={organizations.find(org => org.id === organizationId)?.role === 'owner'} syncing={syncing} syncPeriodLabel={periodLabel(from, to)} onSyncPeriod={syncSelectedPeriod} onSaved={() => void load()} /></div>}
           {visitedPages.has('ledger') && <div hidden={page !== 'ledger'}><Ledger events={events} /></div>}

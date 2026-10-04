@@ -21,5 +21,9 @@ services:
         sync: false
       - key: SUPABASE_SECRET_KEY
         sync: false
+      - key: OPENROUTER_API_KEY
+        sync: false
+      - key: PURCHASE_RECEIPT_MAX_OUTPUT_TOKENS
+        value: "1400"
       - key: ACCOUNTING_TIMEZONE
         value: America/New_York

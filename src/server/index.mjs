@@ -1,7 +1,7 @@
 import { acceptSquareWebhook } from '../square/webhooks.mjs';
 import { diagnoseIssue, DiagnosisError, SUPPORTED_DIAGNOSIS_ISSUE_TYPES } from '../agent/diagnosis.mjs';
 import { extractReceipt } from '../agent/receipt.mjs';
-import { createHash, randomUUID } from 'node:crypto';
+import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { calculateProductAnalytics } from '../engine/analytics.mjs';
 import { calculateInventory } from '../engine/inventory.mjs';
 
@@ -9,6 +9,8 @@ const JSON_HEADERS = { 'content-type': 'application/json; charset=utf-8', 'cache
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const ISO = /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d{1,3})?Z$/;
 const MAX_SYNC_WINDOW_MS = 366 * 24 * 60 * 60 * 1000;
+const MAX_PURCHASE_RECEIPT_BYTES = 8 * 1024 * 1024;
+const RECEIPT_MIME_TYPES = new Set(['application/pdf','image/jpeg','image/png']);
 const roles = new Set(['owner', 'operator', 'reviewer', 'read_only']);
 const own = (o, k) => Object.prototype.hasOwnProperty.call(o, k);
 
@@ -90,6 +92,24 @@ async function readBytes(req, maxBytes) {
   for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength; }
   return bytes;
 }
+function receiptMime(bytes) {
+  if (bytes.length >= 5 && new TextDecoder().decode(bytes.subarray(0,5)) === '%PDF-') return 'application/pdf';
+  if (bytes.length >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) return 'image/jpeg';
+  if (bytes.length >= 8 && bytes[0] === 137 && bytes[1] === 80 && bytes[2] === 78 && bytes[3] === 71 && bytes[4] === 13 && bytes[5] === 10 && bytes[6] === 26 && bytes[7] === 10) return 'image/png';
+  return null;
+}
+function cleanFilename(value) {
+  const base = String(value ?? 'purchase-receipt').split(/[\\/]/).at(-1).replace(/[^A-Za-z0-9._-]/g,'_').slice(0,120);
+  return base && !/^\.+$/.test(base) ? base : 'purchase-receipt';
+}
+function receiptPublicRecord(row) {
+  return { id: row.id, status: row.status, activeDraftVersion: row.active_draft_version ?? row.activeDraftVersion ?? null,
+    originalFilename: row.original_filename ?? row.originalFilename ?? row.filename,
+    contentType: row.declared_mime_type ?? row.mimeType ?? null, evidenceFileId: row.evidence_file_id ?? row.evidenceFileId ?? null,
+    submittedAt: row.submitted_at ?? row.submittedAt ?? null, uploadedAt: row.uploaded_at ?? row.uploadedAt ?? null,
+    updatedAt: row.updated_at ?? row.updatedAt ?? null, lastErrorCode: row.last_error_code ?? null,
+    duplicateOfReceiptId: row.duplicate_of ?? row.duplicateOf ?? null };
+}
 async function readJson(req, maxBytes = 32_000) {
   if (!req.headers.get('content-type')?.toLowerCase().startsWith('application/json')) throw new HttpError(415, 'JSON_REQUIRED');
   const raw = new TextDecoder().decode(await readBytes(req, maxBytes));
@@ -103,6 +123,16 @@ function parseBearer(req) {
 }
 function safeThrown(error) {
   if (error instanceof HttpError) return bad(error.status, error.code);
+  const safeDatabaseMessage=typeof error?.message==='string'?error.message.toLowerCase():'';
+  if (error?.code==='P0001' || error?.code==='23505') {
+    if (safeDatabaseMessage.includes('period_closed')) return bad(409,'PERIOD_CLOSED');
+    if (safeDatabaseMessage.includes('version conflict') || safeDatabaseMessage.includes('draft version')) return bad(409,'RECEIPT_VERSION_CONFLICT');
+    if (safeDatabaseMessage.includes('idempotency key collision')) return bad(409,'IDEMPOTENCY_CONFLICT');
+    if (safeDatabaseMessage.includes('currency')) return bad(409,'RECEIPT_CURRENCY_CONFLICT');
+    if (safeDatabaseMessage.includes('receipt') && safeDatabaseMessage.includes('not found')) return bad(404,'RECEIPT_NOT_FOUND');
+    if (safeDatabaseMessage.includes('confirm that this is a supplier purchase')) return bad(409,'DOCUMENT_CONFIRMATION_REQUIRED');
+    if (safeDatabaseMessage.includes('payments exceed') || safeDatabaseMessage.includes('payment')) return bad(422,'PAYMENT_REVIEW_REQUIRED');
+  }
   if (error instanceof DiagnosisError) {
     const status = error.code === 'INVALID_INPUT' ? 400 : 503;
     // DiagnosisError messages are generated from fixed validation checks and
@@ -455,7 +485,7 @@ export function createHandlers(adapters) {
       itemId: m.item_definition_id ?? m.inventory_item_id ?? m.itemId, squareCatalogObjectId: m.square_catalog_object_id ?? null,
       itemName: m.item_name ?? m.itemName, quantityDelta: Number(m.quantity_delta ?? m.quantityDelta),
       currency: m.currency, occurredAt: utc(m.occurred_at ?? m.occurredAt),
-      kind: ['opening_balance','opening'].includes(m.movement_type ?? m.kind) ? 'opening' : ['purchase','purchase_receipt'].includes(m.movement_type ?? m.kind) ? 'purchase' : 'adjustment',
+      kind: ['opening_balance','opening'].includes(m.movement_type ?? m.kind) ? 'opening' : ['purchase','purchase_receipt','supplier_receipt'].includes(m.movement_type ?? m.kind) ? 'purchase' : 'adjustment',
       evidenceId: m.evidence_file_id ?? m.evidenceId, reason: m.reason }));
     const normalizedLines = (snapshot.lines ?? []).map(line => ({ ...line, id: line.id ?? line.objectId,
       version: line.version ?? 1, occurredAt: utc(line.occurredAt ?? line.occurred_at),
@@ -522,6 +552,198 @@ export function createHandlers(adapters) {
       recordUsage: args => db.recordReceiptModelUsage({ organizationId: body.organizationId, runId, ...args, accessToken: actor.accessToken })
     });
     return ok({ draft, candidates });
+  });
+  const receiptIntegration = run(async req => {
+    if (req.method === 'GET') {
+      const organizationId=new URL(req.url).searchParams.get('organizationId');
+      const actor=await authorize(req,organizationId,['owner']);
+      if(typeof db.listPurchaseReceiptIntegrations!=='function') throw new HttpError(503,'RECEIPT_INTEGRATION_UNAVAILABLE');
+      return ok({integrations:await db.listPurchaseReceiptIntegrations({organizationId,accessToken:actor.accessToken})});
+    }
+    if (req.method === 'POST') {
+      const body = await readJson(req);
+      if (!exactObject(body,['organizationId','name']) || !UUID.test(body.organizationId ?? '') || !text(body.name,100)) throw new HttpError(400,'INVALID_INTEGRATION');
+      const actor = await authorize(req,body.organizationId,['owner']);
+      if (typeof db.createPurchaseReceiptIntegration !== 'function') throw new HttpError(503,'RECEIPT_INTEGRATION_UNAVAILABLE');
+      const token = `flpr_${randomBytes(32).toString('base64url')}`;
+      const result = await db.createPurchaseReceiptIntegration({organizationId:body.organizationId,name:body.name.trim(),tokenSha256:createHash('sha256').update(token).digest('hex'),accessToken:actor.accessToken});
+      return created({id:result?.id ?? result?.integrationId ?? result?.integration_id,token});
+    }
+    if (req.method === 'DELETE') {
+      const body = await readJson(req);
+      if (!exactObject(body,['organizationId']) || !UUID.test(body.organizationId ?? '')) throw new HttpError(400,'INVALID_INTEGRATION');
+      const integrationId = new URL(req.url).pathname.split('/').at(-1) ?? '';
+      if (!UUID.test(integrationId)) throw new HttpError(400,'INVALID_INTEGRATION_ID');
+      const actor = await authorize(req,body.organizationId,['owner']);
+      if (typeof db.revokePurchaseReceiptIntegration !== 'function') throw new HttpError(503,'RECEIPT_INTEGRATION_UNAVAILABLE');
+      await db.revokePurchaseReceiptIntegration({organizationId:body.organizationId,integrationId,accessToken:actor.accessToken});
+      return ok({revoked:true});
+    }
+    throw new HttpError(405,'METHOD_NOT_ALLOWED');
+  });
+  const integrationCredential = async req => {
+    let token;
+    try { token=parseBearer(req); } catch { throw new HttpError(401,'UNAUTHENTICATED'); }
+    if (!token.startsWith('flpr_') || typeof db.authorizePurchaseReceiptIntegration !== 'function') throw new HttpError(401,'UNAUTHENTICATED');
+    const credential=await db.authorizePurchaseReceiptIntegration({tokenSha256:createHash('sha256').update(token).digest('hex')});
+    if (!credential?.organizationId || !credential?.integrationId) throw new HttpError(401,'UNAUTHENTICATED');
+    return credential;
+  };
+  const purchaseReceiptIntake = run(async req => {
+    if (req.method !== 'POST') throw new HttpError(405,'METHOD_NOT_ALLOWED');
+    const credential=await integrationCredential(req);
+    const body=await readJson(req,12_000);
+    idempotency(req);
+    if (!exactObject(body,['externalSubmissionId','filename','contentType']) || !text(body.externalSubmissionId,200) || /[\u0000-\u001f\u007f]/.test(body.externalSubmissionId)
+        || !text(body.filename,300) || !RECEIPT_MIME_TYPES.has(body.contentType)) throw new HttpError(400,'INVALID_RECEIPT_SUBMISSION');
+    if (typeof db.createPurchaseReceiptSubmission!=='function' || typeof db.createPurchaseReceiptUploadUrl!=='function') throw new HttpError(503,'RECEIPT_INTAKE_UNAVAILABLE');
+    const submission=await db.createPurchaseReceiptSubmission({organizationId:credential.organizationId,integrationId:credential.integrationId,
+      externalSubmissionId:body.externalSubmissionId,filename:cleanFilename(body.filename),mimeType:body.contentType});
+    if (!submission?.receiptId || !submission.objectKey) throw new HttpError(503,'RECEIPT_INTAKE_UNAVAILABLE');
+    if(submission.status && submission.status!=='awaiting_upload') return created({receiptId:submission.receiptId,status:submission.status});
+    const upload=await db.createPurchaseReceiptUploadUrl({objectKey:submission.objectKey});
+    return created({receiptId:submission.receiptId,status:submission.status ?? 'awaiting_upload',upload:{url:upload.url,token:upload.token,method:'PUT',contentType:body.contentType,headers:{'x-upsert':'false'}}});
+  });
+  const purchaseReceiptComplete = run(async req => {
+    if (req.method!=='POST') throw new HttpError(405,'METHOD_NOT_ALLOWED');
+    const credential=await integrationCredential(req);
+    const receiptId=new URL(req.url).pathname.split('/').at(-2) ?? '';
+    if (!UUID.test(receiptId)) throw new HttpError(400,'INVALID_RECEIPT_ID');
+    const record=await db.getPurchaseReceiptForIntegration({organizationId:credential.organizationId,integrationId:credential.integrationId,receiptId});
+    if (!record) throw new HttpError(404,'RECEIPT_NOT_FOUND');
+    const objectKey=`${credential.organizationId}/purchase-receipts/${receiptId}/${cleanFilename(record.original_filename ?? record.originalFilename)}`;
+    const declaredMime=record.declared_mime_type ?? record.mimeType;
+    const bytes=await db.downloadPurchaseReceiptObject({objectKey});
+    if (!bytes.length || bytes.byteLength>MAX_PURCHASE_RECEIPT_BYTES) throw new HttpError(413,'RECEIPT_FILE_SIZE_INVALID');
+    const detected=receiptMime(bytes);
+    if (!detected || detected!==declaredMime) throw new HttpError(415,'RECEIPT_FILE_TYPE_MISMATCH');
+    const sha256Hex=createHash('sha256').update(bytes).digest('hex');
+    const result=await db.completePurchaseReceiptUpload({organizationId:credential.organizationId,receiptId,objectKey,sha256Hex,byteSize:bytes.byteLength,mimeType:detected});
+    return response(202,{receiptId,status:result?.status ?? 'queued',duplicateOfReceiptId:result?.duplicateOf??result?.duplicate_of??null});
+  });
+  const purchaseReceiptStatus = run(async req => {
+    if (req.method!=='GET') throw new HttpError(405,'METHOD_NOT_ALLOWED');
+    const credential=await integrationCredential(req);
+    const receiptId=new URL(req.url).pathname.split('/').at(-1) ?? '';
+    if (!UUID.test(receiptId)) throw new HttpError(400,'INVALID_RECEIPT_ID');
+    const record=await db.getPurchaseReceiptForIntegration({organizationId:credential.organizationId,integrationId:credential.integrationId,receiptId});
+    if (!record) throw new HttpError(404,'RECEIPT_NOT_FOUND');
+    return ok({receiptId,status:record.status,createdAt:record.submitted_at ?? record.createdAt,duplicateOfReceiptId:record.duplicate_of??null,reviewUrl:`/?purchaseReceipt=${receiptId}&organizationId=${credential.organizationId}`});
+  });
+  const purchaseReceipts = run(async req => {
+    const url=new URL(req.url), queryOrganizationId=url.searchParams.get('organizationId');
+    const pathParts=url.pathname.split('/').filter(Boolean);
+    const action=['complete','approve','reject'].includes(pathParts.at(-1)) ? pathParts.at(-1) : null;
+    const receiptId=action ? pathParts.at(-2) : pathParts.at(-1);
+    const actionBody=req.method==='POST'&&action ? await readJson(req,action==='approve'?80_000:32_000) : null;
+    const organizationId=queryOrganizationId ?? actionBody?.organizationId ?? null;
+    if(queryOrganizationId&&actionBody?.organizationId&&queryOrganizationId!==actionBody.organizationId) throw new HttpError(400,'INVALID_ORGANIZATION_ID');
+    if (req.method==='POST' && pathParts.length===2 && pathParts[1]==='purchase-receipts') {
+      const body=await readJson(req,12_000);
+      idempotency(req);
+      if(!exactObject(body,['organizationId','externalSubmissionId','filename','contentType'])||!UUID.test(body.organizationId??'')||!text(body.externalSubmissionId,194)||/[\u0000-\u001f\u007f]/.test(body.externalSubmissionId)||!text(body.filename,300)||!RECEIPT_MIME_TYPES.has(body.contentType)) throw new HttpError(400,'INVALID_RECEIPT_SUBMISSION');
+      const actor=await authorize(req,body.organizationId,['owner','operator','reviewer']);
+      const submission=await db.createManualPurchaseReceiptSubmission({organizationId:body.organizationId,submissionId:body.externalSubmissionId,filename:cleanFilename(body.filename),mimeType:body.contentType,accessToken:actor.accessToken});
+      if(submission.status && submission.status!=='awaiting_upload') return created({receiptId:submission.receiptId,status:submission.status});
+      const upload=await db.createPurchaseReceiptUploadUrl({objectKey:submission.objectKey});
+      return created({receiptId:submission.receiptId,status:submission.status??'awaiting_upload',upload:{url:upload.url,token:upload.token,method:'PUT',contentType:body.contentType,headers:{'x-upsert':'false'}}});
+    }
+    const actor=await authorize(req,organizationId,action==='complete'?['owner','operator','reviewer']:['owner','operator','reviewer','read_only']);
+    if (req.method==='GET' && !UUID.test(receiptId ?? '')) {
+      const rows=await db.listPurchaseReceipts({organizationId,accessToken:actor.accessToken});
+      return ok({receipts:rows.map(receiptPublicRecord)});
+    }
+    if (!UUID.test(receiptId)) throw new HttpError(405,'METHOD_NOT_ALLOWED');
+    if(req.method==='POST'&&action==='complete') {
+      const body=actionBody;
+      if(!exactObject(body,['organizationId'])||body.organizationId!==organizationId) throw new HttpError(400,'INVALID_RECEIPT_COMPLETION');
+      const record=await db.getPurchaseReceipt({organizationId,receiptId,accessToken:actor.accessToken});
+      if(!record) throw new HttpError(404,'RECEIPT_NOT_FOUND');
+      const objectKey=`${organizationId}/purchase-receipts/${receiptId}/${cleanFilename(record.original_filename??record.originalFilename)}`;
+      const mime=record.declared_mime_type??record.mimeType;
+      const bytes=await db.downloadPurchaseReceiptObject({objectKey});
+      if(!bytes.length||bytes.byteLength>MAX_PURCHASE_RECEIPT_BYTES) throw new HttpError(413,'RECEIPT_FILE_SIZE_INVALID');
+      const detected=receiptMime(bytes); if(!detected||detected!==mime) throw new HttpError(415,'RECEIPT_FILE_TYPE_MISMATCH');
+      const result=await db.completePurchaseReceiptUpload({organizationId,receiptId,objectKey,sha256Hex:createHash('sha256').update(bytes).digest('hex'),byteSize:bytes.byteLength,mimeType:detected});
+    return response(202,{receiptId,status:result?.status??'queued',duplicateOfReceiptId:result?.duplicateOf??result?.duplicate_of??null});
+    }
+    if (req.method==='GET') {
+      const receipt=await db.getPurchaseReceipt({organizationId,receiptId,accessToken:actor.accessToken});
+      if (!receipt) throw new HttpError(404,'RECEIPT_NOT_FOUND');
+      const version=Number(receipt.active_draft_version ?? receipt.activeDraftVersion ?? 0);
+      const draft=version ? await db.getPurchaseReceiptDraft({organizationId,receiptId,version,accessToken:actor.accessToken}) : null;
+      let evidenceUrl=null;
+      const evidenceId=receipt.evidence_file_id ?? receipt.evidenceFileId;
+      if (evidenceId && UUID.test(evidenceId)) evidenceUrl=(await db.getEvidenceSignedUrl({organizationId,evidenceId,accessToken:actor.accessToken}))?.url ?? null;
+      const requestedCurrency=url.searchParams.get('currency');
+      const currency=draft?.draft?.currency ?? (/^[A-Z]{3}$/.test(requestedCurrency??'')?requestedCurrency:null);
+      const candidates=currency && db.listPurchaseReceiptCatalogCandidates ? await db.listPurchaseReceiptCatalogCandidates({organizationId,currency,accessToken:actor.accessToken}) : [];
+      const inventoryItems=db.listInventoryItems ? await db.listInventoryItems({organizationId,asOf:new Date().toISOString(),accessToken:actor.accessToken}) : [];
+      const [effects,decisions]=await Promise.all([
+        db.listPurchaseReceiptEffects?db.listPurchaseReceiptEffects({organizationId,receiptId,accessToken:actor.accessToken}):[],
+        db.listPurchaseReceiptDecisions?db.listPurchaseReceiptDecisions({organizationId,receiptId,accessToken:actor.accessToken}):[],
+      ]);
+      return ok({receipt:receiptPublicRecord(receipt),draft:draft?.draft ?? null,version,candidates,inventoryItems:inventoryItems.map(item=>({id:item.id,sku:item.sku,name:item.name,currency:item.currency,squareCatalogObjectId:item.square_catalog_object_id??null,effectiveFrom:item.effective_from??null,unitCostMinor:item.unit_cost_minor??null,itemKind:item.item_kind})),effects,decisions,evidenceUrl});
+    }
+    if (req.method==='POST' && url.pathname.endsWith('/approve')) {
+      const body=actionBody,key=idempotency(req);
+      if (!exactObject(body,['organizationId','expectedVersion','reason','costUpdates','stockReceipts','payments','currency','confirmPurchaseDocument']) || body.organizationId!==organizationId || !Number.isSafeInteger(body.expectedVersion) || body.expectedVersion<1 || !text(body.reason,1000) || body.reason.trim().length<10 || typeof body.confirmPurchaseDocument!=='boolean'
+          || !Array.isArray(body.costUpdates) || !Array.isArray(body.stockReceipts) || !Array.isArray(body.payments) || !(body.currency===null || /^[A-Z]{3}$/.test(body.currency))) throw new HttpError(400,'INVALID_RECEIPT_APPROVAL');
+      const reviewer=await authorize(req,organizationId,['owner','reviewer']);
+      const receipt=await db.getPurchaseReceipt({organizationId,receiptId,accessToken:reviewer.accessToken});
+      if (!receipt) throw new HttpError(404,'RECEIPT_NOT_FOUND');
+      if(Number(receipt.active_draft_version??receipt.activeDraftVersion)!==body.expectedVersion) throw new HttpError(409,'RECEIPT_VERSION_CONFLICT');
+      const draftRow=await db.getPurchaseReceiptDraft({organizationId,receiptId,version:body.expectedVersion,accessToken:reviewer.accessToken});
+      if (!draftRow?.draft) throw new HttpError(409,'RECEIPT_VERSION_CONFLICT');
+      const draft=draftRow.draft, validLineIds=new Set((draft.lines ?? []).map(line=>line.lineId));
+      if(body.costUpdates.length>60||body.stockReceipts.length>60||body.payments.length>50) throw new HttpError(400,'INVALID_RECEIPT_APPROVAL');
+      for(const effect of [...body.costUpdates,...body.stockReceipts]) if(!effect||!validLineIds.has(effect.lineId)) throw new HttpError(400,'INVALID_RECEIPT_APPROVAL');
+      const confirmedCurrency=draft.currency??body.currency;
+      for(const cost of body.costUpdates) if(!text(cost.catalogObjectId,200)||!text(cost.name,200)||!Number.isSafeInteger(cost.unitCostMinor)||cost.unitCostMinor<0||cost.unitCostMinor>=1_000_000_000_000||! /^[A-Z]{3}$/.test(cost.currency??'')||cost.currency!==confirmedCurrency||!validDate(cost.effectiveFrom)) throw new HttpError(400,'INVALID_RECEIPT_APPROVAL');
+      for(const stock of body.stockReceipts) if(!UUID.test(stock.itemId ?? '')||!Number.isSafeInteger(stock.quantity)||stock.quantity<1||stock.quantity>1_000_000||!Number.isSafeInteger(stock.unitCostMinor)||stock.unitCostMinor<0||stock.unitCostMinor>=1_000_000_000_000||! /^[A-Z]{3}$/.test(stock.currency??'')||stock.currency!==confirmedCurrency||!Number.isSafeInteger(stock.packageQuantity)||stock.packageQuantity<1||!Number.isSafeInteger(stock.unitsPerPackage)||stock.unitsPerPackage<1||stock.quantity>stock.packageQuantity*stock.unitsPerPackage||!validDate(stock.receivedAt)) throw new HttpError(400,'INVALID_RECEIPT_APPROVAL');
+      let paymentTotal=0;
+      for(const payment of body.payments) {
+        const hasAccount=UUID.test(payment.accountId??''),hasExisting=UUID.test(payment.existingMovementId??'');
+        if(!Number.isSafeInteger(payment.amountMinor)||payment.amountMinor<1||payment.amountMinor>=1_000_000_000_000||!(/^[A-Z]{3}$/.test(payment.currency ?? ''))||payment.currency!==confirmedCurrency||!validDate(payment.paidAt)||hasAccount===hasExisting) throw new HttpError(400,'INVALID_RECEIPT_APPROVAL');
+        paymentTotal+=payment.amountMinor;
+        if(!Number.isSafeInteger(paymentTotal)) throw new HttpError(400,'INVALID_RECEIPT_APPROVAL');
+      }
+      if(draft.totals?.totalMinor !== null && draft.totals?.totalMinor !== undefined && paymentTotal>draft.totals.totalMinor) throw new HttpError(400,'PAYMENT_EXCEEDS_RECEIPT_TOTAL');
+      if(typeof db.approvePurchaseReceipt!=='function') throw new HttpError(503,'RECEIPT_APPROVAL_UNAVAILABLE');
+      const selections={currency:body.currency,confirmPurchaseDocument:body.confirmPurchaseDocument,
+        costUpdates:body.costUpdates,
+        stockReceipts:body.stockReceipts.map((stock,index)=>({lineId:stock.lineId,itemId:stock.itemId,quantity:stock.quantity,unitCostMinor:stock.unitCostMinor,currency:stock.currency,
+          packageQuantity:stock.packageQuantity,unitsPerPackage:stock.unitsPerPackage,occurredAt:stock.receivedAt,eventKey:stock.eventKey??`${key}:stock:${stock.lineId}:${index}`})),
+        payments:body.payments.map((payment,index)=>({paymentKey:payment.paymentKey??`${key}:payment:${index}`,accountId:payment.accountId||undefined,existingMovementId:payment.existingMovementId||undefined,
+          amountMinor:payment.amountMinor,currency:payment.currency,occurredAt:payment.paidAt}))};
+      const result=await db.approvePurchaseReceipt({organizationId,receiptId,expectedVersion:body.expectedVersion,selections,reason:body.reason.trim(),idempotencyKey:key,accessToken:reviewer.accessToken});
+      return created(result);
+    }
+    if (req.method==='POST' && url.pathname.endsWith('/reject')) {
+      const body=actionBody,key=idempotency(req);
+      if(!exactObject(body,['organizationId','expectedVersion','reason'])||body.organizationId!==organizationId||!Number.isSafeInteger(body.expectedVersion)||!text(body.reason,1000)||body.reason.trim().length<10) throw new HttpError(400,'INVALID_RECEIPT_DECISION');
+      const reviewer=await authorize(req,organizationId,['owner','reviewer']);
+      if(typeof db.rejectPurchaseReceipt!=='function') throw new HttpError(503,'RECEIPT_APPROVAL_UNAVAILABLE');
+      return created(await db.rejectPurchaseReceipt({organizationId,receiptId,expectedVersion:body.expectedVersion,reason:body.reason.trim(),idempotencyKey:key,accessToken:reviewer.accessToken}));
+    }
+    throw new HttpError(405,'METHOD_NOT_ALLOWED');
+  });
+  const manualPurchaseReceiptIntake = run(async req => {
+    if(req.method!=='POST') throw new HttpError(405,'METHOD_NOT_ALLOWED');
+    const length=Number(req.headers.get('content-length')); if(Number.isFinite(length)&&length>MAX_PURCHASE_RECEIPT_BYTES+64_000) throw new HttpError(413,'BODY_TOO_LARGE');
+    let form; try { form=await req.formData(); } catch { throw new HttpError(400,'INVALID_MULTIPART'); }
+    const organizationId=String(form.get('organizationId') ?? ''), file=form.get('file');
+    if(!UUID.test(organizationId)||!file||typeof file.arrayBuffer!=='function'||file.size<1||file.size>MAX_PURCHASE_RECEIPT_BYTES) throw new HttpError(400,'INVALID_RECEIPT_FILE');
+    const actor=await authorize(req,organizationId,['owner','operator','reviewer']);
+    const bytes=new Uint8Array(await file.arrayBuffer()), mimeType=receiptMime(bytes);
+    if(!mimeType||mimeType!==file.type) throw new HttpError(415,'RECEIPT_FILE_TYPE_MISMATCH');
+    const submission=await db.createManualPurchaseReceiptSubmission({organizationId,submissionId:randomUUID(),filename:cleanFilename(file.name),mimeType,accessToken:actor.accessToken});
+    const upload=await db.createPurchaseReceiptUploadUrl({objectKey:submission.objectKey});
+    const uploadResponse=await fetch(upload.url,{method:'PUT',headers:{'content-type':mimeType,...(upload.token?{'x-upsert':'false'}:{})},body:bytes});
+    if(!uploadResponse.ok) throw new HttpError(503,'RECEIPT_UPLOAD_FAILED');
+    const sha256Hex=createHash('sha256').update(bytes).digest('hex');
+    const result=await db.completePurchaseReceiptUpload({organizationId,receiptId:submission.receiptId,objectKey:submission.objectKey,sha256Hex,byteSize:bytes.byteLength,mimeType});
+    return created({receiptId:submission.receiptId,status:result?.status ?? 'queued'});
   });
   const receiptItemCosts = run(async req => {
     if (req.method !== 'POST') throw new HttpError(405, 'METHOD_NOT_ALLOWED');
@@ -955,5 +1177,5 @@ export function createHandlers(adapters) {
     return ok(result);
   });
 
-  return Object.freeze({ dashboard, issues, issueEvidence, audit, settings, inventory, inventoryPurchase, receiptDraft, receiptItemCosts, inventoryCorrection, inventoryOpening, inventoryItem, squareCatalogItem, squareCatalogCreate, squareCatalogManage, analytics, evidence, evidenceUrl, manualMovement, manualMovements, observation, observations, proposal, itemCost, saleLineCost, refundReview, decision, replay, sync, webhook });
+  return Object.freeze({ dashboard, issues, issueEvidence, audit, settings, inventory, inventoryPurchase, receiptDraft, receiptItemCosts, receiptIntegration, purchaseReceiptIntake, purchaseReceiptComplete, purchaseReceiptStatus, purchaseReceipts, manualPurchaseReceiptIntake, inventoryCorrection, inventoryOpening, inventoryItem, squareCatalogItem, squareCatalogCreate, squareCatalogManage, analytics, evidence, evidenceUrl, manualMovement, manualMovements, observation, observations, proposal, itemCost, saleLineCost, refundReview, decision, replay, sync, webhook });
 }

@@ -16,6 +16,22 @@ supabase migration list
 
 The project reference is in the Supabase Dashboard project URL. `supabase login` uses a Supabase Personal Access Token; `supabase link` may ask for the database password. These are distinct from `SUPABASE_SECRET_KEY`. Confirm the linked project and migration history before `db push`; back up and review the target first if it contains data. The migrations create the app schema and private evidence bucket, but do not create Auth users or organization rows. Migration `202610020005_receipt_agent_cost_approval.sql` adds the receipt helper's budget and owner/reviewer approval RPC. Migration `202610020006_enable_inventory_and_product_analytics.sql` enables both capabilities for current and future organizations. Migration `202610030000_square_catalog_item_creation.sql` adds the owner-only Square item creation flow and stores the requested OAuth scopes with single-use state. Migration `202610030001_product_catalog_listing.sql` adds the membership-checked read RPC used to list synced Square variations and registered supplies with current prices and approved costs. Migration `202610030002_catalog_item_management.sql` exposes Square archive state in the catalogue and adds an audited, owner-only catalog change RPC with private idempotency records. The repository may be ahead of a linked project; verify the exact target and applied history with `supabase migration list` before any push. Never use production as a migration-test database.
 
+## Purchase Receipt Inbox rollout
+
+The purchase receipt release adds an ordered migration for restricted integration
+principals, private document submissions, immutable extraction versions, human
+decisions, and atomic cost/stock/payment posting. Review the new migration and its
+SQL tests against a disposable database before production. Confirm the linked
+project and applied migration list; production `db push` requires explicit user
+authorization. Deploy compatible web/API and worker builds together after the
+schema is available. The worker needs document-processing binaries and a
+server-only OpenRouter key for receipt extraction. No external credentials or live
+merchant evidence belong in SQL fixtures.
+
+See `../docs/PURCHASE_RECEIPTS.md` for operational verification and
+`../docs/POWER_AUTOMATE_SETUP.md` for unattended document delivery. Receipt intake
+does not grant the integration authority to approve financial records.
+
 ## Enable the first sign-in
 
 The web app supports email/password sign-in and has no public sign-up form. Supabase email/password Auth is enabled by default. In **Authentication → URL Configuration**, set the Site URL to `https://operations.ccdsinvest.com` and allow that URL for Auth email redirects. This Supabase Auth URL is separate from the Square OAuth callback URL.

@@ -24,11 +24,17 @@ or paste secret values into chat.
 | `SQUARE_TOKEN_ENCRYPTION_KEY` | The same base64-encoded 32-byte key used by the web deployment; existing stored OAuth tokens depend on it |
 | `SUPABASE_URL` | Supabase project URL |
 | `SUPABASE_SECRET_KEY` | Supabase service/secret key; grants the worker privileged RPC access |
+| `OPENROUTER_API_KEY` | Worker-only key for bounded supplier receipt extraction; drafts still require human approval |
+| `OPENROUTER_MODEL` | Receipt extraction model (default `openai/gpt-6-luna`) |
+| `PURCHASE_RECEIPT_MAX_OUTPUT_TOKENS` | Receipt extraction response limit (default 1400, maximum 1500); organization budget reservations still apply |
 
-`SUPABASE_PUBLISHABLE_KEY` is not used by worker requests. OpenRouter is not
-enabled in this first worker process; issue-investigation jobs remain unclaimed
-until its durable budget/proposal adapter is implemented. Webhook signing
-secrets belong on the web/API deployment, not this worker.
+`SUPABASE_PUBLISHABLE_KEY` is not used by worker requests. The image installs
+Poppler and Tesseract for searchable/scanned PDFs and JPEG/PNG receipts. Each
+document is limited to 8 MiB, 20 PDF pages, 40 megapixels for image uploads,
+24,000 extracted characters, and three minutes of native extraction time.
+Receipt model calls reserve the organization budget and produce review drafts;
+they never approve or post financial effects. Webhook signing secrets belong
+on the web/API deployment, not this worker.
 
 Optional tuning: `WORKER_POLL_MS` (default 3000, range 250–60000),
 `WORKER_LEASE_SECONDS` (120), `WORKER_MAX_JOB_ATTEMPTS` (5),

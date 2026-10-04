@@ -389,6 +389,167 @@ export function createSupabaseAdapters({ url, publishableKey, secretKey, tokenEn
       const url = /^https?:\/\//i.test(payload.signedURL) ? payload.signedURL : `${baseUrl}/storage/v1${payload.signedURL.startsWith('/') ? '' : '/'}${payload.signedURL}`;
       return { url };
     },
+    async createPurchaseReceiptIntegration({ organizationId, name, tokenSha256, accessToken }) {
+      const { data, error } = await userRest(accessToken).rpc('register_purchase_receipt_integration', {
+        p_organization_id: organizationId, p_name: name, p_token_sha256: tokenSha256,
+      });
+      if (error) throw error;
+      return typeof data === 'string' ? { id: data } : data;
+    },
+    async revokePurchaseReceiptIntegration({ organizationId, integrationId, accessToken }) {
+      const { data, error } = await userRest(accessToken).rpc('revoke_purchase_receipt_integration', {
+        p_organization_id: organizationId, p_integration_id: integrationId,
+      });
+      if (error) throw error;
+      return data;
+    },
+    async listPurchaseReceiptIntegrations({ organizationId, accessToken }) {
+      const { data, error } = await userRest(accessToken).rpc('list_purchase_receipt_integrations', { p_organization_id: organizationId });
+      if (error) throw error;
+      return Array.isArray(data) ? data : [];
+    },
+    async authorizePurchaseReceiptIntegration({ tokenSha256 }) {
+      const { data, error } = await serviceRest().rpc('authorize_purchase_receipt_integration', { p_token_sha256: tokenSha256 });
+      if (error) throw error;
+      const value = Array.isArray(data) ? data[0] : data;
+      return value ? { organizationId: value.organizationId ?? value.organization_id, integrationId: value.integrationId ?? value.integration_id } : null;
+    },
+    async createPurchaseReceiptSubmission({ organizationId, integrationId = null, externalSubmissionId, filename, mimeType }) {
+      const { data, error } = await serviceRest().rpc('create_purchase_receipt_submission', {
+        p_organization_id: organizationId, p_integration_id: integrationId,
+        p_external_submission_id: externalSubmissionId, p_filename: filename, p_mime_type: mimeType,
+      });
+      if (error) throw error;
+      const value = Array.isArray(data) ? data[0] : data;
+      return value ? { receiptId: value.receiptId ?? value.receipt_id, status: value.status, objectKey: value.objectKey ?? value.object_key } : null;
+    },
+    async createManualPurchaseReceiptSubmission({ organizationId, submissionId, filename, mimeType, accessToken }) {
+      const { data, error } = await userRest(accessToken).rpc('create_manual_purchase_receipt_submission', {
+        p_organization_id: organizationId, p_submission_id: submissionId, p_filename: filename, p_mime_type: mimeType,
+      });
+      if (error) throw error;
+      const value = Array.isArray(data) ? data[0] : data;
+      return value ? { receiptId: value.receiptId ?? value.receipt_id, status: value.status, objectKey: value.objectKey ?? value.object_key } : null;
+    },
+    async getPurchaseReceiptForIntegration({ organizationId, integrationId, receiptId }) {
+      const query = new URLSearchParams({ select: '*', organization_id: eq(organizationId), integration_id: eq(integrationId), id: eq(receiptId), limit: '2' });
+      return one(await table(serviceRest(), 'purchase_receipt_submissions', query), 'integration purchase receipt');
+    },
+    async createPurchaseReceiptUploadUrl({ objectKey }) {
+      if (!serviceKey) throw new Error('Privileged evidence storage is unavailable');
+      const path = objectKey.split('/').map(encodeURIComponent).join('/');
+      const response = await fetchImpl(`${baseUrl}/storage/v1/object/upload/sign/finance-evidence/${path}`, {
+        method: 'POST', headers: { apikey: serviceKey, ...(serviceAuthorization ? { Authorization: serviceAuthorization } : {}), 'content-type': 'application/json' },
+        body: JSON.stringify({ upsert: false }),
+      });
+      let payload = null; try { payload = await response.json(); } catch {}
+      if (!response.ok || typeof payload?.url !== 'string' && typeof payload?.signedURL !== 'string') throw safeError(payload, response.status);
+      const signed = payload.url ?? payload.signedURL;
+      let url = /^https?:\/\//i.test(signed) ? signed : `${baseUrl}/storage/v1${signed.startsWith('/') ? '' : '/'}${signed}`;
+      const token = payload.token ?? null;
+      if (token) { const signedUrl = new URL(url); signedUrl.searchParams.set('token',token); url=signedUrl.toString(); }
+      return { url, token };
+    },
+    async downloadPurchaseReceiptObject({ objectKey }) {
+      if (!serviceKey) throw new Error('Privileged evidence storage is unavailable');
+      const path = objectKey.split('/').map(encodeURIComponent).join('/');
+      const response = await fetchImpl(`${baseUrl}/storage/v1/object/finance-evidence/${path}`, {
+        headers: { apikey: serviceKey, ...(serviceAuthorization ? { Authorization: serviceAuthorization } : {}) },
+      });
+      if (!response.ok) throw safeError(null, response.status);
+      const length=Number(response.headers.get('content-length'));
+      if(Number.isFinite(length)&&length>8*1024*1024) throw Object.assign(new Error('Receipt exceeds size limit'),{code:'RECEIPT_FILE_SIZE_INVALID',permanent:true});
+      if(!response.body) return new Uint8Array();
+      const reader=response.body.getReader(),chunks=[];let total=0;
+      try { for(;;) { const {done,value}=await reader.read();if(done)break;total+=value.byteLength;if(total>8*1024*1024){await reader.cancel();throw Object.assign(new Error('Receipt exceeds size limit'),{code:'RECEIPT_FILE_SIZE_INVALID',permanent:true});}chunks.push(value); } }
+      finally { reader.releaseLock(); }
+      const bytes=new Uint8Array(total);let offset=0;for(const chunk of chunks){bytes.set(chunk,offset);offset+=chunk.byteLength;}return bytes;
+    },
+    async completePurchaseReceiptUpload({ organizationId, receiptId, objectKey, sha256Hex, byteSize, mimeType }) {
+      const { data, error } = await serviceRest().rpc('complete_purchase_receipt_upload', {
+        p_organization_id: organizationId, p_receipt_id: receiptId, p_object_key: objectKey,
+        p_sha256_hex: sha256Hex, p_byte_size: byteSize, p_mime_type: mimeType,
+      });
+      if (error) throw error;
+      return data;
+    },
+    async getPurchaseReceiptForProcessing({ organizationId, receiptId }) {
+      const { data, error } = await serviceRest().rpc('get_purchase_receipt_for_processing', { p_organization_id: organizationId, p_receipt_id: receiptId });
+      if (error) throw error;
+      return Array.isArray(data) ? data[0] ?? null : data;
+    },
+    async savePurchaseReceiptDraftSystem({ organizationId, receiptId, expectedVersion, draft }) {
+      const { data, error } = await serviceRest().rpc('save_purchase_receipt_draft', {
+        p_organization_id: organizationId, p_receipt_id: receiptId, p_expected_version: expectedVersion, p_draft: draft,
+      });
+      if (error) throw error;
+      return Array.isArray(data) ? data[0] ?? null : data;
+    },
+    async finalizePurchaseReceiptProjection({ organizationId, receiptId, decisionId, succeeded, errorCode = null }) {
+      const { data, error } = await serviceRest().rpc('finalize_purchase_receipt_projection', {
+        p_organization_id: organizationId, p_receipt_id: receiptId, p_decision_id: decisionId,
+        p_succeeded: succeeded, p_error_code: errorCode,
+      });
+      if (error) throw error;
+      return data;
+    },
+    async reservePurchaseReceiptModelBudget({ organizationId, receiptId, model, maxInputTokens, maxOutputTokens, maxAttempts }) {
+      const { data, error } = await serviceRest().rpc('reserve_purchase_receipt_model_budget', {
+        p_organization_id: organizationId, p_receipt_id: receiptId, p_model_id: model,
+        p_max_input_tokens: maxInputTokens, p_max_output_tokens: maxOutputTokens, p_max_attempts: maxAttempts,
+      });
+      if (error) throw error;
+      return data === true;
+    },
+    async recordPurchaseReceiptModelUsage({ organizationId, receiptId, model, usage, attempt }) {
+      const { data, error } = await serviceRest().rpc('record_purchase_receipt_model_usage', {
+        p_organization_id: organizationId, p_receipt_id: receiptId, p_model_id: model,
+        p_usage: usage ?? {}, p_attempt: attempt,
+      });
+      if (error) throw error;
+      return data;
+    },
+    async failPurchaseReceiptProcessing({ organizationId, receiptId, code }) {
+      const { data, error } = await serviceRest().rpc('fail_purchase_receipt_processing', { p_organization_id: organizationId, p_receipt_id: receiptId, p_code: code });
+      if (error) throw error;
+      return data;
+    },
+    async listPurchaseReceipts({ organizationId, accessToken }) {
+      const query = new URLSearchParams({ select: '*', organization_id: eq(organizationId), order: 'submitted_at.desc', limit: '100' });
+      return await table(userRest(accessToken), 'purchase_receipt_submissions', query);
+    },
+    async getPurchaseReceipt({ organizationId, receiptId, accessToken }) {
+      const query = new URLSearchParams({ select: '*', organization_id: eq(organizationId), id: eq(receiptId), limit: '2' });
+      return one(await table(userRest(accessToken), 'purchase_receipt_submissions', query), 'purchase receipt');
+    },
+    async getPurchaseReceiptDraft({ organizationId, receiptId, version, accessToken }) {
+      const query = new URLSearchParams({ select: 'version,draft,created_at', organization_id: eq(organizationId), receipt_id: eq(receiptId), version: eq(version), limit: '2' });
+      return one(await table(userRest(accessToken), 'purchase_receipt_draft_versions', query), 'purchase receipt draft');
+    },
+    async listPurchaseReceiptEffects({ organizationId, receiptId, accessToken }) {
+      const query = new URLSearchParams({ select: 'id,source_line_id,effect_type,effect_key,effect_payload,inventory_movement_id,cash_movement_id,created_at', organization_id: eq(organizationId), receipt_id: eq(receiptId), order: 'created_at.asc', limit: '500' });
+      return await table(userRest(accessToken), 'purchase_receipt_effects', query);
+    },
+    async listPurchaseReceiptDecisions({ organizationId, receiptId, accessToken }) {
+      const query = new URLSearchParams({ select: 'id,draft_version,decision,selections,reason,decided_by,decided_at', organization_id: eq(organizationId), receipt_id: eq(receiptId), order: 'decided_at.desc', limit: '100' });
+      return await table(userRest(accessToken), 'purchase_receipt_decisions', query);
+    },
+    async approvePurchaseReceipt({ organizationId, receiptId, expectedVersion, selections, reason, idempotencyKey, accessToken }) {
+      const { data, error } = await userRest(accessToken).rpc('approve_purchase_receipt', {
+        p_organization_id: organizationId, p_receipt_id: receiptId, p_expected_version: expectedVersion,
+        p_selections: selections, p_reason: reason, p_idempotency_key: idempotencyKey,
+      });
+      if (error) throw error;
+      return data;
+    },
+    async rejectPurchaseReceipt({ organizationId, receiptId, expectedVersion, reason, idempotencyKey, accessToken }) {
+      const { data, error } = await userRest(accessToken).rpc('reject_purchase_receipt', {
+        p_organization_id: organizationId, p_receipt_id: receiptId, p_expected_version: expectedVersion,
+        p_reason: reason, p_idempotency_key: idempotencyKey,
+      });
+      if (error) throw error;
+      return data;
+    },
     async getSquareConnection({ organizationId }) {
       const connection = await tokenVault.getDecrypted({ organizationId });
       return connection ? { accessToken: connection.accessToken, refreshToken: connection.refreshToken, expiresAt: connection.expiresAt, merchantId: connection.merchantId } : null;
@@ -691,7 +852,14 @@ export function createSupabaseAdapters({ url, publishableKey, secretKey, tokenEn
     },
     async listReceiptCatalogCandidates(args) {
       const { data, error } = await userRest(args.accessToken).rpc('list_receipt_catalog_candidates', {
-        organization_id: args.organizationId, currency: args.currency
+        p_organization_id: args.organizationId, p_currency: args.currency
+      });
+      if (error) throw error;
+      return Array.isArray(data) ? data : [];
+    },
+    async listPurchaseReceiptCatalogCandidates({ organizationId, currency, accessToken }) {
+      const { data, error } = await userRest(accessToken).rpc('list_purchase_receipt_catalog_candidates', {
+        p_organization_id: organizationId, p_currency: currency,
       });
       if (error) throw error;
       return Array.isArray(data) ? data : [];
@@ -880,6 +1048,11 @@ export function createSupabaseAdapters({ url, publishableKey, secretKey, tokenEn
   };
 
   const queue = {
+    async enqueuePurchaseReceiptProcess({ organizationId, receiptId }) {
+      const { data, error } = await serviceRest().rpc('enqueue_purchase_receipt_process', { p_organization_id: organizationId, p_receipt_id: receiptId });
+      if (error) throw error;
+      return typeof data === 'string' ? { id: data } : data;
+    },
     async enqueueSquareSync(args) {
       const { data, error } = await serviceRest().rpc('enqueue_square_sync', {
         organization_id: args.organizationId, start_at: args.startAt, end_at: args.endAt,

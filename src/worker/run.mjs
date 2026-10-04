@@ -39,7 +39,10 @@ const worker = createWorker({
     squareClientId: required('SQUARE_CLIENT_ID'),
     squareClientSecret: required('SQUARE_CLIENT_SECRET'),
     accountingTimezone,
-    enabledJobTypes: ['square.webhook', 'square.sync', 'projection.replay'],
+    enabledJobTypes: ['square.webhook', 'square.sync', 'projection.replay', 'receipt.process'],
+    openRouterApiKey: process.env.OPENROUTER_API_KEY?.trim() || '',
+    openRouterModel: process.env.OPENROUTER_MODEL?.trim() || 'openai/gpt-6-luna',
+    openRouterMaxOutputTokens: integer('PURCHASE_RECEIPT_MAX_OUTPUT_TOKENS', 1400, 100, 1500),
     leaseSeconds: integer('WORKER_LEASE_SECONDS', 120, 30, 900),
     maxJobAttempts: integer('WORKER_MAX_JOB_ATTEMPTS', 5, 1, 12),
     maxBackfillPages: integer('WORKER_MAX_BACKFILL_PAGES', 10000, 1, 20000),
@@ -55,7 +58,7 @@ let stopping = false;
 for (const signal of ['SIGINT', 'SIGTERM']) process.on(signal, () => { stopping = true; });
 const log = (level, event, fields = {}) => process.stdout.write(`${JSON.stringify({ at: new Date().toISOString(), level, event, workerId, ...fields })}\n`);
 
-log('info', 'worker_started', { squareEnvironment, enabledJobTypes: ['square.webhook', 'square.sync', 'projection.replay'] });
+log('info', 'worker_started', { squareEnvironment, enabledJobTypes: ['square.webhook', 'square.sync', 'projection.replay', 'receipt.process'], receiptExtractionConfigured: Boolean(process.env.OPENROUTER_API_KEY?.trim()) });
 while (!stopping) {
   try {
     const result = await worker.runOne({ workerId });
