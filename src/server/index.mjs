@@ -649,7 +649,7 @@ export function createHandlers(adapters) {
     const body = await readJson(req), key = idempotency(req);
     const fields = ['organizationId','action','squareItemId','squareCatalogObjectId','name','description',
       'variationName','sku','pricingType','priceMinor','currency','reason'];
-    if (!exactObject(body, fields) || !UUID.test(body.organizationId ?? '')
+    if (!exactObject(body, fields, ['organizationId','action','squareItemId','reason']) || !UUID.test(body.organizationId ?? '')
         || !['update_item','update_variation','add_variation','archive','restore'].includes(body.action)
         || !text(body.squareItemId, 200) || !text(body.reason, 1000) || body.reason.trim().length < 10) {
       throw new HttpError(400, 'INVALID_SQUARE_CATALOG_CHANGE');
