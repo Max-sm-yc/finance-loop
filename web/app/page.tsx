@@ -1038,12 +1038,12 @@ function Review({ issues, organizationId, currency, onSaved }: { issues: Issue[]
             : String(issue.details?.message ?? issue.details?.description ?? 'Review the linked source evidence and decide how to handle this item.');
         return <article className="review-item" key={issue.id}>
           <div className="review-symbol">◇</div>
-          <div className="review-copy"><div className="review-title">{issueTitle} <span className="pill warn">{issue.state.replaceAll('_', ' ')}</span></div>
+          <div className="review-copy"><div className="review-title"><button type="button" className="review-issue-trigger" onClick={() => void openIssue(issue)}>{issueTitle}</button> <span className="pill warn">{issue.state.replaceAll('_', ' ')}</span></div>
             <p>{issueMessage}</p>
             {proposal && <details className="proposal-details"><summary>Proposed classification and evidence</summary><pre>{JSON.stringify(proposal.proposal ?? proposal.payload ?? proposal, null, 2)}</pre></details>}
           </div>
           <div className="form-actions review-actions">
-            <button className="secondary" onClick={() => void openIssue(issue)}>Open issue</button>
+            <button type="button" className="secondary" onClick={() => void openIssue(issue)}>Open issue</button>
             {issue.code === 'UNKNOWN_ITEM' && <button className="secondary" disabled={busyId === issue.id} onClick={() => void openCorrection(issue, 'item')}>Record item cost</button>}
             {issue.code === 'REFUND_COGS_REVIEW' && <button className="secondary" disabled={busyId === issue.id} onClick={() => void openCorrection(issue, 'refund')}>Record refund decision</button>}
             {!['UNKNOWN_ITEM', 'REFUND_COGS_REVIEW'].includes(issue.code ?? '') && (proposal ? <button className="secondary" disabled={busyId === issue.id} onClick={() => { setSelected(issue); setReason(''); setError(''); }}>{busyId === issue.id ? 'Saving…' : 'Review proposal'}</button>
