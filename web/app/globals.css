@@ -40,10 +40,9 @@ input[type="search"]:hover { border-color: #465148; }
 
 .shell { min-height: 100vh; display: grid; grid-template-columns: 220px minmax(0, 1fr); }
 .sidebar { position: sticky; top: 0; height: 100vh; min-height: 100vh; padding: 24px 12px 16px; display: flex; flex-direction: column; background: var(--sidebar); border-right: 1px solid var(--line); }
-.brand-lockup { display: flex; align-items: center; gap: 11px; padding: 0 10px; margin-bottom: 32px; }
-.brand-icon { display: grid; place-items: center; width: 32px; height: 32px; border-radius: 7px; color: #07130b; background: var(--green); font-size: 20px; font-weight: 750; }
-.brand-lockup b { display: block; color: var(--text-strong); font-size: 16px; font-weight: 680; letter-spacing: -.55px; line-height: 1.1; }
-.brand-lockup small { display: block; margin-top: 5px; color: var(--subtle); font-size: 9px; font-weight: 650; letter-spacing: 1.4px; }
+.brand-lockup { display: flex; flex-direction: column; align-items: flex-start; gap: 6px; padding: 0 10px; margin-bottom: 32px; }
+.brand-wordmark { display: block; width: min(100%, 164px); height: auto; }
+.brand-lockup small { display: block; margin: 0; color: var(--subtle); font-size: 9px; font-weight: 650; letter-spacing: 1.4px; }
 .workspace { display: flex; align-items: center; gap: 10px; min-width: 0; margin: 0 3px 24px; padding: 9px; border: 1px solid var(--line); border-radius: 7px; background: #171b19; }
 .workspace-mark { display: grid; flex: 0 0 30px; place-items: center; width: 30px; height: 30px; border-radius: 6px; color: #c3cec5; background: #252c27; font-size: 12px; font-weight: 700; }
 .workspace b, .workspace small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -237,6 +236,7 @@ td small.cell-sub { display: block; margin-top: 4px; color: var(--subtle); font-
 .auth-screen { display: grid; place-items: center; min-height: 100vh; padding: 20px; background: var(--canvas); }
 .auth-card { width: min(410px, 100%); padding: 30px; border: 1px solid #303b33; border-radius: 7px; background: #171c19; }
 .auth-card .brand-lockup { margin-bottom: 30px; padding: 0; }
+.auth-card .brand-wordmark { width: min(100%, 210px); }
 .auth-card .eyebrow { margin-top: 0; }
 .auth-card h1 { font-size: 25px; }
 .auth-card label { margin-top: 17px; }

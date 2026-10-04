@@ -358,7 +358,7 @@ export default function Home() {
 
   if (loadingAuth) return <main className="auth-screen"><div className="auth-card">Loading secure workspace…</div></main>;
   if (!user) return <main className="auth-screen"><form className="auth-card" onSubmit={signIn}>
-    <div className="brand-lockup"><span className="brand-icon" aria-hidden="true">Z</span><span><b>ZYTHE</b><small>OPERATIONS ACCOUNTING</small></span></div>
+    <div className="brand-lockup"><img className="brand-wordmark" src="/zythe-wordmark.svg" alt="Zythe" /><small>OPERATIONS ACCOUNTING</small></div>
     <p className="eyebrow">SECURE WORKSPACE</p><h1>Sign in</h1><p className="muted">Use your organization account to access financial records.</p>
     <label>Email address<input type="email" autoComplete="username" required value={email} onChange={e => setEmail(e.target.value)} /></label>
     <label>Password<input type="password" autoComplete="current-password" required value={password} onChange={e => setPassword(e.target.value)} /></label>
@@ -369,7 +369,7 @@ export default function Home() {
   const navItems = NAV.filter(x => x.id !== 'analytics' || features.productAnalytics);
   const title = navItems.find(x => x.id === page)?.label ?? 'Overview';
   return <div className="shell">
-    <aside className="sidebar"><div className="brand-lockup"><span className="brand-icon" aria-hidden="true">Z</span><span><b>ZYTHE</b><small>WORKSPACE</small></span></div>
+    <aside className="sidebar"><div className="brand-lockup"><img className="brand-wordmark" src="/zythe-wordmark.svg" alt="Zythe" /><small>WORKSPACE</small></div>
       <div className="workspace"><span className="workspace-mark">{dashboard?.organization?.name?.slice(0, 1) ?? 'O'}</span><span><b>{dashboard?.organization?.name ?? 'Your workspace'}</b><small>Organization workspace</small></span></div>
       <div className="nav-caption">WORKSPACE</div><nav aria-label="Main navigation">{navItems.map(item => <button key={item.id} className={`nav-link ${page === item.id ? 'selected' : ''}`} onClick={() => navigate(item.id)} aria-current={page === item.id ? 'page' : undefined}>{item.label}{item.id === 'review' && openIssues.length > 0 && <i>{openIssues.length}</i>}</button>)}</nav>
       <div className="sidebar-foot"><div className="profile"><span className="avatar">{user.email?.slice(0, 1).toUpperCase() ?? 'U'}</span><span className="profile-info"><b>{user.email}</b><small>Signed in</small></span><button className="icon-button" onClick={signOut} title="Sign out" aria-label="Sign out">↪</button></div></div>
