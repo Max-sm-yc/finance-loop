@@ -43,6 +43,22 @@ function windowCovered(windows, from, to) {
   }
   return false;
 }
+function uncoveredWindows(windows, from, to) {
+  const start = Date.parse(from), end = Date.parse(to);
+  if (!Number.isFinite(start) || !Number.isFinite(end) || start >= end) return [];
+  const intervals = (Array.isArray(windows) ? windows : []).filter(w => Number.isFinite(Date.parse(w?.from)) && Number.isFinite(Date.parse(w?.to)) && Date.parse(w.to) > Date.parse(w.from))
+    .map(w => [Math.max(start, Date.parse(w.from)), Math.min(end, Date.parse(w.to))])
+    .filter(([left, right]) => left < right).sort((a, b) => a[0] - b[0]);
+  const gaps = [];
+  let cursor = start;
+  for (const [left, right] of intervals) {
+    if (left > cursor) gaps.push({ startAt: new Date(cursor).toISOString(), endAt: new Date(left).toISOString() });
+    if (right > cursor) cursor = right;
+    if (cursor >= end) break;
+  }
+  if (cursor < end) gaps.push({ startAt: new Date(cursor).toISOString(), endAt: new Date(end).toISOString() });
+  return gaps;
+}
 function sourceHealthIncomplete(health, requiredResources, { includeUnlisted = true } = {}) {
   const fresh = row => row?.status === 'fresh' && row.gap == null
     && Number.isFinite(Date.parse(row.lastSuccessfulSyncAt ?? ''))
@@ -302,6 +318,31 @@ export function createHandlers(adapters) {
     if (!exactObject(body, ['organizationId','startAt','endAt']) || !UUID.test(body.organizationId) || !validDate(body.startAt) || !validDate(body.endAt) || Date.parse(body.startAt) >= Date.parse(body.endAt)) throw new HttpError(400, 'INVALID_SYNC');
     if (Date.parse(body.endAt) - Date.parse(body.startAt) > MAX_SYNC_WINDOW_MS) throw new HttpError(400, 'SYNC_WINDOW_TOO_LARGE');
     const actor = await authorize(req, body.organizationId, ['owner']);
+    let coverage = null;
+    if (typeof db.getSquareSyncCoverage === 'function') {
+      try {
+        coverage = await db.getSquareSyncCoverage({ organizationId: body.organizationId, startAt: body.startAt, endAt: body.endAt, accessToken: actor.accessToken });
+      } catch (error) {
+        // Keep existing deployments working until the small coverage RPC is applied.
+        if (error?.code !== 'PGRST202') throw new HttpError(503, 'SQUARE_SYNC_STATUS_UNAVAILABLE');
+      }
+    }
+    const gaps = uncoveredWindows(coverage?.windows, body.startAt, body.endAt);
+    const pendingWindows = Array.isArray(coverage?.pendingWindows) ? coverage.pendingWindows : [];
+    const sourceGaps = coverage?.sourceGaps ?? {};
+    const hasSourceGaps = !Number.isSafeInteger(sourceGaps.missingParentOrderLineCount)
+      || !Number.isSafeInteger(sourceGaps.missingPayoutEntryHealthCount)
+      || sourceGaps.missingParentOrderLineCount > 0 || sourceGaps.missingPayoutEntryHealthCount > 0;
+    const canTrustCoverage = coverage && typeof coverage.sourceHealthFresh === 'boolean' && Array.isArray(coverage.windows)
+      && Array.isArray(coverage.pendingWindows)
+      && Number.isSafeInteger(sourceGaps.missingParentOrderLineCount) && Number.isSafeInteger(sourceGaps.missingPayoutEntryHealthCount);
+    if (canTrustCoverage && coverage.sourceHealthFresh && !hasSourceGaps && gaps.length === 0) {
+      return ok({ skipped: true, reason: 'PERIOD_CURRENT', startAt: body.startAt, endAt: body.endAt });
+    }
+    const refreshWholeWindow = !canTrustCoverage || !coverage.sourceHealthFresh || hasSourceGaps;
+    const plannedWindows = refreshWholeWindow ? [{ startAt: body.startAt, endAt: body.endAt }] : gaps;
+    const windowsToSync = plannedWindows.flatMap(window => uncoveredWindows(pendingWindows, window.startAt, window.endAt));
+    if (!windowsToSync.length) return ok({ skipped: true, reason: 'SYNC_IN_PROGRESS', startAt: body.startAt, endAt: body.endAt });
     if (typeof adapters.listSquareLocations !== 'function') throw new HttpError(503, 'SQUARE_SYNC_UNAVAILABLE');
     let locations;
     try { locations = await adapters.listSquareLocations({ organizationId: body.organizationId }); }
@@ -316,10 +357,23 @@ export function createHandlers(adapters) {
     const locationIds = [...new Set(locations.map(location => location.id))];
     if (!locationIds.length) throw new HttpError(409, 'SQUARE_NO_ACTIVE_LOCATIONS');
     if (locationIds.length > 100) throw new HttpError(409, 'SQUARE_LOCATION_LIMIT_EXCEEDED');
-    return created(await queue.enqueueSquareSync({
-      organizationId: body.organizationId, startAt: body.startAt, endAt: body.endAt,
-      locationIds, idempotencyKey: key, requestedBy: actor.userId,
-    }));
+    const jobs = [];
+    for (const window of windowsToSync) {
+      const isWholeWindow = Date.parse(window.startAt) === Date.parse(body.startAt) && Date.parse(window.endAt) === Date.parse(body.endAt);
+      const windowKey = isWholeWindow ? key : `square-sync:${createHash('sha256').update(`${key}:${window.startAt}:${window.endAt}`).digest('hex').slice(0, 48)}`;
+      const startAt = isWholeWindow ? body.startAt : window.startAt;
+      const endAt = isWholeWindow ? body.endAt : window.endAt;
+      const job = await queue.enqueueSquareSync({
+        organizationId: body.organizationId, startAt, endAt,
+        locationIds, idempotencyKey: windowKey, requestedBy: actor.userId,
+      });
+      jobs.push({ ...job, startAt, endAt });
+    }
+    return created({
+      ...(jobs.length === 1 ? jobs[0] : { jobs }),
+      queuedWindows: jobs.length,
+      syncScope: refreshWholeWindow ? 'period' : 'uncovered',
+    });
   });
 
   const webhook = run(async req => {

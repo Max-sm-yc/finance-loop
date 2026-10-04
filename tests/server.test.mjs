@@ -7,7 +7,7 @@ const org = '11111111-1111-4111-8111-111111111111';
 const account = '22222222-2222-4222-8222-222222222222';
 const user = '33333333-3333-4333-8333-333333333333';
 
-function setup({ role = 'operator', proposalFixture = false, proposalType = 'unknown_item', proposalPolicyVersion = 'policy-v1', fetchImpl, budgetAllowed = true, inventoryFlag = false, analyticsFlag = false, inventoryServerFlag = false, analyticsServerFlag = false, squareLocations = [{ id: 'square-location-1' }], squareCatalog } = {}) {
+function setup({ role = 'operator', proposalFixture = false, proposalType = 'unknown_item', proposalPolicyVersion = 'policy-v1', fetchImpl, budgetAllowed = true, inventoryFlag = false, analyticsFlag = false, inventoryServerFlag = false, analyticsServerFlag = false, squareLocations = [{ id: 'square-location-1' }], squareCatalog, syncCoverage } = {}) {
   const calls = [];
   const inboxIds = new Set();
   const db = {
@@ -37,6 +37,10 @@ function setup({ role = 'operator', proposalFixture = false, proposalType = 'unk
     async reserveModelBudget() { return budgetAllowed; }, async recordModelUsage() {},
     async getReplaySnapshot() { return null; }, async saveProjectionRun() { return {}; },
     asUser(token) { calls.push(['asUser', token]); return { async rpc(name, args) { calls.push(['rpc', name, args]); return { data: 'new-id', error: null }; } }; }
+  };
+  if (syncCoverage !== undefined) db.getSquareSyncCoverage = async args => {
+    calls.push(['sync-coverage', args]);
+    return typeof syncCoverage === 'function' ? syncCoverage(args) : syncCoverage;
   };
   const queue = { async enqueueSquareSync(arg) { calls.push(['sync', arg]); return { id: 'job-1' }; }, async enqueueSquareWebhook(arg) { calls.push(['webhook-job', arg]); }, async enqueueProjectionReplay(arg) { calls.push(['projection-replay', arg]); return { id: 'replay-1' }; } };
   const webhookInbox = { async putIfAbsent(id, record) { calls.push(['inbox', id]); const inserted = !inboxIds.has(id); inboxIds.add(id); return { inserted, record }; } };
@@ -193,6 +197,97 @@ test('sync is owner-only, bounded, and enqueued with idempotency key', async () 
   assert.equal(oversized.status, 400);
   assert.equal((await read(oversized)).code, 'SYNC_WINDOW_TOO_LARGE');
   assert.equal(tooWide.calls.some(x => x[0] === 'square-locations'), false);
+});
+
+test('sync skips a fully covered period when source health is fresh', async () => {
+  const { handlers, calls } = setup({ role: 'owner', syncCoverage: {
+    windows: [
+      { from: '2026-01-01T00:00:00Z', to: '2026-01-15T00:00:00Z' },
+      { from: '2026-01-15T00:00:00Z', to: '2026-02-01T00:00:00Z' },
+    ], pendingWindows: [], sourceHealthFresh: true,
+    sourceGaps: { missingParentOrderLineCount: 0, missingPayoutEntryHealthCount: 0 },
+  } });
+  const body = { organizationId: org, startAt: '2026-01-01T00:00:00Z', endAt: '2026-02-01T00:00:00Z' };
+  const response = await handlers.sync(post('/api/sync', body, { 'idempotency-key': 'sync:covered' }));
+  assert.equal(response.status, 200);
+  assert.deepEqual(await read(response), { skipped: true, reason: 'PERIOD_CURRENT', startAt: body.startAt, endAt: body.endAt });
+  assert.equal(calls.some(call => call[0] === 'square-locations'), false);
+  assert.equal(calls.some(call => call[0] === 'sync'), false);
+});
+
+test('sync queues only uncovered gaps when existing coverage and source health are fresh', async () => {
+  const { handlers, calls } = setup({ role: 'owner', syncCoverage: {
+    windows: [
+      { from: '2026-01-01T00:00:00Z', to: '2026-01-10T00:00:00Z' },
+      { from: '2026-01-20T00:00:00Z', to: '2026-01-31T00:00:00Z' },
+    ], pendingWindows: [], sourceHealthFresh: true,
+    sourceGaps: { missingParentOrderLineCount: 0, missingPayoutEntryHealthCount: 0 },
+  } });
+  const body = { organizationId: org, startAt: '2026-01-01T00:00:00Z', endAt: '2026-02-01T00:00:00Z' };
+  const response = await handlers.sync(post('/api/sync', body, { 'idempotency-key': 'sync:gaps' }));
+  assert.equal(response.status, 201);
+  const queued = calls.filter(call => call[0] === 'sync').map(call => call[1]);
+  assert.deepEqual(queued.map(({ startAt, endAt }) => ({ startAt, endAt })), [
+    { startAt: '2026-01-10T00:00:00.000Z', endAt: '2026-01-20T00:00:00.000Z' },
+    { startAt: '2026-01-31T00:00:00.000Z', endAt: '2026-02-01T00:00:00.000Z' },
+  ]);
+  assert.ok(queued.every(job => job.idempotencyKey.startsWith('square-sync:')));
+  assert.equal(new Set(queued.map(job => job.idempotencyKey)).size, 2);
+  assert.deepEqual((await read(response)).jobs.map(({ startAt, endAt }) => ({ startAt, endAt })), [
+    { startAt: '2026-01-10T00:00:00.000Z', endAt: '2026-01-20T00:00:00.000Z' },
+    { startAt: '2026-01-31T00:00:00.000Z', endAt: '2026-02-01T00:00:00.000Z' },
+  ]);
+});
+
+test('sync refreshes the complete selected period when source health is stale or incomplete', async () => {
+  const body = { organizationId: org, startAt: '2026-01-01T00:00:00Z', endAt: '2026-02-01T00:00:00Z' };
+  const stale = setup({ role: 'owner', syncCoverage: {
+    windows: [{ from: body.startAt, to: body.endAt }], pendingWindows: [], sourceHealthFresh: false,
+    sourceGaps: { missingParentOrderLineCount: 0, missingPayoutEntryHealthCount: 0 },
+  } });
+  const staleResponse = await stale.handlers.sync(post('/api/sync', body, { 'idempotency-key': 'sync:stale' }));
+  assert.equal(staleResponse.status, 201);
+  assert.deepEqual(stale.calls.find(call => call[0] === 'sync')[1], {
+    organizationId: org, startAt: body.startAt, endAt: body.endAt,
+    locationIds: ['square-location-1'], idempotencyKey: 'sync:stale', requestedBy: user,
+  });
+
+  const incomplete = setup({ role: 'owner', syncCoverage: {
+    windows: [], pendingWindows: [], sourceHealthFresh: true,
+    sourceGaps: { missingParentOrderLineCount: 1, missingPayoutEntryHealthCount: 0 },
+  } });
+  const incompleteResponse = await incomplete.handlers.sync(post('/api/sync', body, { 'idempotency-key': 'sync:gap' }));
+  assert.equal(incompleteResponse.status, 201);
+  assert.deepEqual(incomplete.calls.find(call => call[0] === 'sync')[1], {
+    organizationId: org, startAt: body.startAt, endAt: body.endAt,
+    locationIds: ['square-location-1'], idempotencyKey: 'sync:gap', requestedBy: user,
+  });
+});
+
+test('sync avoids duplicate enqueue when another durable sync already covers the requested period', async () => {
+  const { handlers, calls } = setup({ role: 'owner', syncCoverage: {
+    windows: [], pendingWindows: [{ from: '2026-01-01T00:00:00Z', to: '2026-02-01T00:00:00Z' }],
+    sourceHealthFresh: false, sourceGaps: { missingParentOrderLineCount: 0, missingPayoutEntryHealthCount: 0 },
+  } });
+  const body = { organizationId: org, startAt: '2026-01-01T00:00:00Z', endAt: '2026-02-01T00:00:00Z' };
+  const response = await handlers.sync(post('/api/sync', body, { 'idempotency-key': 'sync:pending' }));
+  assert.equal(response.status, 200);
+  assert.equal((await read(response)).reason, 'SYNC_IN_PROGRESS');
+  assert.equal(calls.some(call => call[0] === 'square-locations'), false);
+  assert.equal(calls.some(call => call[0] === 'sync'), false);
+});
+
+test('sync keeps working with a full-window backfill while the coverage migration is unapplied', async () => {
+  const { handlers, calls } = setup({ role: 'owner', syncCoverage: async () => {
+    throw Object.assign(new Error('coverage RPC is not installed'), { code: 'PGRST202' });
+  } });
+  const body = { organizationId: org, startAt: '2026-01-01T00:00:00Z', endAt: '2026-02-01T00:00:00Z' };
+  const response = await handlers.sync(post('/api/sync', body, { 'idempotency-key': 'sync:legacy' }));
+  assert.equal(response.status, 201);
+  assert.deepEqual(calls.find(call => call[0] === 'sync')[1], {
+    organizationId: org, startAt: body.startAt, endAt: body.endAt,
+    locationIds: ['square-location-1'], idempotencyKey: 'sync:legacy', requestedBy: user,
+  });
 });
 
 test('issue proposal runs a budgeted model draft, persists only the validated proposal, and never posts a ledger fact', async () => {

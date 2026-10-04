@@ -292,7 +292,7 @@ export default function Home() {
     }
     setSyncing(true); setSyncError(''); setSyncStatus('');
     try {
-      await api('/api/sync', {
+      const result = await api<{ skipped?: boolean; reason?: 'PERIOD_CURRENT' | 'SYNC_IN_PROGRESS'; queuedWindows?: number; syncScope?: 'period' | 'uncovered' }>('/api/sync', {
         method: 'POST',
         headers: { 'Idempotency-Key': `square-sync:${crypto.randomUUID()}` },
         body: JSON.stringify({
@@ -301,7 +301,16 @@ export default function Home() {
           endAt: zonedMidnight(nextDate(to), reportTimezone),
         }),
       });
-      setSyncStatus(`Sync queued for ${from} through ${to} across active Square locations. When the worker finishes, click ↻ to refresh; incomplete Square data may still leave figures unavailable.`);
+      if (result.skipped) {
+        setSyncStatus(result.reason === 'SYNC_IN_PROGRESS'
+          ? `A Square sync covering ${from} through ${to} is already queued or running.`
+          : `Square data for ${from} through ${to} is already covered and current. The report uses the stored facts.`);
+      } else if (result.syncScope === 'uncovered') {
+        const count = result.queuedWindows ?? 1;
+        setSyncStatus(`Sync queued for ${count} uncovered ${count === 1 ? 'date range' : 'date ranges'} within ${from} through ${to}. When the worker finishes, click ↻ to refresh.`);
+      } else {
+        setSyncStatus(`Sync queued for ${from} through ${to} across active Square locations. When the worker finishes, click ↻ to refresh; incomplete Square data may still leave figures unavailable.`);
+      }
       return true;
     } catch (reason) {
       const code = reason instanceof Error ? reason.message : '';
@@ -315,6 +324,7 @@ export default function Home() {
         SYNC_WINDOW_TOO_LARGE: 'A sync can cover up to 366 days. Shorten the selected period and try again.',
         SQUARE_SYNC_UNAVAILABLE: 'Square sync is not configured for this environment.',
         SQUARE_LOCATIONS_UNAVAILABLE: 'Square locations could not be loaded. Try again shortly.',
+        SQUARE_SYNC_STATUS_UNAVAILABLE: 'Square sync coverage could not be checked. Try again shortly.',
       };
       setSyncError(messages[code] ?? 'The sync could not be queued. Refresh the page and try again.');
       return false;

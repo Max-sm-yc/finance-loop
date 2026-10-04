@@ -53,6 +53,26 @@ test('RPC uses the caller JWT and SQL p_ argument names; no service key is expos
   assert.equal('serviceKey' in adapters, false);
 });
 
+test('Square sync coverage is read through the member JWT with a bounded window', async () => {
+  let call;
+  const coverage = { windows: [{ from: '2026-09-01T00:00:00Z', to: '2026-10-01T00:00:00Z' }], pendingWindows: [], sourceHealthFresh: true,
+    sourceGaps: { missingParentOrderLineCount: 0, missingPayoutEntryHealthCount: 0 } };
+  const adapters = createSupabaseAdapters({
+    url: 'https://tenant.supabase.test', publishableKey: 'publishable', secretKey: serviceKey,
+    fetchImpl: async (url, init) => {
+      call = { url: String(url), headers: new Headers(init.headers), body: JSON.parse(init.body) };
+      return response(coverage);
+    }
+  });
+  const result = await adapters.db.getSquareSyncCoverage({ organizationId: org, startAt: '2026-09-01T00:00:00Z',
+    endAt: '2026-10-01T00:00:00Z', accessToken: userJwt });
+  assert.deepEqual(result, coverage);
+  assert.match(call.url, /rpc\/get_square_sync_coverage$/);
+  assert.equal(call.headers.get('apikey'), 'publishable');
+  assert.equal(call.headers.get('authorization'), `Bearer ${userJwt}`);
+  assert.deepEqual(call.body, { p_organization_id: org, p_start_at: '2026-09-01T00:00:00Z', p_end_at: '2026-10-01T00:00:00Z' });
+});
+
 test('human finance corrections use caller authorization while projection replay uses the worker key', async () => {
   const calls = [];
   const adapters = createSupabaseAdapters({

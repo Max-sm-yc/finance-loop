@@ -485,6 +485,13 @@ export function createSupabaseAdapters({ url, publishableKey, secretKey, tokenEn
       if (error) throw error;
       return data;
     },
+    async getSquareSyncCoverage({ organizationId, startAt, endAt, accessToken }) {
+      const { data, error } = await userRest(accessToken).rpc('get_square_sync_coverage', {
+        organization_id: organizationId, start_at: startAt, end_at: endAt,
+      });
+      if (error) throw error;
+      return data ?? { windows: [], sourceHealthFresh: false, sourceGaps: {} };
+    },
     async getSyncHealth({ organizationId }) {
       return await getWorkerHealth(organizationId);
     },
