@@ -545,15 +545,28 @@ export function createHandlers(adapters) {
       throw new HttpError(400, 'RECEIPT_COST_DATE_OUTSIDE_REPLAY_WINDOW');
     }
     if (typeof db.recordReceiptItemCosts !== 'function') throw new HttpError(503, 'RECEIPT_COST_APPROVAL_UNAVAILABLE');
-    const result = await db.recordReceiptItemCosts({ organizationId: body.organizationId, evidenceFileId: body.evidenceRef,
-      reason: body.reason.trim(), idempotencyKey: key,
-      updates: body.updates.map(update => ({ ...update, catalogObjectId: update.catalogObjectId.trim(), name: update.name.trim(), effectiveFrom: new Date(update.effectiveFrom).toISOString() })),
-      accessToken: actor.accessToken });
+    let result;
+    try {
+      result = await db.recordReceiptItemCosts({ organizationId: body.organizationId, evidenceFileId: body.evidenceRef,
+        reason: body.reason.trim(), idempotencyKey: key,
+        updates: body.updates.map(update => ({ ...update, catalogObjectId: update.catalogObjectId.trim(), name: update.name.trim(), effectiveFrom: new Date(update.effectiveFrom).toISOString() })),
+        accessToken: actor.accessToken });
+    } catch (error) {
+      const code = typeof error?.code === 'string' && /^[A-Z0-9]{1,10}$/.test(error.code) ? error.code : 'UNKNOWN';
+      console.error(JSON.stringify({ event: 'receipt_cost_approval_failed', stage: 'cost_write', code }));
+      throw new HttpError(503, 'RECEIPT_COST_APPROVAL_FAILED');
+    }
     let replay = null;
     if (result?.replayStartAt && result?.replayEndAt) {
-      replay = await queue.enqueueProjectionReplay({ organizationId: body.organizationId,
-        startAt: result.replayStartAt, endAt: result.replayEndAt,
-        idempotencyKey: `receipt-cost:${key}`, requestedBy: actor.userId });
+      try {
+        replay = await queue.enqueueProjectionReplay({ organizationId: body.organizationId,
+          startAt: result.replayStartAt, endAt: result.replayEndAt,
+          idempotencyKey: `receipt-cost:${key}`, requestedBy: actor.userId });
+      } catch (error) {
+        const code = typeof error?.code === 'string' && /^[A-Z0-9]{1,10}$/.test(error.code) ? error.code : 'UNKNOWN';
+        console.error(JSON.stringify({ event: 'receipt_cost_approval_failed', stage: 'projection_replay_queue', code }));
+        throw new HttpError(503, 'RECEIPT_COST_SAVED_REPLAY_PENDING');
+      }
     }
     return created({ updates: result?.updates ?? [], projectionJobId: replay?.id ?? null, projectionQueued: Boolean(replay) });
   });

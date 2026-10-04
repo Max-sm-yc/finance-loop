@@ -25,6 +25,7 @@ function setup({ role = 'operator', proposalFixture = false, proposalType = 'unk
     async recordInventoryPurchase(arg) { calls.push(['inventory-purchase', arg]); return { cashMovementId: 'cash-1', inventoryMovementIds: ['stock-1'] }; },
     async recordInventoryCorrection(arg) { calls.push(['inventory-correction', arg]); return { movementId: 'stock-2' }; },
     async hasEvidenceFile(arg) { calls.push(['evidence-exists', arg]); return arg.evidenceFileId === '44444444-4444-4444-8444-444444444444'; },
+    async recordReceiptItemCosts(arg) { calls.push(['receipt-costs', arg]); return { updates: [], replayStartAt: '2026-09-01T00:00:00Z', replayEndAt: '2026-10-03T00:00:00Z' }; },
     async recordSquareCatalogItem(arg) { calls.push(['square-catalog-cost', arg]); return { id: 'item-definition-1', version: 1, squareCatalogObjectId: arg.squareCatalogObjectId }; },
     async upsertSquareFacts(arg) { calls.push(['square-facts', arg]); return { changed: true, revision: 1 }; },
     async registerSquareCatalogCreationTicket(arg) { calls.push(['square-ticket', arg]); return true; },
@@ -45,7 +46,7 @@ function setup({ role = 'operator', proposalFixture = false, proposalType = 'unk
   const queue = { async enqueueSquareSync(arg) { calls.push(['sync', arg]); return { id: 'job-1' }; }, async enqueueSquareWebhook(arg) { calls.push(['webhook-job', arg]); }, async enqueueProjectionReplay(arg) { calls.push(['projection-replay', arg]); return { id: 'replay-1' }; } };
   const webhookInbox = { async putIfAbsent(id, record) { calls.push(['inbox', id]); const inserted = !inboxIds.has(id); inboxIds.add(id); return { inserted, record }; } };
   const supabase = { auth: { async getUser(token) { calls.push(['auth', token]); return { data: { user: { id: user } }, error: null }; } } };
-  return { handlers: createHandlers({ supabase, db, queue, webhookInbox, fetchImpl, squareCatalog, engine: { replayAccounting: () => ({}) }, listSquareLocations: async args => { calls.push(['square-locations', args]); return squareLocations; }, config: { squareWebhookSignatureKey: 'key', squareNotificationUrl: 'https://example.test/webhook', openRouterApiKey: 'test-key', inventoryTrackingEnabled: inventoryServerFlag, productAnalyticsEnabled: analyticsServerFlag } }), calls };
+  return { handlers: createHandlers({ supabase, db, queue, webhookInbox, fetchImpl, squareCatalog, engine: { replayAccounting: () => ({}) }, listSquareLocations: async args => { calls.push(['square-locations', args]); return squareLocations; }, config: { squareWebhookSignatureKey: 'key', squareNotificationUrl: 'https://example.test/webhook', openRouterApiKey: 'test-key', inventoryTrackingEnabled: inventoryServerFlag, productAnalyticsEnabled: analyticsServerFlag } }), calls, db, queue };
 }
 const auth = { authorization: 'Bearer valid.jwt.token' };
 const post = (path, body, headers = {}) => new Request(`https://app.test${path}`, { method: 'POST', headers: { ...auth, 'content-type': 'application/json', ...headers }, body: JSON.stringify(body) });
@@ -95,6 +96,42 @@ test('inventory correction and analytics routes enforce feature flags, bounds, a
   assert.equal(report.status, 200); assert.equal((await read(report)).analytics.status, 'incomplete');
   const tooLong = await reviewer.handlers.analytics(new Request(`https://app.test/api/analytics?organizationId=${org}&from=2025-01-01T00:00:00Z&to=2026-02-01T00:00:00Z&currency=USD`, { headers: auth }));
   assert.equal(tooLong.status, 400);
+});
+
+test('receipt cost approval hides cost-write errors and logs only a sanitized code', async () => {
+  const app = setup({ role: 'reviewer', inventoryFlag: true, inventoryServerFlag: true });
+  app.db.recordReceiptItemCosts = async () => { throw Object.assign(new Error('private provider detail'), { code: '42501' }); };
+  const approval = { organizationId: org, evidenceRef: '44444444-4444-4444-8444-444444444444', reason: 'Supplier invoice confirms item cost.',
+    updates: [{ catalogObjectId: 'variation-1', name: 'Tea', unitCostMinor: 425, currency: 'USD', effectiveFrom: '2026-09-01T00:00:00Z' }] };
+  const errors = [];
+  const originalError = console.error;
+  console.error = (...args) => errors.push(args.join(' '));
+  try {
+    const response = await app.handlers.receiptItemCosts(post('/api/inventory/receipt-costs', approval, { 'idempotency-key': 'receipt-test-key' }));
+    assert.equal(response.status, 503);
+    assert.deepEqual(await read(response), { error: 'RECEIPT_COST_APPROVAL_FAILED', code: 'RECEIPT_COST_APPROVAL_FAILED' });
+    assert.equal(errors.length, 1);
+    assert.deepEqual(JSON.parse(errors[0]), { event: 'receipt_cost_approval_failed', stage: 'cost_write', code: '42501' });
+    assert.equal(errors[0].includes('private provider detail'), false);
+  } finally { console.error = originalError; }
+});
+
+test('receipt cost approval reports saved costs when projection replay enqueue fails', async () => {
+  const app = setup({ role: 'reviewer', inventoryFlag: true, inventoryServerFlag: true });
+  app.queue.enqueueProjectionReplay = async arg => { app.calls.push(['projection-replay', arg]); throw Object.assign(new Error('private queue detail'), { code: '08006' }); };
+  const approval = { organizationId: org, evidenceRef: '44444444-4444-4444-8444-444444444444', reason: 'Supplier invoice confirms item cost.',
+    updates: [{ catalogObjectId: 'variation-1', name: 'Tea', unitCostMinor: 425, currency: 'USD', effectiveFrom: '2026-09-01T00:00:00Z' }] };
+  const errors = [];
+  const originalError = console.error;
+  console.error = (...args) => errors.push(args.join(' '));
+  try {
+    const response = await app.handlers.receiptItemCosts(post('/api/inventory/receipt-costs', approval, { 'idempotency-key': 'receipt-test-key' }));
+    assert.equal(response.status, 503);
+    assert.deepEqual(await read(response), { error: 'RECEIPT_COST_SAVED_REPLAY_PENDING', code: 'RECEIPT_COST_SAVED_REPLAY_PENDING' });
+    assert.equal(app.calls.filter(call => call[0] === 'receipt-costs').length, 1);
+    assert.deepEqual(JSON.parse(errors[0]), { event: 'receipt_cost_approval_failed', stage: 'projection_replay_queue', code: '08006' });
+    assert.equal(errors[0].includes('private queue detail'), false);
+  } finally { console.error = originalError; }
 });
 
 test('Square item creation is owner-only and records Square identity, evidenced COGS, and a replay', async () => {

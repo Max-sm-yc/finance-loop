@@ -188,6 +188,7 @@ export default function Home() {
   const [organizationId, setOrganizationId] = useState('');
   const [loadingAuth, setLoadingAuth] = useState(true);
   const [page, setPage] = useState<Page>('overview');
+  const [visitedPages, setVisitedPages] = useState<Set<Page>>(() => new Set(['overview']));
   const [dashboard, setDashboard] = useState<Dashboard | null>(null);
   const [issues, setIssues] = useState<Issue[]>([]);
   const [movements, setMovements] = useState<Movement[]>([]);
@@ -205,6 +206,11 @@ export default function Home() {
   const loadSequence = useRef(0);
   const supabase = useMemo(() => { try { return browserSupabase(); } catch { return null; } }, []);
   const reportTimezone = dashboard?.organization?.timezone ?? 'UTC';
+
+  function navigate(nextPage: Page) {
+    setVisitedPages(current => current.has(nextPage) ? current : new Set(current).add(nextPage));
+    setPage(nextPage);
+  }
 
   useEffect(() => {
     if (!supabase) { setError('Supabase is not configured. Add the project URL and publishable key to the web environment.'); setLoadingAuth(false); return; }
@@ -247,7 +253,7 @@ export default function Home() {
     if (results[4].status === 'fulfilled') {
       const settings = (results[4].value as { settings: { features?: Features } }).settings;
       const enabled = { inventoryTracking: settings.features?.inventoryTracking === true, productAnalytics: settings.features?.productAnalytics === true };
-      setFeatures(enabled); if (page === 'analytics' && !enabled.productAnalytics) setPage('overview');
+      setFeatures(enabled); if (page === 'analytics' && !enabled.productAnalytics) navigate('overview');
     } else setFeatures({ inventoryTracking: false, productAnalytics: false });
     if (results[0].status === 'fulfilled' && results[4].status === 'fulfilled') {
       const raw = results[0].value as Record<string, unknown>; const settings = (results[4].value as { settings: { organization?: Organization; accounts?: Dashboard['accounts']; features?: Features } }).settings;
@@ -271,7 +277,7 @@ export default function Home() {
     if (results[1].status === 'fulfilled') setIssues((results[1].value as { issues: Issue[] }).issues ?? []);
     if (results[2].status === 'fulfilled') setMovements((results[2].value as { movements: Movement[] }).movements ?? []);
     if (results[3].status === 'fulfilled') setEvents((results[3].value as { events: AuditEvent[] }).events ?? []);
-    if (results[4].status === 'rejected' && page === 'analytics') setPage('overview');
+    if (results[4].status === 'rejected' && page === 'analytics') navigate('overview');
     const rejected = results.find(x => x.status === 'rejected') as PromiseRejectedResult | undefined;
     if (rejected) setError(rejected.reason instanceof Error ? rejected.reason.message : 'Some workspace data could not be loaded.');
     setBusy(false);
@@ -348,7 +354,7 @@ export default function Home() {
   return <div className="shell">
     <aside className="sidebar"><div className="brand-lockup"><span className="brand-icon" aria-hidden="true">Z</span><span><b>ZYTHE</b><small>WORKSPACE</small></span></div>
       <div className="workspace"><span className="workspace-mark">{dashboard?.organization?.name?.slice(0, 1) ?? 'O'}</span><span><b>{dashboard?.organization?.name ?? 'Your workspace'}</b><small>Organization workspace</small></span></div>
-      <div className="nav-caption">WORKSPACE</div><nav aria-label="Main navigation">{navItems.map(item => <button key={item.id} className={`nav-link ${page === item.id ? 'selected' : ''}`} onClick={() => setPage(item.id)} aria-current={page === item.id ? 'page' : undefined}>{item.label}{item.id === 'review' && openIssues.length > 0 && <i>{openIssues.length}</i>}</button>)}</nav>
+      <div className="nav-caption">WORKSPACE</div><nav aria-label="Main navigation">{navItems.map(item => <button key={item.id} className={`nav-link ${page === item.id ? 'selected' : ''}`} onClick={() => navigate(item.id)} aria-current={page === item.id ? 'page' : undefined}>{item.label}{item.id === 'review' && openIssues.length > 0 && <i>{openIssues.length}</i>}</button>)}</nav>
       <div className="sidebar-foot"><div className="profile"><span className="avatar">{user.email?.slice(0, 1).toUpperCase() ?? 'U'}</span><span className="profile-info"><b>{user.email}</b><small>Signed in</small></span><button className="icon-button" onClick={signOut} title="Sign out" aria-label="Sign out">↪</button></div></div>
     </aside>
     <section className="main-area"><header className="topbar"><div className="top-controls" role="group" aria-label={`Workspace and reporting controls. Period dates use ${reportTimezone}`}>{organizations.length > 1 && <label className="compact">Organization<select value={organizationId} onChange={e => { loadSequence.current += 1; setOrganizationId(e.target.value); setAccountId(''); setDashboard(null); setFeatures({ inventoryTracking: false, productAnalytics: false }); setSyncStatus(''); setSyncError(''); if (page === 'analytics') setPage('overview'); }}><option value="">Choose workspace</option>{organizations.map(org => <option key={org.id} value={org.id}>{org.name}</option>)}</select></label>}<details className="period-picker"><summary aria-label={`Reporting period ${periodLabel(from, to)}`}>{periodLabel(from, to)}<span aria-hidden="true">⌄</span></summary><div className="period-popover"><label>Start date<input aria-label="Period start date" type="date" value={from} onChange={e => { setFrom(e.target.value); setSyncStatus(''); setSyncError(''); }} /></label><label>End date<input aria-label="Period end date" type="date" value={to} onChange={e => { setTo(e.target.value); setSyncStatus(''); setSyncError(''); }} /></label><small>Reporting timezone · {reportTimezone}</small></div></details><button className="icon-button refresh" onClick={() => void load()} disabled={busy || syncing} aria-label="Refresh workspace data">{busy ? '…' : '↻'}</button></div></header>
@@ -357,14 +363,13 @@ export default function Home() {
         {syncError && <div className="notice error-box" role="alert"><b>Sync could not start</b><span>{syncError}</span></div>}
         {syncStatus && <div className="notice" role="status"><b>Sync queued</b><span>{syncStatus}</span></div>}
         {!organizationId ? <section className="empty-state"><div className="empty-icon">⌁</div><h2>{organizations.length ? 'Choose a workspace' : 'No workspace membership found'}</h2><p>Ask a workspace owner to add your account, then sign in again.</p></section> : !dashboard ? <section className="empty-state"><div className="empty-icon">⌁</div><h2>{busy ? 'Loading workspace data' : 'No projection available yet'}</h2><p>Once your workspace has accounts and a completed projection, verified figures will appear here.</p><button className="secondary" onClick={() => void load()}>Retry</button></section> : <>
-          {page === 'overview' && <Overview dashboard={dashboard} currency={currency} issues={openIssues} events={events} accountId={accountId} onNavigate={setPage} />}
-          {page === 'income' && <Income dashboard={dashboard} currency={currency} />}
-          {page === 'income' && <GiftCardSummary income={dashboard.income} currency={currency} />}
-          {page === 'cash' && <Cash key={organizationId} dashboard={dashboard} currency={currency} movements={movements} accounts={dashboard.accounts ?? []} accountId={accountId} organizationId={organizationId} inventoryEnabled={features.inventoryTracking} canManageSquareCatalog={organizations.find(org => org.id === organizationId)?.role === 'owner'} canAuthorizeSquareCatalog={organizations.find(org => org.id === organizationId)?.role === 'owner'} onAccount={setAccountId} onSaved={() => void load()} />}
-          {page === 'analytics' && features.productAnalytics && <Analytics key={organizationId} organizationId={organizationId} from={zonedMidnight(from, reportTimezone)} to={zonedMidnight(nextDate(to), reportTimezone)} currency={currency} timezone={reportTimezone} role={organizations.find(org => org.id === organizationId)?.role ?? 'read_only'} />}
-          {page === 'review' && <Review issues={openIssues} organizationId={organizationId} currency={currency} canSync={organizations.find(org => org.id === organizationId)?.role === 'owner'} syncing={syncing} syncPeriodLabel={periodLabel(from, to)} onSyncPeriod={syncSelectedPeriod} onSaved={() => void load()} />}
-          {page === 'ledger' && <Ledger events={events} />}
-          {page === 'settings' && <Settings dashboard={dashboard} accountId={accountId} onAccount={setAccountId} />}
+          {visitedPages.has('overview') && <div hidden={page !== 'overview'}><Overview dashboard={dashboard} currency={currency} issues={openIssues} events={events} accountId={accountId} onNavigate={navigate} /></div>}
+          {visitedPages.has('income') && <div hidden={page !== 'income'}><Income dashboard={dashboard} currency={currency} /><GiftCardSummary income={dashboard.income} currency={currency} /></div>}
+          {visitedPages.has('cash') && <div hidden={page !== 'cash'}><Cash key={organizationId} dashboard={dashboard} currency={currency} movements={movements} accounts={dashboard.accounts ?? []} accountId={accountId} organizationId={organizationId} inventoryEnabled={features.inventoryTracking} canManageSquareCatalog={organizations.find(org => org.id === organizationId)?.role === 'owner'} canAuthorizeSquareCatalog={organizations.find(org => org.id === organizationId)?.role === 'owner'} onAccount={setAccountId} onSaved={() => void load()} /></div>}
+          {visitedPages.has('analytics') && features.productAnalytics && <div hidden={page !== 'analytics'}><Analytics key={organizationId} organizationId={organizationId} from={zonedMidnight(from, reportTimezone)} to={zonedMidnight(nextDate(to), reportTimezone)} currency={currency} timezone={reportTimezone} role={organizations.find(org => org.id === organizationId)?.role ?? 'read_only'} /></div>}
+          {visitedPages.has('review') && <div hidden={page !== 'review'}><Review key={organizationId} issues={openIssues} organizationId={organizationId} currency={currency} canSync={organizations.find(org => org.id === organizationId)?.role === 'owner'} syncing={syncing} syncPeriodLabel={periodLabel(from, to)} onSyncPeriod={syncSelectedPeriod} onSaved={() => void load()} /></div>}
+          {visitedPages.has('ledger') && <div hidden={page !== 'ledger'}><Ledger events={events} /></div>}
+          {visitedPages.has('settings') && <div hidden={page !== 'settings'}><Settings dashboard={dashboard} accountId={accountId} onAccount={setAccountId} /></div>}
           <footer className="projection-foot">Calculation {dashboard.projectionVersion ?? 'version pending'} · {dashboard.period?.from ?? from} to {dashboard.period?.to ?? to} · {currency} · {dashboard.income?.status === 'incomplete' ? 'Margin incomplete' : 'Operational reporting'}</footer>
         </>}
       </main>
@@ -583,7 +588,14 @@ function InventoryPanel({ organizationId, accountId, currency, timezone, account
       setReceiptNotice(result.projectionQueued ? 'Approved cost updates were recorded. Projection replay is queued; refresh after it completes.' : 'Approved cost updates were recorded. They take effect on the selected date.');
       setReceiptDraft(null); setReceiptLines([]); setReceiptCandidates([]); setReceiptText(''); setReceiptEvidence(null); setReceiptEvidenceRef(''); setReceiptReason('');
       await refresh(); onSaved();
-    } catch (err) { setReceiptError(err instanceof Error ? err.message : 'Receipt cost update could not be saved.'); }
+    } catch (err) {
+      const code = err instanceof Error ? err.message : '';
+      const messages: Record<string, string> = {
+        RECEIPT_COST_APPROVAL_FAILED: 'The cost approval could not be confirmed. Check the selected items, evidence, date, and your review role; your receipt review is still here. If it looks correct and retrying fails, ask an owner to check the server logs.',
+        RECEIPT_COST_SAVED_REPLAY_PENDING: 'The COGS updates were saved, but the historical projection replay could not be queued. Retry without changing this review; the same approval key prevents duplicate cost writes. If it fails again, ask an owner to check the server logs.',
+      };
+      setReceiptError(messages[code] ?? (code === 'INTERNAL_ERROR' ? 'The save failed unexpectedly. Your receipt review is still here; retry once. If it repeats, ask an owner to check the server logs.' : code || 'Receipt cost update could not be saved.'));
+    }
     finally { setApplyingReceiptCosts(false); }
   }
   async function authorizeSquareCatalog() {
