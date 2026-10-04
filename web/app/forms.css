@@ -22,6 +22,7 @@
 .issue-source-refs { display: grid; gap: 6px; margin: 0; padding: 0; list-style: none; }
 .issue-source-refs li { min-width: 0; padding: 8px 10px; border: 1px solid #2a332d; border-radius: 5px; background: #141916; }
 .issue-source-refs code { overflow-wrap: anywhere; color: #a9cbb1; font-size: 10px; }
+.issue-source-refs small { display: block; margin-top: 4px; color: #849087; font-size: 10px; }
 .issue-record-details { margin-top: 15px; }
 .issue-detail-dialog .form-actions { margin-top: 17px; }
 .catalog-dialog { width: min(760px, 100%); }
@@ -53,6 +54,7 @@
 .decision-context-warning .decision-context-heading span { color: #e0b46e; }
 .decision-context-heading strong { display: block; overflow-wrap: anywhere; color: #e4ece5; font-size: 13px; font-weight: 640; }
 .decision-context p { margin: 9px 0 0; }
+.decision-context .form-actions { justify-content: flex-start; flex-wrap: wrap; }
 .decision-context-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; margin: 12px 0 0; }
 .decision-context-grid div { min-width: 0; }
 .decision-context-grid dt { color: #849087; font-size: 10px; font-weight: 650; }

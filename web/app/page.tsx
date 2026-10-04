@@ -23,6 +23,85 @@ type CatalogDialogMode = 'create' | 'edit_item' | 'edit_variation' | 'add_variat
 const UUID_INPUT = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 type Organization = { id: string; name: string; base_currency?: string; timezone?: string; role?: string };
 type IssueEvidence = { id: string; type?: 'sale_line' | 'refund'; occurred_at?: string; currency?: string; quantity?: string | number; amount_minor?: string | number; gross_minor?: string | number; unit_price_minor?: string | number; discount_minor?: string | number; catalog_object_id?: string | null; item_name?: string | null; provider_object_id?: string; line_id?: string; refund_id?: string; order_id?: string; status?: string };
+type IssueSourceProblem = { objectId?: string; fields?: string[] };
+type IssueReviewContext = { summary: string; nextStep: string; resource: string; gapCode: string; problems: IssueSourceProblem[]; queueSync: boolean; providerCode?: string; providerStatus?: number; eventType?: string; objectId?: string; jobId?: string };
+const supportsIssueEvidence = (issue: Issue) => ['UNKNOWN_ITEM', 'REFUND_COGS_REVIEW'].includes(issue.code ?? '');
+const ISSUE_FIELD_LABELS: Record<string, string> = {
+  missing_occurred_at: 'event date or time is missing',
+  missing_currency: 'currency is missing',
+  unsupported_or_missing_quantity: 'quantity is missing or unsupported',
+  missing_square_sales_amount: 'sale amount is missing',
+  missing_square_payment_or_fee_amount: 'payment amount or fee is missing',
+  missing_square_refund_amount: 'refund amount is missing',
+  missing_square_payout_amount: 'payout amount is missing',
+  missing_square_gift_card_amount: 'gift card amount is missing',
+  unsupported_gift_card_activity_type: 'gift card activity type is unsupported',
+};
+function sourceGapReviewContext(issue: Issue): IssueReviewContext | null {
+  if (!['SOURCE_GAP', 'SOURCE_STALE'].includes(issue.code ?? '')) return null;
+  const details = issue.details ?? {};
+  const gapCode = typeof details.code === 'string' && details.code ? details.code : issue.code ?? 'SOURCE_GAP';
+  const resourceValue = typeof details.resource === 'string' ? details.resource : '';
+  const formattedResource = resourceValue.replace(/[._-]+/g, ' ').toLowerCase().replace(/^square\s+/, '');
+  const resource = formattedResource || 'overall sync';
+  const problems = Array.isArray(details.problems)
+    ? details.problems.flatMap(problem => {
+      if (!problem || typeof problem !== 'object' || Array.isArray(problem)) return [];
+      const row = problem as IssueSourceProblem;
+      return [{
+        ...(typeof row.objectId === 'string' ? { objectId: row.objectId } : {}),
+        ...(Array.isArray(row.fields) ? { fields: row.fields.filter((field): field is string => typeof field === 'string').slice(0, 20) } : {}),
+      }];
+    }).slice(0, 20)
+    : [];
+
+  let summary = `Square reported incomplete ${resource} data (${gapCode.replaceAll('_', ' ').toLowerCase()}).`;
+  let nextStep = 'Sync the selected period. If the gap returns, check the Square connection and permissions with the workspace owner, then share the issue ID with support. Leave the issue open until the source data is complete.';
+  if (issue.code === 'SOURCE_STALE') {
+    summary = 'No recent successful Square sync is recorded, so the source data may be out of date.';
+    nextStep = 'Sync the selected period, then refresh the workspace after the worker finishes.';
+  } else if (gapCode === 'NORMALIZATION_MISSING_MONEY_OR_IDENTITY') {
+    summary = problems.length
+      ? `${problems.length} Square source record${problems.length === 1 ? ' is' : 's are'} missing required information.`
+      : `Square ${resource} records are missing required information.`;
+    nextStep = 'Check the listed records in Square. Once Square has complete data, sync the selected period. If Square does not provide the missing fields, leave this open and share the issue ID with support.';
+  } else if (gapCode === 'PROCESSING_FEE_UNAVAILABLE') {
+    summary = 'Square has not supplied a processing fee for one or more completed payments, so fee and margin totals are incomplete.';
+    nextStep = 'Sync the selected period again after Square finishes reporting payout entries. If the fee remains unavailable, leave the issue open and share it with support.';
+  } else if (gapCode === 'PERMISSION_LOST') {
+    summary = `Square denied access to ${resource} during sync.`;
+    nextStep = 'Ask a workspace owner to reconnect Square with read access for this source, then sync the selected period.';
+  } else if (gapCode === 'RATE_LIMITED') {
+    summary = `Square temporarily rate-limited the ${resource} sync.`;
+    nextStep = 'Wait a few minutes, then ask a workspace owner to sync the selected period again.';
+  } else if (gapCode === 'BACKFILL_INCOMPLETE') {
+    summary = `The Square sync did not finish loading ${resource}.`;
+    nextStep = 'Ask a workspace owner to sync the selected period again. If it fails repeatedly, check the Square connection and share the issue ID with support.';
+  } else if (gapCode === 'AUTHORITATIVE_OBJECT_MISSING') {
+    summary = 'A Square event referred to a record that the app could not retrieve from Square.';
+    nextStep = 'Confirm the transaction exists in the connected Square account, then sync the selected period. Developer Explorer sample events can refer to synthetic records that cannot be fetched.';
+  } else if (gapCode === 'UNSUPPORTED_WEBHOOK_ACTIVITY') {
+    summary = 'Square sent an activity type the app cannot process yet.';
+    nextStep = 'A catch-up sync is queued automatically. Refresh the workspace after it finishes; if the issue remains, share the issue ID with support.';
+  } else if (gapCode === 'GIFT_CARD_ACTIVITY_LINKAGE_MISSING') {
+    summary = 'A gift card sale is missing its matching activation or load record.';
+    nextStep = 'Check the related gift card activity in Square, then ask a workspace owner to sync the selected period again. Leave the issue open if the matching activity is absent.';
+  } else if (gapCode === 'SOURCE_GAP' && typeof details.jobId === 'string') {
+    summary = `A Square ${resource} job failed, so its source data may be incomplete.`;
+    nextStep = 'Sync the selected period. If the gap returns, have the workspace owner check the Square connection and permissions, then share the issue ID and worker job with support.';
+  }
+
+  return {
+    summary, nextStep, resource, gapCode, problems,
+    queueSync: !['PERMISSION_LOST', 'UNSUPPORTED_WEBHOOK_ACTIVITY'].includes(gapCode),
+    ...(typeof details.providerCode === 'string' ? { providerCode: details.providerCode } : {}),
+    ...(Number.isSafeInteger(details.providerStatus) ? { providerStatus: Number(details.providerStatus) } : {}),
+    ...(typeof details.eventType === 'string' ? { eventType: details.eventType } : {}),
+    ...(typeof details.objectId === 'string' ? { objectId: details.objectId } : {}),
+    ...(typeof details.jobId === 'string' ? { jobId: details.jobId } : {}),
+  };
+}
+function issueFieldLabel(field: string) { return ISSUE_FIELD_LABELS[field] ?? field.replaceAll('_', ' ').toLowerCase(); }
 const NAV: Array<{ id: Page; label: string }> = [
   { id: 'overview', label: 'Overview' }, { id: 'income', label: 'Income & inventory' },
   { id: 'cash', label: 'Cash flow' }, { id: 'analytics', label: 'Business analytics' }, { id: 'review', label: 'Review queue' },
@@ -207,9 +286,9 @@ export default function Home() {
     finally { setBusy(false); }
   }
   async function signOut() { loadSequence.current += 1; await supabase?.auth.signOut(); setDashboard(null); setIssues([]); setMovements([]); setEvents([]); setFeatures({ inventoryTracking: false, productAnalytics: false }); setSyncStatus(''); setSyncError(''); }
-  async function syncSelectedPeriod() {
+  async function syncSelectedPeriod(): Promise<boolean> {
     if (!organizationId || !from || !to || from > to) {
-      setSyncError('Choose a valid period before syncing.'); setSyncStatus(''); return;
+      setSyncError('Choose a valid period before syncing.'); setSyncStatus(''); return false;
     }
     setSyncing(true); setSyncError(''); setSyncStatus('');
     try {
@@ -223,6 +302,7 @@ export default function Home() {
         }),
       });
       setSyncStatus(`Sync queued for ${from} through ${to} across active Square locations. When the worker finishes, click ↻ to refresh; incomplete Square data may still leave figures unavailable.`);
+      return true;
     } catch (reason) {
       const code = reason instanceof Error ? reason.message : '';
       const messages: Record<string, string> = {
@@ -237,6 +317,7 @@ export default function Home() {
         SQUARE_LOCATIONS_UNAVAILABLE: 'Square locations could not be loaded. Try again shortly.',
       };
       setSyncError(messages[code] ?? 'The sync could not be queued. Refresh the page and try again.');
+      return false;
     } finally { setSyncing(false); }
   }
   const currency = dashboard?.period?.currency ?? dashboard?.income?.currency ?? 'USD';
@@ -271,7 +352,7 @@ export default function Home() {
           {page === 'income' && <GiftCardSummary income={dashboard.income} currency={currency} />}
           {page === 'cash' && <Cash key={organizationId} dashboard={dashboard} currency={currency} movements={movements} accounts={dashboard.accounts ?? []} accountId={accountId} organizationId={organizationId} inventoryEnabled={features.inventoryTracking} canManageSquareCatalog={organizations.find(org => org.id === organizationId)?.role === 'owner'} canAuthorizeSquareCatalog={organizations.find(org => org.id === organizationId)?.role === 'owner'} onAccount={setAccountId} onSaved={() => void load()} />}
           {page === 'analytics' && features.productAnalytics && <Analytics key={organizationId} organizationId={organizationId} from={zonedMidnight(from, reportTimezone)} to={zonedMidnight(nextDate(to), reportTimezone)} currency={currency} timezone={reportTimezone} role={organizations.find(org => org.id === organizationId)?.role ?? 'read_only'} />}
-          {page === 'review' && <Review issues={openIssues} organizationId={organizationId} currency={currency} onSaved={() => void load()} />}
+          {page === 'review' && <Review issues={openIssues} organizationId={organizationId} currency={currency} canSync={organizations.find(org => org.id === organizationId)?.role === 'owner'} syncing={syncing} syncPeriodLabel={periodLabel(from, to)} onSyncPeriod={syncSelectedPeriod} onSaved={() => void load()} />}
           {page === 'ledger' && <Ledger events={events} />}
           {page === 'settings' && <Settings dashboard={dashboard} accountId={accountId} onAccount={setAccountId} />}
           <footer className="projection-foot">Calculation {dashboard.projectionVersion ?? 'version pending'} · {dashboard.period?.from ?? from} to {dashboard.period?.to ?? to} · {currency} · {dashboard.income?.status === 'incomplete' ? 'Margin incomplete' : 'Operational reporting'}</footer>
@@ -904,12 +985,14 @@ function ProductSalesChart({ product, from, to, currency, issues }: { product: A
   </div>;
 }
 
-function Review({ issues, organizationId, currency, onSaved }: { issues: Issue[]; organizationId: string; currency: string; onSaved: () => void }) {
+function Review({ issues, organizationId, currency, canSync, syncing, syncPeriodLabel, onSyncPeriod, onSaved }: { issues: Issue[]; organizationId: string; currency: string; canSync: boolean; syncing: boolean; syncPeriodLabel: string; onSyncPeriod: () => Promise<boolean>; onSaved: () => void }) {
   const [selected, setSelected] = useState<Issue | null>(null);
   const [issueDetails, setIssueDetails] = useState<Issue | null>(null);
   const [issueEvidence, setIssueEvidence] = useState<IssueEvidence[]>([]);
   const [issueEvidenceLoading, setIssueEvidenceLoading] = useState(false);
   const [issueEvidenceError, setIssueEvidenceError] = useState('');
+  const [issueSyncMessage, setIssueSyncMessage] = useState('');
+  const issueEvidenceRequestId = useRef(0);
   const [correction, setCorrection] = useState<{ issue: Issue; kind: 'item' | 'refund' } | null>(null);
   const [reason, setReason] = useState(''); const [busyId, setBusyId] = useState(''); const [error, setError] = useState(''); const [notice, setNotice] = useState('');
   const [evidence, setEvidence] = useState<IssueEvidence[]>([]); const [evidenceLoading, setEvidenceLoading] = useState(false);
@@ -933,15 +1016,32 @@ function Review({ issues, organizationId, currency, onSaved }: { issues: Issue[]
     try { await api('/api/proposals', { method: 'POST', headers: { 'Idempotency-Key': crypto.randomUUID() }, body: JSON.stringify({ organizationId, issueId: issue.id }) }); onSaved(); }
     catch (err) { setError(err instanceof Error ? err.message : 'A proposal could not be generated.'); } finally { setBusyId(''); }
   }
-  async function openIssue(issue: Issue) {
-    setIssueDetails(issue); setIssueEvidence([]); setIssueEvidenceError(''); setIssueEvidenceLoading(true);
+  async function loadIssueEvidence(issue: Issue) {
+    const requestId = ++issueEvidenceRequestId.current;
+    setIssueEvidence([]); setIssueEvidenceError(''); setIssueEvidenceLoading(supportsIssueEvidence(issue));
+    if (!supportsIssueEvidence(issue)) return;
     try {
       const query = new URLSearchParams({ organizationId });
       const result = await api<{ evidence: IssueEvidence[] }>(`/api/issues/${encodeURIComponent(issue.id)}/evidence?${query}`);
-      setIssueEvidence(result.evidence ?? []);
+      if (requestId === issueEvidenceRequestId.current) setIssueEvidence(result.evidence ?? []);
     } catch (err) {
-      setIssueEvidenceError(err instanceof Error ? err.message : 'Linked source evidence could not be loaded.');
-    } finally { setIssueEvidenceLoading(false); }
+      if (requestId === issueEvidenceRequestId.current) {
+        setIssueEvidenceError(err instanceof Error && err.message === 'Your session has expired. Sign in again.'
+          ? err.message
+          : 'Square linked records could not be loaded. This issue remains open and no decision was saved. Retry; if it continues, share the issue ID with a workspace owner.');
+      }
+    } finally { if (requestId === issueEvidenceRequestId.current) setIssueEvidenceLoading(false); }
+  }
+  function openIssue(issue: Issue) {
+    setIssueDetails(issue); setIssueSyncMessage('');
+    void loadIssueEvidence(issue);
+  }
+  async function syncIssuePeriod() {
+    setIssueSyncMessage('');
+    const queued = await onSyncPeriod();
+    setIssueSyncMessage(queued
+      ? `Sync queued for ${syncPeriodLabel}. Refresh the workspace after the worker finishes to check whether the issue cleared.`
+      : 'The sync could not be queued. Check the sync message on the page or ask a workspace owner to retry.');
   }
   async function openCorrection(issue: Issue, kind: 'item' | 'refund') {
     setCorrection({ issue, kind }); setError(''); setNotice(''); setReason(''); setEvidence([]); setEvidenceLoading(true);
@@ -1017,6 +1117,8 @@ function Review({ issues, organizationId, currency, onSaved }: { issues: Issue[]
       ? 'Square did not provide a reliable per-unit price, so no pass-through cost is prefilled.'
       : `Square also did not provide an item name. Per merchant policy, the prefilled pass-through cost equals the supported unit price of ${money(passThroughPriceMinor, itemCurrency)}. This approval applies only to this exact sale line (quantity ${selectedSaleLine?.quantity ?? 'unknown'}); replay uses unit cost × quantity.`
     : `This approval applies only to this exact sale line (quantity ${selectedSaleLine?.quantity ?? 'unknown'}). Enter a supplier-backed acquisition cost; replay uses unit cost × quantity.`;
+  const issueDiagnosis = issueDetails ? sourceGapReviewContext(issueDetails) : null;
+  const issueEvidenceSupported = issueDetails ? supportsIssueEvidence(issueDetails) : false;
   useEffect(() => {
     if (!passThroughLine || !selectedSaleLine) return;
     const unitPriceMinor = passThroughUnitPriceMinor(selectedSaleLine);
@@ -1030,11 +1132,15 @@ function Review({ issues, organizationId, currency, onSaved }: { issues: Issue[]
       {error && !correction && <p className="error" role="alert">{error}</p>}{notice && <p className="notice" role="status">{notice}</p>}
       {issues.length ? <div className="review-list">{issues.map(issue => {
         const proposal = getProposal(issue);
+        const diagnosis = sourceGapReviewContext(issue);
         const issueTitle = issue.code === 'UNKNOWN_ITEM' ? 'Item cost needs review'
           : issue.code === 'REFUND_COGS_REVIEW' ? 'Refund return needs review'
+            : issue.code === 'SOURCE_GAP' ? 'Square source data needs attention'
+              : issue.code === 'SOURCE_STALE' ? 'Square sync is out of date'
             : issue.title ?? issue.code?.replaceAll('_', ' ').toLowerCase() ?? 'Needs review';
         const issueMessage = issue.code === 'UNKNOWN_ITEM' ? 'A sale item needs a documented unit cost. Open the review to see the item and sale details.'
           : issue.code === 'REFUND_COGS_REVIEW' ? 'Confirm whether goods returned to inventory and whether a COGS reversal is supported.'
+            : diagnosis ? diagnosis.summary
             : String(issue.details?.message ?? issue.details?.description ?? 'Review the linked source evidence and decide how to handle this item.');
         return <article className="review-item" key={issue.id}>
           <div className="review-symbol">◇</div>
@@ -1054,13 +1160,33 @@ function Review({ issues, organizationId, currency, onSaved }: { issues: Issue[]
       {issueDetails && <div className="dialog-backdrop" onMouseDown={e => { if (e.target === e.currentTarget) setIssueDetails(null); }}><section className="dialog issue-detail-dialog" role="dialog" aria-modal="true" aria-labelledby="issue-details-title">
         <button className="icon-button dialog-close" onClick={() => setIssueDetails(null)} aria-label="Close issue details">×</button>
         <p className="eyebrow">ISSUE DETAILS</p>
-        <h2 id="issue-details-title">{issueDetails.title ?? issueDetails.code?.replaceAll('_', ' ') ?? 'Review issue'}</h2>
+        <h2 id="issue-details-title">{issueDetails.title ?? (issueDetails.code === 'SOURCE_GAP' ? 'Square source data needs attention' : issueDetails.code === 'SOURCE_STALE' ? 'Square sync is out of date' : issueDetails.code?.replaceAll('_', ' ')) ?? 'Review issue'}</h2>
         <p className="issue-detail-state"><span className="pill warn">{issueDetails.state.replaceAll('_', ' ')}</span>{issueDetails.code && <span>{issueDetails.code}</span>}</p>
         <dl className="issue-detail-meta"><div><dt>Issue ID</dt><dd>{issueDetails.id}</dd></div>{issueDetails.updated_at && <div><dt>Last updated</dt><dd>{date(issueDetails.updated_at)}</dd></div>}</dl>
-        {Boolean(issueDetails.details?.message || issueDetails.details?.description) && <section className="decision-context"><div className="decision-context-heading"><span>WHY THIS NEEDS REVIEW</span><strong>{String(issueDetails.details?.message ?? issueDetails.details?.description)}</strong></div></section>}
-        <section className="issue-detail-section"><h3>Linked source references</h3>{issueDetails.source_refs?.length ? <ul className="issue-source-refs">{issueDetails.source_refs.map((ref, index) => <li key={`${index}-${ref}`}><code>{ref}</code></li>)}</ul> : <p className="muted">No source references were attached to this issue.</p>}</section>
-        <section className="issue-detail-section"><h3>Linked source evidence</h3>{issueEvidenceLoading ? <p className="muted">Loading linked evidence…</p> : issueEvidenceError ? <p className="error" role="alert">{issueEvidenceError}</p> : issueEvidence.length ? <details className="proposal-details" open><summary>{issueEvidence.length} source record{issueEvidence.length === 1 ? '' : 's'}</summary><pre>{JSON.stringify(issueEvidence, null, 2)}</pre></details> : <p className="muted">No linked Square evidence was returned for this issue.</p>}</section>
-        <details className="proposal-details issue-record-details"><summary>Stored issue details</summary><pre>{JSON.stringify(issueDetails.details ?? {}, null, 2)}</pre></details>
+        {issueDiagnosis && <section className="decision-context decision-context-warning">
+          <div className="decision-context-heading"><span>WHAT NEEDS ATTENTION</span><strong>{issueDiagnosis.summary}</strong></div>
+          <dl className="decision-context-grid">
+            <div><dt>Square area</dt><dd>{issueDiagnosis.resource}</dd></div>
+            <div><dt>Gap type</dt><dd>{issueDiagnosis.gapCode.replaceAll('_', ' ').toLowerCase()}</dd></div>
+            {issueDiagnosis.eventType && <div><dt>Square activity</dt><dd>{issueDiagnosis.eventType}</dd></div>}
+            {issueDiagnosis.objectId && <div><dt>Square object</dt><dd>{issueDiagnosis.objectId}</dd></div>}
+            {issueDiagnosis.providerStatus !== undefined && <div><dt>Provider status</dt><dd>{issueDiagnosis.providerStatus}</dd></div>}
+            {issueDiagnosis.providerCode && <div><dt>Provider code</dt><dd>{issueDiagnosis.providerCode}</dd></div>}
+            {issueDiagnosis.jobId && <div><dt>Worker job</dt><dd>{issueDiagnosis.jobId}</dd></div>}
+          </dl>
+          {issueDiagnosis.problems.length > 0 && <>
+            <div className="decision-context-subheading">Missing information on source records</div>
+            <ul className="decision-context-lines">{issueDiagnosis.problems.map((problem, index) => <li key={`${index}-${problem.objectId ?? 'record'}`}><strong>{problem.objectId ?? `Source record ${index + 1}`}</strong><span>{problem.fields?.length ? problem.fields.map(issueFieldLabel).join('; ') : 'Required source information is missing.'}</span></li>)}</ul>
+          </>}
+          <p><strong>Next step:</strong> {issueDiagnosis.nextStep}</p>
+          {issueSyncMessage && <p role="status">{issueSyncMessage}</p>}
+          {issueDiagnosis.queueSync && (canSync
+            ? <div className="form-actions"><button type="button" className="secondary" onClick={() => void syncIssuePeriod()} disabled={syncing}>{syncing ? 'Queueing sync…' : 'Sync selected period'}</button><span className="field-hint">{syncPeriodLabel}</span></div>
+            : <p>Only a workspace owner can start a Square sync. Ask an owner to sync the selected period.</p>)}
+        </section>}
+        <section className="issue-detail-section"><h3>Linked source references</h3>{issueDetails.source_refs?.length ? <ul className="issue-source-refs">{issueDetails.source_refs.map((ref, index) => <li key={`${index}-${ref}`}><code>{ref}</code></li>)}</ul> : issueDiagnosis?.objectId ? <ul className="issue-source-refs"><li><code>{issueDiagnosis.objectId}</code><small>Square object from the worker diagnostic</small></li></ul> : <p className="muted">{issueDiagnosis ? `No individual record reference was attached; the gap was reported during the Square ${issueDiagnosis.resource} check.` : 'No source references were attached to this issue.'}</p>}</section>
+        <section className="issue-detail-section"><h3>Linked source evidence</h3>{issueEvidenceLoading ? <p className="muted">Loading linked evidence…</p> : issueEvidenceError ? <><p className="error" role="alert">{issueEvidenceError}</p><button type="button" className="secondary" onClick={() => void loadIssueEvidence(issueDetails)} disabled={issueEvidenceLoading}>Retry loading evidence</button></> : issueEvidence.length ? <details className="proposal-details" open><summary>{issueEvidence.length} source record{issueEvidence.length === 1 ? '' : 's'}</summary><pre>{JSON.stringify(issueEvidence, null, 2)}</pre></details> : !issueEvidenceSupported ? <p className="muted">This issue uses source diagnostics rather than the item and refund evidence viewer. Review the explanation and next step above.</p> : <p className="muted">No linked Square evidence was returned for this issue.</p>}</section>
+        <details className="proposal-details issue-record-details"><summary>Technical details</summary><pre>{JSON.stringify(issueDetails.details ?? {}, null, 2)}</pre></details>
         <div className="form-actions"><button className="secondary" onClick={() => setIssueDetails(null)}>Close</button></div>
       </section></div>}
       {selected && <div className="dialog-backdrop" onMouseDown={e => { if (e.target === e.currentTarget) setSelected(null); }}><section className="dialog" role="dialog" aria-modal="true" aria-labelledby="review-dialog-title"><button className="icon-button dialog-close" onClick={() => setSelected(null)} aria-label="Close review">×</button><p className="eyebrow">REVIEW DECISION</p><h2 id="review-dialog-title">{selected.title ?? selected.code ?? 'Review proposal'}</h2><p className="muted">This records a proposal decision. Use the source-backed correction form to update costs or refund treatment and recalculate.</p><label>Decision reason<textarea required rows={4} maxLength={1000} value={reason} onChange={e => setReason(e.target.value)} /></label><div className="form-actions"><button className="secondary" onClick={() => setSelected(null)}>Cancel</button>{(() => { const p = getProposal(selected); return <><button className="secondary reject-button" disabled={!p || !reason.trim() || busyId === selected.id} onClick={() => p && void decide(selected, p, 'reject')}>Reject</button><button className="primary" disabled={!p || !reason.trim() || busyId === selected.id} onClick={() => p && void decide(selected, p, 'approve')}>Record approval</button></>; })()}</div></section></div>}

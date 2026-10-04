@@ -169,6 +169,41 @@ function issueEvidenceRefs(issue) {
   return refs;
 }
 
+function issueDetailsForClient(details, issueCode) {
+  if (!details || typeof details !== 'object' || Array.isArray(details)) return {};
+  const visible = {};
+  for (const key of ['origin', 'code', 'resource', 'providerCode', 'eventType', 'jobId', 'objectId']) {
+    if (typeof details[key] === 'string' && details[key].length <= 400) visible[key] = details[key];
+  }
+  for (const key of ['providerStatus', 'source_revision', 'revision', 'freshnessTargetMs']) {
+    if (Number.isSafeInteger(details[key])) visible[key] = details[key];
+  }
+  for (const key of ['period_start', 'period_end', 'lastSuccessfulSyncAt']) {
+    if (typeof details[key] === 'string' && details[key].length <= 40) visible[key] = details[key];
+  }
+  if (typeof details.title === 'string') visible.title = details.title.slice(0, 200);
+
+  // Projection and finance-review messages are app-authored. Square/provider
+  // error text is deliberately omitted because it can contain raw diagnostics.
+  if (details.origin === 'projection' || ['UNKNOWN_ITEM', 'REFUND_COGS_REVIEW'].includes(issueCode)) {
+    for (const key of ['message', 'description']) {
+      if (typeof details[key] === 'string') visible[key] = details[key].slice(0, 1000);
+    }
+  }
+  if (Array.isArray(details.problems)) {
+    visible.problems = details.problems.slice(0, 50).flatMap(problem => {
+      if (!problem || typeof problem !== 'object' || Array.isArray(problem)) return [];
+      const row = {};
+      if (typeof problem.objectId === 'string' && problem.objectId.length <= 400) row.objectId = problem.objectId;
+      if (Array.isArray(problem.fields)) {
+        row.fields = problem.fields.filter(field => typeof field === 'string').slice(0, 20).map(field => field.slice(0, 120));
+      }
+      return Object.keys(row).length ? [row] : [];
+    });
+  }
+  return visible;
+}
+
 function issueEvidenceFromFacts(issue, facts) {
   const refs = issueEvidenceRefs(issue);
   const message = String(issue.details?.message ?? '');
@@ -509,7 +544,7 @@ export function createSupabaseAdapters({ url, publishableKey, secretKey, tokenEn
         ...issue,
         proposal_supported: SUPPORTED_DIAGNOSIS_ISSUE_TYPES.includes(details?.issue_type ?? ISSUE_TYPE_BY_CODE[issue.code]),
         title: typeof details?.title === 'string' ? details.title.slice(0, 200) : undefined,
-        details: { ...(typeof details?.message === 'string' ? { message: details.message.slice(0, 1000) } : {}), ...(typeof details?.description === 'string' ? { description: details.description.slice(0, 1000) } : {}) },
+        details: issueDetailsForClient(details, issue.code),
         proposals: (Array.isArray(proposals) ? proposals : []).filter(proposal => proposal.decision === 'pending').map(proposal => ({
           id: proposal.id,
           issueId: proposal.issue_id,
