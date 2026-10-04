@@ -317,3 +317,81 @@ td small.cell-sub { display: block; margin-top: 4px; color: var(--subtle); font-
   .activity-list li { grid-template-columns: 1fr; gap: 4px; }
   .auth-card { padding: 23px; }
 }
+
+/* Quieter, denser workspace styling. Keep borders on controls and true dialogs;
+   use alignment and dividers to separate the working areas. */
+:root { font-variant-numeric: tabular-nums; }
+.brand-wordmark { width: min(100%, 138px); }
+.brand-lockup { margin-bottom: 26px; }
+.workspace { margin: 0 3px 20px; padding: 7px 5px; border: 0; border-radius: 0; background: transparent; }
+.workspace-mark { flex-basis: 28px; width: 28px; height: 28px; }
+.nav-link { height: 40px; border-radius: 4px; }
+.nav-link.selected { box-shadow: inset 2px 0 var(--green); background: #1b211d; }
+.topbar { min-height: 54px; padding-inline: 40px; }
+.page { padding: 27px 40px 36px; }
+.page-head { margin-bottom: 21px; }
+.page h1 { font-size: 30px; }
+.primary, .secondary { min-height: 36px; padding: 7px 11px; border-radius: 5px; }
+.metric-grid { margin-bottom: 12px; border: 0; border-radius: 0; background: transparent; }
+.metric { min-height: 100px; padding: 13px 16px; }
+.metric:first-child { padding-left: 0; }
+.metric strong { margin: 8px 0 3px; }
+.panel:not(.entry-form) { margin-bottom: 10px; padding: 16px 0; border: 0; border-top: 1px solid var(--line); border-radius: 0; background: transparent; }
+.panel-heading { align-items: center; margin-bottom: 10px; }
+.panel-heading p { margin-top: 3px; }
+th { position: sticky; top: 0; z-index: 1; padding: 8px 10px; background: #151a17; }
+td { padding: 9px 10px; }
+tbody tr { transition: background-color .14s ease; }
+tbody tr:hover td { background: #1a201c; }
+.overview-summary { margin-bottom: 9px; border: 0; border-radius: 0; background: transparent; }
+.summary-metric { min-height: 105px; padding: 13px 17px; }
+.summary-metric:first-child { padding-left: 0; }
+.summary-metric strong { margin: 8px 0 3px; font-size: 26px; }
+.overview-status-strip { min-height: 30px; margin-bottom: 17px; padding: 0; border: 0; border-radius: 0; background: transparent; font-size: 11px; }
+.overview-content { gap: 34px; }
+.overview-section { padding: 13px 0 15px; }
+.overview-section-heading { margin-bottom: 8px; }
+.finance-table td { height: 36px; padding-block: 6px; }
+.recent-activity { margin-top: 10px; }
+.activity-list li { min-height: 34px; padding-block: 7px; }
+.projection-foot { display: flex; justify-content: space-between; align-items: center; margin-top: 17px; padding-top: 9px; }
+.system-details { position: relative; }
+.system-details summary, .receipt-help summary { color: var(--subtle); cursor: pointer; }
+.system-details[open] span { position: absolute; right: 0; bottom: calc(100% + 7px); z-index: 3; width: max-content; max-width: min(420px, 80vw); padding: 9px 11px; border: 1px solid var(--line); border-radius: 5px; color: var(--muted); background: var(--surface-raised); }
+.inventory-panel { margin-top: 18px !important; }
+.inventory-actions { gap: 6px; }
+.action-menu { position: relative; }
+.action-menu > summary { display: grid; min-width: 36px; height: 36px; place-items: center; border: 1px solid transparent; border-radius: 5px; color: var(--muted); cursor: pointer; list-style: none; }
+.action-menu > summary::-webkit-details-marker { display: none; }
+.action-menu > summary:hover, .action-menu[open] > summary { border-color: var(--line); color: var(--text); background: var(--surface-raised); }
+.action-menu-popover { position: absolute; top: calc(100% + 4px); right: 0; z-index: 8; display: grid; min-width: 170px; padding: 4px; border: 1px solid var(--line); border-radius: 6px; background: #1b211d; box-shadow: 0 10px 24px #0005; }
+.action-menu-popover button { padding: 8px 9px; border: 0; border-radius: 3px; color: var(--text); background: transparent; text-align: left; font-size: 12px; }
+.action-menu-popover button:hover { background: #29322b; }
+.menu-note { padding: 8px 9px; color: var(--subtle); font-size: 11px; }
+.receipt-assist { margin-top: 8px; padding: 13px 0 !important; border-top: 1px solid var(--line-soft) !important; }
+.receipt-assist .panel-heading h3, .stock-panel .panel-heading h3 { margin: 0; color: #e1e8e2; font-size: 15px; font-weight: 620; }
+.receipt-assist .panel-heading p, .stock-panel .panel-heading p { font-size: 11px; }
+.receipt-draft-label { font-size: 11px; }
+.receipt-help { margin-top: 12px; font-size: 11px; }
+.receipt-help p { max-width: 620px; margin: 7px 0 0; color: var(--subtle); line-height: 1.5; }
+.stock-panel { border-top: 1px solid var(--line-soft) !important; }
+.inventory-issues { margin: 8px 0; color: var(--amber); font-size: 12px; }
+.inventory-issues span { margin-left: 8px; color: var(--muted); }
+.catalog-table { min-width: 760px; }
+.catalog-table td:last-child, .catalog-table th:last-child { width: 48px; min-width: 48px; }
+.catalog-row-menu { display: grid; justify-items: end; }
+.cost-unavailable { color: var(--amber); font-size: 12px; }
+.catalog-state { padding: 2px 6px; border-radius: 3px; font-size: 9px; }
+.overview-attention { min-height: 48px; margin-block: 0 3px; padding-block: 8px; }
+@media (max-width: 1050px) {
+  .topbar { padding-inline: 22px; }
+  .page { padding: 24px 23px 32px; }
+}
+@media (max-width: 720px) {
+  .page { padding: 21px 16px 28px; }
+  .topbar { padding-inline: 16px; }
+  .summary-metric { min-height: 92px; padding: 11px; }
+  .summary-metric strong { font-size: 22px; }
+  .inventory-actions { flex-wrap: wrap; }
+  .overview-content { gap: 8px; }
+}
