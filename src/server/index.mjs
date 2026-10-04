@@ -636,7 +636,8 @@ export function createHandlers(adapters) {
     const action=['complete','approve','reject'].includes(pathParts.at(-1)) ? pathParts.at(-1) : null;
     const receiptId=action ? pathParts.at(-2) : pathParts.at(-1);
     const actionBody=req.method==='POST'&&action ? await readJson(req,action==='approve'?80_000:32_000) : null;
-    const organizationId=queryOrganizationId ?? actionBody?.organizationId ?? null;
+    const deleteBody=req.method==='DELETE' ? await readJson(req,12_000) : null;
+    const organizationId=queryOrganizationId ?? actionBody?.organizationId ?? deleteBody?.organizationId ?? null;
     if(queryOrganizationId&&actionBody?.organizationId&&queryOrganizationId!==actionBody.organizationId) throw new HttpError(400,'INVALID_ORGANIZATION_ID');
     if (req.method==='POST' && pathParts.length===2 && pathParts[1]==='purchase-receipts') {
       const body=await readJson(req,12_000);
@@ -654,6 +655,15 @@ export function createHandlers(adapters) {
       return ok({receipts:rows.map(receiptPublicRecord)});
     }
     if (!UUID.test(receiptId)) throw new HttpError(405,'METHOD_NOT_ALLOWED');
+    if (req.method==='DELETE' && !action && pathParts.length===3) {
+      if(!exactObject(deleteBody,['organizationId'])||deleteBody.organizationId!==organizationId) throw new HttpError(400,'INVALID_RECEIPT_DELETION');
+      const reviewer=await authorize(req,organizationId,['owner','reviewer']);
+      const receipt=await db.getPurchaseReceipt({organizationId,receiptId,accessToken:reviewer.accessToken});
+      if(!receipt) throw new HttpError(404,'RECEIPT_NOT_FOUND');
+      if(receipt.status!=='failed'||Number(receipt.active_draft_version??receipt.activeDraftVersion??0)>0) throw new HttpError(409,'RECEIPT_NOT_DELETABLE');
+      await db.deleteFailedPurchaseReceipt({organizationId,receiptId,accessToken:reviewer.accessToken});
+      return ok({receiptId,deleted:true});
+    }
     if(req.method==='POST'&&action==='complete') {
       const body=actionBody;
       if(!exactObject(body,['organizationId'])||body.organizationId!==organizationId) throw new HttpError(400,'INVALID_RECEIPT_COMPLETION');

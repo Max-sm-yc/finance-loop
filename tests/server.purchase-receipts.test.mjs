@@ -6,7 +6,7 @@ import { createHandlers } from '../src/server/index.mjs';
 const org='11111111-1111-4111-8111-111111111111', receiptId='55555555-5555-4555-8555-555555555555';
 const userToken='valid.user.jwt', integrationToken='flpr_abcdefghijklmnopqrstuvwxyz0123456789';
 const bytes=Buffer.from('%PDF-1.7\nminimal test fixture');
-function harness({role='owner',receiptBytes=bytes}={}) {
+function harness({role='owner',receiptBytes=bytes,receiptStatus='needs_review',draftVersion=2}={}) {
   const calls=[];
   const db={
     async getMembership(args){calls.push(['membership',args]);return {role};},
@@ -22,7 +22,8 @@ function harness({role='owner',receiptBytes=bytes}={}) {
     async downloadPurchaseReceiptObject(args){calls.push(['download',args]);return new Uint8Array(receiptBytes);},
     async completePurchaseReceiptUpload(args){calls.push(['complete',args]);return {receiptId,status:'queued',jobId:'job-1'};},
     async getPurchaseReceiptForIntegration(args){calls.push(['integrationReceipt',args]);return {id:receiptId,status:'awaiting_upload',original_filename:'source.pdf',declared_mime_type:'application/pdf'};},
-    async getPurchaseReceipt(args){calls.push(['getReceipt',args]);return {id:receiptId,status:'needs_review',active_draft_version:2,original_filename:'source.pdf',declared_mime_type:'application/pdf',submitted_at:'2026-10-03T00:00:00Z',evidence_file_id:null};},
+    async getPurchaseReceipt(args){calls.push(['getReceipt',args]);return {id:receiptId,status:receiptStatus,active_draft_version:draftVersion,original_filename:'source.pdf',declared_mime_type:'application/pdf',submitted_at:'2026-10-03T00:00:00Z',evidence_file_id:null};},
+    async deleteFailedPurchaseReceipt(args){calls.push(['deleteReceipt',args]);return {receiptId,deleted:true};},
     async getPurchaseReceiptDraft(args){calls.push(['getDraft',args]);return {version:2,draft:{documentKind:'receipt',currency:null,totals:{totalMinor:47688,totalAmount:'476.88'},lines:[{lineId:'line-1'}]}};},
     async listPurchaseReceipts(){return [];}, async listPurchaseReceiptCatalogCandidates(){return [{catalogObjectId:'variation-1',name:'Tea',sku:'T-1',currency:'USD'}];},
     async listInventoryItems(){return [{id:'88888888-8888-4888-8888-888888888888',name:'Tea',sku:'T-1',currency:'USD',square_catalog_object_id:'variation-1',item_kind:'catalog'}];},
@@ -37,6 +38,37 @@ function harness({role='owner',receiptBytes=bytes}={}) {
 }
 const auth={authorization:`Bearer ${userToken}`};
 const post=(url,body,headers={})=>new Request(`https://app.test${url}`,{method:'POST',headers:{...auth,'content-type':'application/json',...headers},body:JSON.stringify(body)});
+
+const deleteRequest=(body={organizationId:org})=>new Request(`https://app.test/api/purchase-receipts/${receiptId}`,{method:'DELETE',headers:{...auth,'content-type':'application/json'},body:JSON.stringify(body)});
+test('owner and reviewer delete failed receipts using their caller JWT',async()=>{
+  for(const role of ['owner','reviewer']) {
+    const {handlers,calls}=harness({role,receiptStatus:'failed',draftVersion:null});
+    const response=await handlers.purchaseReceipts(deleteRequest());
+    assert.equal(response.status,200);
+    assert.deepEqual(calls.find(call=>call[0]==='deleteReceipt')[1],{organizationId:org,receiptId,accessToken:userToken});
+    assert.ok(!calls.some(call=>['download','approve','reject'].includes(call[0])));
+  }
+});
+test('operators and read-only members cannot delete failed receipts',async()=>{
+  for(const role of ['operator','read_only']) {
+    const {handlers,calls}=harness({role,receiptStatus:'failed',draftVersion:null});
+    assert.equal((await handlers.purchaseReceipts(deleteRequest())).status,403);
+    assert.ok(!calls.some(call=>call[0]==='deleteReceipt'));
+  }
+});
+test('receipt deletion rejects non-failed states and receipts with a draft',async()=>{
+  for(const [receiptStatus,draftVersion] of [['queued',null],['processing',null],['needs_review',2],['posted',2],['failed',2]]) {
+    const {handlers,calls}=harness({receiptStatus,draftVersion});
+    assert.equal((await handlers.purchaseReceipts(deleteRequest())).status,409);
+    assert.ok(!calls.some(call=>call[0]==='deleteReceipt'));
+  }
+});
+test('receipt deletion requires a valid body and authenticated session',async()=>{
+  const {handlers,calls}=harness({receiptStatus:'failed',draftVersion:null});
+  assert.equal((await handlers.purchaseReceipts(deleteRequest({organizationId:org,force:true}))).status,400);
+  assert.equal((await handlers.purchaseReceipts(new Request(`https://app.test/api/purchase-receipts/${receiptId}?organizationId=${org}`,{method:'DELETE',headers:{'content-type':'application/json'},body:JSON.stringify({organizationId:org})}))).status,401);
+  assert.ok(!calls.some(call=>call[0]==='deleteReceipt'));
+});
 
 test('creates one-time integration credentials as an owner and only stores their SHA-256 digest',async()=>{
   const {handlers,calls}=harness();

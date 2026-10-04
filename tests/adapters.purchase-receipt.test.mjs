@@ -26,6 +26,7 @@ test('purchase receipt RPC and storage adapters keep privileged and caller-JWT o
   assert.equal(await adapters.db.reservePurchaseReceiptModelBudget({organizationId:org,receiptId:receipt,model:'openai/gpt-6-luna',maxInputTokens:1000,maxOutputTokens:1400,maxAttempts:2}),true);
   await adapters.db.approvePurchaseReceipt({organizationId:org,receiptId:receipt,expectedVersion:1,selections:{currency:'USD'},reason:'Verified source invoice.',idempotencyKey:'approve-1',accessToken:human});
   await adapters.db.listPurchaseReceiptCatalogCandidates({organizationId:org,currency:'USD',accessToken:human});
+  await adapters.db.deleteFailedPurchaseReceipt({organizationId:org,receiptId:receipt,accessToken:human});
   await adapters.db.finalizePurchaseReceiptProjection({organizationId:org,receiptId:receipt,decisionId:'decision-1',succeeded:true});
   const authCall=calls.find(call=>call.url.endsWith('/rpc/authorize_purchase_receipt_integration'));
   const completeCall=calls.find(call=>call.url.endsWith('/rpc/complete_purchase_receipt_upload'));
@@ -36,6 +37,10 @@ test('purchase receipt RPC and storage adapters keep privileged and caller-JWT o
   assert.deepEqual(reserveCall.body,{p_organization_id:org,p_receipt_id:receipt,p_model_id:'openai/gpt-6-luna',p_max_input_tokens:1000,p_max_output_tokens:1400,p_max_attempts:2});
   assert.equal(approveCall.headers.get('apikey'),publishable);assert.equal(approveCall.headers.get('authorization'),`Bearer ${human}`);
   const candidatesCall=calls.find(call=>call.url.endsWith('/rpc/list_purchase_receipt_catalog_candidates'));
+  const deleteCall=calls.find(call=>call.url.endsWith('/rpc/delete_failed_purchase_receipt'));
+  assert.deepEqual(deleteCall.body,{p_organization_id:org,p_receipt_id:receipt});
+  assert.equal(deleteCall.headers.get('apikey'),publishable);
+  assert.equal(deleteCall.headers.get('authorization'),`Bearer ${human}`);
   assert.deepEqual(candidatesCall.body,{p_organization_id:org,p_currency:'USD'});
   assert.equal(candidatesCall.headers.get('apikey'),publishable);
   assert.equal(candidatesCall.headers.get('authorization'),`Bearer ${human}`);

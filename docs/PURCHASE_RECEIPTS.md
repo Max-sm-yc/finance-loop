@@ -37,6 +37,8 @@ Workspace users register an upload with `POST /api/purchase-receipts` using thei
 
 `duplicate`, `rejected`, and `failed` need explicit handling; duplicates link to the prior receipt and must not be posted again. Delivery and payment are separate from intake status and can remain pending after the document has been approved. A completed upload or successful processing job does not mean the resulting accounting projection is ready.
 
+Owners and reviewers can use **Delete failed receipt** for a failed submission without any draft, decision, or financial effects. Deletion removes it from the inbox and records the actor in an audit event; original evidence, submission identity, jobs, and budget history remain retained. After fixing the processing configuration, upload the document with a new submission ID. Deleted submissions no longer block that new upload as duplicates. Reusing the deleted submission's ID does not restart it. The `DELETE /api/purchase-receipts/{receiptId}` endpoint requires the caller's Supabase JWT and a JSON body `{ organizationId }`; its database RPC independently verifies organization role and receipt state.
+
 ## Deployment prerequisites
 
 - Apply the new ordered receipt migrations only after reviewing their scope and verifying the linked Supabase project. Do not use production `db push` as a local validation step.

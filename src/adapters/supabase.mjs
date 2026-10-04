@@ -432,7 +432,7 @@ export function createSupabaseAdapters({ url, publishableKey, secretKey, tokenEn
       return value ? { receiptId: value.receiptId ?? value.receipt_id, status: value.status, objectKey: value.objectKey ?? value.object_key } : null;
     },
     async getPurchaseReceiptForIntegration({ organizationId, integrationId, receiptId }) {
-      const query = new URLSearchParams({ select: '*', organization_id: eq(organizationId), integration_id: eq(integrationId), id: eq(receiptId), limit: '2' });
+      const query = new URLSearchParams({ select: '*', organization_id: eq(organizationId), integration_id: eq(integrationId), id: eq(receiptId), deleted_at: 'is.null', limit: '2' });
       return one(await table(serviceRest(), 'purchase_receipt_submissions', query), 'integration purchase receipt');
     },
     async createPurchaseReceiptUploadUrl({ objectKey }) {
@@ -511,6 +511,13 @@ export function createSupabaseAdapters({ url, publishableKey, secretKey, tokenEn
     },
     async failPurchaseReceiptProcessing({ organizationId, receiptId, code }) {
       const { data, error } = await serviceRest().rpc('fail_purchase_receipt_processing', { p_organization_id: organizationId, p_receipt_id: receiptId, p_code: code });
+      if (error) throw error;
+      return data;
+    },
+    async deleteFailedPurchaseReceipt({ organizationId, receiptId, accessToken }) {
+      const { data, error } = await userRest(accessToken).rpc('delete_failed_purchase_receipt', {
+        p_organization_id: organizationId, p_receipt_id: receiptId,
+      });
       if (error) throw error;
       return data;
     },

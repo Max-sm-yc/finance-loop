@@ -242,6 +242,21 @@ export default function PurchaseReceipts({ organizationId, role, accounts, curre
     catch (reason) { setError(reason instanceof Error ? reason.message : 'Could not create the integration credential.'); }
     finally { setBusy(false); }
   }
+  async function deleteFailedReceipt() {
+    if (!selected || !canReview || selected.receipt.status !== 'failed' || selected.draft) return;
+    if (!window.confirm('Delete this failed receipt from the inbox? Source evidence and audit history will be retained. You can upload it again with a new submission ID after fixing the processing issue.')) return;
+    const receiptId = selected.receipt.id;
+    setBusy(true); setError(''); setNotice('');
+    try {
+      await api(`/api/purchase-receipts/${encodeURIComponent(receiptId)}`, { method: 'DELETE', body: JSON.stringify({ organizationId }) });
+      setReceipts(current => current.filter(receipt => receipt.id !== receiptId)); setSelected(null);
+      uploadSubmissionId.current = null; uploadFileIdentity.current = '';
+      const url = new URL(window.location.href); url.searchParams.delete('purchaseReceipt'); window.history.replaceState(null, '', url.toString());
+      setNotice('Failed receipt deleted from the inbox.'); onSaved();
+    } catch (reason) { setError(reason instanceof Error ? reason.message : 'Could not delete the failed receipt.'); }
+    finally { setBusy(false); }
+  }
+
   async function revokeCredential(id: string) {
     if (!window.confirm('Revoke this integration credential now? Existing flows using it will stop working.')) return;
     setBusy(true); setError('');
@@ -260,7 +275,7 @@ export default function PurchaseReceipts({ organizationId, role, accounts, curre
     {selected && <section className="panel purchase-review">
       <div className="panel-heading"><div><h2>{selected.draft?.supplier || selected.receipt.originalFilename || selected.receipt.filename || 'Receipt review'}</h2><p>{selected.draft?.purchaseReference ? `Reference ${selected.draft.purchaseReference} · ` : ''}{selected.draft?.invoiceDate || 'Date not extracted'} · Draft version {selected.receipt.activeDraftVersion ?? '—'}</p></div><div className="purchase-review-actions">{selected.evidenceUrl && <a className="secondary button-link" href={selected.evidenceUrl} target="_blank" rel="noreferrer">Open source document</a>}<span className="pill warn">{selected.receipt.status.replaceAll('_', ' ')}</span></div></div>
       {selected.receipt.duplicateOfReceiptId && <div className="notice decision-context-warning">This document matches a prior submission. <button type="button" className="secondary" onClick={() => void openReceipt(selected.receipt.duplicateOfReceiptId!)}>Open prior receipt</button></div>}
-      {!selected.draft ? selected.receipt.status === 'failed' ? <div className="notice decision-context-warning"><b>Processing failed{selected.receipt.lastErrorCode ? ` · ${selected.receipt.lastErrorCode}` : ''}</b><span>This receipt has no reviewable draft. Ask a workspace owner to investigate the worker and configuration. Reusing the same submission ID does not restart a failed terminal record.</span></div> : <div className="inline-empty">Draft extraction is pending. Refresh this inbox after the worker completes.</div> : <>
+      {!selected.draft ? selected.receipt.status === 'failed' ? <div className="notice decision-context-warning"><b>Processing failed{selected.receipt.lastErrorCode ? ` · ${selected.receipt.lastErrorCode}` : ''}</b><span>This receipt has no reviewable draft. Ask a workspace owner to investigate the worker and configuration. Reusing the same submission ID does not restart a failed terminal record.</span>{canReview && <button type="button" className="secondary" disabled={busy} onClick={() => void deleteFailedReceipt()}>Delete failed receipt</button>}</div> : <div className="inline-empty">Draft extraction is pending. Refresh this inbox after the worker completes.</div> : <>
         {selected.receipt.lastErrorCode && ['failed','projection_pending'].includes(selected.receipt.status) && <div className="notice decision-context-warning"><b>Processing issue · {selected.receipt.lastErrorCode}</b><span>Review the worker and projection status before taking further action.</span></div>}
         <div className={`notice ${selected.draft.reconciliation?.status === 'matched' ? 'purchase-match' : 'decision-context-warning'}`}><b>Document reconciliation · {selected.draft.reconciliation?.status ?? 'incomplete'}</b><span>Line amounts {formatMoney(displayedLineTotal, displayCurrency)} · Document total {formatMoney(displayedDocumentTotal, displayCurrency)} · Unexplained variance {formatMoney(displayedDifference, displayCurrency)}. Tax, shipping, and other charges are not treated as a discrepancy unless reconciliation identifies an unexplained amount. Check discounts and charges against the source before approval.</span></div>
         {!selected.draft.currency && <label className="purchase-currency">Confirm currency from the source document<select required value={confirmedCurrency} onChange={event => confirmCurrency(event.target.value)}><option value="">Choose currency</option>{[...new Set([currency, ...accounts.map(account => account.currency)])].map(code => <option key={code} value={code}>{code}</option>)}</select></label>}

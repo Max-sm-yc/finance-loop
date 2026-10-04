@@ -313,7 +313,7 @@ async function dispatch(request: Request) {
   if (resource === 'purchase-receipts' && !id && method === 'GET') return route.purchaseReceipts(request);
   if (resource === 'purchase-receipts' && !id && method === 'POST') return route.purchaseReceipts(request);
   if (resource === 'purchase-receipts' && id === 'intake' && method === 'POST') return route.manualPurchaseReceiptIntake(request);
-  if (resource === 'purchase-receipts' && id && !['intake'].includes(id) && (method === 'GET' || method === 'POST')) return route.purchaseReceipts(request);
+  if (resource === 'purchase-receipts' && id && !['intake'].includes(id) && ['GET', 'POST', 'DELETE'].includes(method)) return route.purchaseReceipts(request);
   if (resource === 'integrations' && id === 'purchase-receipts') {
     const receiptId = parts[3];
     const integrationAction = parts[4];
