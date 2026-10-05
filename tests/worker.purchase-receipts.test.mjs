@@ -66,6 +66,16 @@ test('receipt budget denial persists failure and dead-letters without model or a
   assert.ok(!events.some(event => ['draft','usage','saveProjectionRunSystem','upsertSquareFacts'].includes(Array.isArray(event) ? event[0] : event)));
 });
 
+test('invalid model response marks the receipt failed without retrying against the same reservation', async () => {
+  const { worker, events } = harness({ modelResponse: { document_kind: 'invoice' } });
+  const result = await worker.runOne({ workerId: 'receipt-worker' });
+  assert.equal(result.status, 'dead_lettered');
+  assert.equal(result.code, 'MODEL_INVALID_RESPONSE');
+  assert.ok(events.some(event => Array.isArray(event) && event[0] === 'failed' && event[1].code === 'MODEL_INVALID_RESPONSE'));
+  assert.ok(events.some(event => Array.isArray(event) && event[0] === 'dead'));
+  assert.ok(!events.some(event => Array.isArray(event) && event[0] === 'retry'));
+});
+
 test('terminal receipt download failure marks the inbox failed instead of leaving it processing', async () => {
   const { worker, events } = harness({ attempts: 2, downloadError: Object.assign(new Error('network unavailable'), { code: 'NETWORK_FAILURE' }) });
   const result = await worker.runOne({ workerId: 'receipt-worker' });

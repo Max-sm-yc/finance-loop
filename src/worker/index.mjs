@@ -446,7 +446,7 @@ export function createWorker(dependencies) {
       return { receiptId, outcome: 'needs_review', draftVersion: result?.version ?? result?.draftVersion ?? expectedVersion + 1 };
     } catch (error) {
       const code = typeof error?.code === 'string' && /^[A-Z0-9_.-]{1,80}$/.test(error.code) ? error.code : 'RECEIPT_PROCESSING_FAILED';
-      if (receipt && (error.permanent || code === 'BUDGET_EXCEEDED' || code === 'MODEL_UNAVAILABLE')) {
+      if (receipt && (error.permanent || code === 'BUDGET_EXCEEDED' || code === 'MODEL_UNAVAILABLE' || code === 'MODEL_INVALID_RESPONSE')) {
         await db.failPurchaseReceiptProcessing({ organizationId: job.organizationId, receiptId, code });
         error.permanent = true;
       }

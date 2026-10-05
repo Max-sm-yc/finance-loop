@@ -1,5 +1,5 @@
 begin;
-select plan(39);
+select plan(46);
 
 insert into auth.users(id,aud,role,email,encrypted_password,email_confirmed_at,created_at,updated_at)
 values('7d9db4a4-37a8-4241-a885-3120f73b3377','authenticated','authenticated','purchase-receipt@example.invalid','',now(),now(),now());
@@ -26,8 +26,51 @@ select public.complete_purchase_receipt_upload('95c9874f-fb81-4f32-bc8b-bbc558d2
   (select result->>'objectKey' from receipt_test_submission),repeat('a',64),128,'application/pdf') as result;
 select is((select result->>'status' from receipt_test_upload),'queued','complete upload atomically queues extraction');
 select is((select count(*) from private.durable_jobs where job_type='receipt.process' and organization_id='95c9874f-fb81-4f32-bc8b-bbc558d2ee07'),1::bigint,'receipt extraction has one durable job');
-select ok(public.reserve_purchase_receipt_model_budget('95c9874f-fb81-4f32-bc8b-bbc558d2ee07',(select (result->>'receiptId')::uuid from receipt_test_upload),'openai/gpt-6-luna',12000,1500,1),'worker budget supports 1500 token extraction cap');
-select ok(public.record_purchase_receipt_model_usage('95c9874f-fb81-4f32-bc8b-bbc558d2ee07',(select (result->>'receiptId')::uuid from receipt_test_upload),'openai/gpt-6-luna','{}'::jsonb,1),'worker usage records against reserved receipt budget');
+insert into private.ai_model_budgets(organization_id,daily_token_limit)
+values('95c9874f-fb81-4f32-bc8b-bbc558d2ee07',4096)
+on conflict (organization_id) do update set daily_token_limit=excluded.daily_token_limit;
+update public.purchase_receipt_submissions set status='processing'
+where id=(select (result->>'receiptId')::uuid from receipt_test_upload);
+update private.durable_jobs set status='running'
+where id=(select (result->>'jobId')::uuid from receipt_test_upload);
+select ok(public.reserve_purchase_receipt_model_budget('95c9874f-fb81-4f32-bc8b-bbc558d2ee07',
+  (select (result->>'receiptId')::uuid from receipt_test_upload),(select (result->>'jobId')::uuid from receipt_test_upload),
+  'openai/gpt-6-luna',12000,1500,1),'worker reserves budget for the active durable extraction job');
+select is((select reserved_tokens from private.receipt_agent_budget_reservations
+  where run_id=(select (result->>'jobId')::uuid from receipt_test_upload)),4096,
+  'receipt job receives the fixed 4,096-token reservation');
+select ok(public.record_purchase_receipt_model_usage('95c9874f-fb81-4f32-bc8b-bbc558d2ee07',
+  (select (result->>'receiptId')::uuid from receipt_test_upload),(select (result->>'jobId')::uuid from receipt_test_upload),
+  'openai/gpt-6-luna','{}'::jsonb,1),'worker usage records against reserved receipt budget');
+update private.durable_jobs set status='dead_letter',finished_at=now(),last_error_code='MODEL_INVALID_RESPONSE'
+where id=(select (result->>'jobId')::uuid from receipt_test_upload);
+update public.purchase_receipt_submissions set status='failed',last_error_code='MODEL_INVALID_RESPONSE'
+where id=(select (result->>'receiptId')::uuid from receipt_test_upload);
+select set_config('request.jwt.claims','{"sub":"7d9db4a4-37a8-4241-a885-3120f73b3377","role":"authenticated"}',true);
+create temporary table receipt_test_retry as
+select public.reprocess_failed_purchase_receipt('95c9874f-fb81-4f32-bc8b-bbc558d2ee07',
+  (select (result->>'receiptId')::uuid from receipt_test_upload)) as result;
+select is((select result->>'status' from receipt_test_retry),'queued','failed receipt retry queues a new job');
+select isnt((select result->>'jobId' from receipt_test_retry),(select result->>'jobId' from receipt_test_upload),
+  'failed receipt retry receives a fresh durable job id');
+select ok((select released_at is not null from private.receipt_agent_budget_reservations
+  where run_id=(select (result->>'jobId')::uuid from receipt_test_upload)),
+  'failed run reservation is released and retained as history');
+select set_config('request.jwt.claims','{"role":"service_role"}',true);
+update private.durable_jobs set status='running'
+where id=(select (result->>'jobId')::uuid from receipt_test_retry);
+update public.purchase_receipt_submissions set status='processing'
+where id=(select (result->>'receiptId')::uuid from receipt_test_upload);
+select ok(public.reserve_purchase_receipt_model_budget('95c9874f-fb81-4f32-bc8b-bbc558d2ee07',
+  (select (result->>'receiptId')::uuid from receipt_test_upload),(select (result->>'jobId')::uuid from receipt_test_retry),
+  'openai/gpt-6-luna',12000,1500,1),'retry receives the released 4,096-token allocation');
+select is((select sum(reserved_tokens) from private.receipt_agent_budget_reservations
+  where organization_id='95c9874f-fb81-4f32-bc8b-bbc558d2ee07'
+    and budget_day=(now() at time zone 'UTC')::date and released_at is null),4096::bigint,
+  'failed retry does not double-count the same daily allocation');
+select ok(public.record_purchase_receipt_model_usage('95c9874f-fb81-4f32-bc8b-bbc558d2ee07',
+  (select (result->>'receiptId')::uuid from receipt_test_upload),(select (result->>'jobId')::uuid from receipt_test_retry),
+  'openai/gpt-6-luna','{}'::jsonb,1),'reallocated reservation accepts usage for the retry job');
 create temporary table receipt_test_duplicate_submission as
 select public.create_purchase_receipt_submission('95c9874f-fb81-4f32-bc8b-bbc558d2ee07',
   (select (result->>'id')::uuid from receipt_test_integration),'external-test-002','supplier-copy.pdf','application/pdf') as result;
