@@ -723,7 +723,10 @@ export function createHandlers(adapters) {
       for(const effect of [...body.costUpdates,...body.stockReceipts]) if(!effect||!validLineIds.has(effect.lineId)) throw new HttpError(400,'INVALID_RECEIPT_APPROVAL');
       const confirmedCurrency=draft.currency??body.currency;
       for(const cost of body.costUpdates) if(!text(cost.catalogObjectId,200)||!text(cost.name,200)||!Number.isSafeInteger(cost.unitCostMinor)||cost.unitCostMinor<0||cost.unitCostMinor>=1_000_000_000_000||! /^[A-Z]{3}$/.test(cost.currency??'')||cost.currency!==confirmedCurrency||!validDate(cost.effectiveFrom)) throw new HttpError(400,'INVALID_RECEIPT_APPROVAL');
-      for(const stock of body.stockReceipts) if(!UUID.test(stock.itemId ?? '')||!Number.isSafeInteger(stock.quantity)||stock.quantity<1||stock.quantity>1_000_000||!Number.isSafeInteger(stock.unitCostMinor)||stock.unitCostMinor<0||stock.unitCostMinor>=1_000_000_000_000||! /^[A-Z]{3}$/.test(stock.currency??'')||stock.currency!==confirmedCurrency||!Number.isSafeInteger(stock.packageQuantity)||stock.packageQuantity<1||!Number.isSafeInteger(stock.unitsPerPackage)||stock.unitsPerPackage<1||stock.quantity>stock.packageQuantity*stock.unitsPerPackage||!validDate(stock.receivedAt)) throw new HttpError(400,'INVALID_RECEIPT_APPROVAL');
+      for(const stock of body.stockReceipts) {
+        const hasCatalogIdentity=text(stock.catalogObjectId,200), hasInventoryItem=UUID.test(stock.itemId ?? '');
+        if(hasCatalogIdentity===hasInventoryItem||own(stock,'catalogObjectId')!==hasCatalogIdentity||own(stock,'itemId')!==hasInventoryItem||!Number.isSafeInteger(stock.quantity)||stock.quantity<1||stock.quantity>1_000_000||!Number.isSafeInteger(stock.unitCostMinor)||stock.unitCostMinor<0||stock.unitCostMinor>=1_000_000_000_000||! /^[A-Z]{3}$/.test(stock.currency??'')||stock.currency!==confirmedCurrency||!Number.isSafeInteger(stock.packageQuantity)||stock.packageQuantity<1||!Number.isSafeInteger(stock.unitsPerPackage)||stock.unitsPerPackage<1||stock.quantity>stock.packageQuantity*stock.unitsPerPackage||!validDate(stock.receivedAt)) throw new HttpError(400,'INVALID_RECEIPT_APPROVAL');
+      }
       let paymentTotal=0;
       for(const payment of body.payments) {
         const hasAccount=UUID.test(payment.accountId??''),hasExisting=UUID.test(payment.existingMovementId??'');
@@ -735,7 +738,7 @@ export function createHandlers(adapters) {
       if(typeof db.approvePurchaseReceipt!=='function') throw new HttpError(503,'RECEIPT_APPROVAL_UNAVAILABLE');
       const selections={currency:body.currency,confirmPurchaseDocument:body.confirmPurchaseDocument,
         costUpdates:body.costUpdates,
-        stockReceipts:body.stockReceipts.map((stock,index)=>({lineId:stock.lineId,itemId:stock.itemId,quantity:stock.quantity,unitCostMinor:stock.unitCostMinor,currency:stock.currency,
+        stockReceipts:body.stockReceipts.map((stock,index)=>({lineId:stock.lineId,...(stock.catalogObjectId ? {catalogObjectId:stock.catalogObjectId} : {itemId:stock.itemId}),quantity:stock.quantity,unitCostMinor:stock.unitCostMinor,currency:stock.currency,
           packageQuantity:stock.packageQuantity,unitsPerPackage:stock.unitsPerPackage,occurredAt:stock.receivedAt,eventKey:stock.eventKey??`${key}:stock:${stock.lineId}:${index}`})),
         payments:body.payments.map((payment,index)=>({paymentKey:payment.paymentKey??`${key}:payment:${index}`,accountId:payment.accountId||undefined,existingMovementId:payment.existingMovementId||undefined,
           amountMinor:payment.amountMinor,currency:payment.currency,occurredAt:payment.paidAt}))};

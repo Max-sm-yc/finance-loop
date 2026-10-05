@@ -576,7 +576,7 @@ function InventoryPanel({ organizationId, accountId, currency, timezone, account
     setReceiptError(''); setReceiptNotice('');
     const selectedLines = receiptLines.filter(line => line.itemId);
     if (!receiptDraft || !selectedLines.length) { setReceiptError('Choose at least one exact Square catalog item to update.'); return; }
-    if (selectedLines.some(line => !receiptCandidates.some(candidate => candidate.catalogObjectId === line.itemId && candidate.currency === receiptDraft.currency))) { setReceiptError('Choose an item from the current Square sale evidence for this receipt currency.'); return; }
+    if (selectedLines.some(line => !receiptCandidates.some(candidate => candidate.catalogObjectId === line.itemId && candidate.currency === receiptDraft.currency))) { setReceiptError('Choose an item from the current Square catalog for this receipt currency.'); return; }
     const parsedReceiptDate = /^\d{4}-\d{2}-\d{2}$/.test(receiptDate) ? new Date(`${receiptDate}T00:00:00Z`) : null;
     if (!parsedReceiptDate || !Number.isFinite(parsedReceiptDate.getTime()) || parsedReceiptDate.toISOString().slice(0, 10) !== receiptDate) { setReceiptError('Enter a valid effective date for the approved COGS change.'); return; }
     const effectiveFrom = zonedMidnight(receiptDate, timezone);
