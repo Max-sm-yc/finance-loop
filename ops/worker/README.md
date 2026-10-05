@@ -28,6 +28,15 @@ or paste secret values into chat.
 | `OPENROUTER_MODEL` | Receipt extraction model (default `openai/gpt-6-luna`) |
 | `PURCHASE_RECEIPT_MAX_OUTPUT_TOKENS` | Receipt extraction response limit (default 1400, maximum 1500); organization budget reservations still apply |
 
+Receipt extraction failures use sanitized provider categories in the failed
+receipt's error code. `MODEL_AUTH_FAILED`, `MODEL_ACCESS_DENIED`, and
+`MODEL_NOT_FOUND` point to worker credentials or model configuration;
+`MODEL_REQUEST_REJECTED` points to an unsupported request or schema;
+`MODEL_RATE_LIMITED` and `MODEL_PROVIDER_UNAVAILABLE` are retried. Correct the
+Render worker configuration before retrying intake. A terminal failed receipt
+does not restart when its submission ID is reused; delete the failed receipt
+from the inbox and submit the document again with a new submission ID.
+
 `SUPABASE_PUBLISHABLE_KEY` is not used by worker requests. The image installs
 Poppler and Tesseract for searchable/scanned PDFs and JPEG/PNG receipts. Each
 document is limited to 8 MiB, 20 PDF pages, 40 megapixels for image uploads,

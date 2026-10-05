@@ -7,6 +7,23 @@ const ENDPOINT = 'https://openrouter.ai/api/v1/chat/completions';
 const MAX_TEXT_CHARS = 24_000;
 const MAX_LINES = 60;
 
+function providerFailure(status) {
+  const failures = {
+    400: ['MODEL_REQUEST_REJECTED', true],
+    401: ['MODEL_AUTH_FAILED', true],
+    402: ['MODEL_BILLING_REQUIRED', true],
+    403: ['MODEL_ACCESS_DENIED', true],
+    404: ['MODEL_NOT_FOUND', true],
+    408: ['MODEL_PROVIDER_UNAVAILABLE', false],
+    413: ['MODEL_REQUEST_TOO_LARGE', true],
+    422: ['MODEL_REQUEST_REJECTED', true],
+    429: ['MODEL_RATE_LIMITED', false],
+  };
+  if (failures[status]) return failures[status];
+  if (status >= 500) return ['MODEL_PROVIDER_UNAVAILABLE', false];
+  return ['MODEL_UNAVAILABLE', status >= 400 && status < 500];
+}
+
 const schema = {
   type: 'object', additionalProperties: false,
   required: ['document_kind','supplier','invoice_date','purchase_reference','currency','totals','payment','lines'],
@@ -34,7 +51,7 @@ const redact = text => text.split(/\r?\n/).map(line => /\b(?:payment\s+card|card
   .replace(/(?<!\d)(?:\+?\d{1,3}[ .-]?)?(?:\(\d{3}\)|\d{3})[ .-]?\d{3}[ .-]?\d{4}(?!\d)/g,'[phone redacted]')).join('\n');
 const moneyText = value => value === null ? null : typeof value === 'string' && /^\d{1,12}(?:\.\d{1,6})?$/.test(value) ? value : undefined;
 function validate(value, sourceText, model) {
-  const fail = () => { throw new DiagnosisError('MODEL_UNAVAILABLE','Purchase receipt extraction did not match expected fields'); };
+  const fail = () => { throw new DiagnosisError('MODEL_INVALID_RESPONSE','Purchase receipt extraction did not match expected fields'); };
   if (!value || typeof value !== 'object' || Array.isArray(value) || Object.keys(value).sort().join('|') !== 'currency|document_kind|invoice_date|lines|payment|purchase_reference|supplier|totals') fail();
   if (!['receipt','invoice','unsupported','unclear'].includes(value.document_kind) ||
       !(value.supplier === null || typeof value.supplier === 'string' && value.supplier.length <= 200) ||
@@ -113,10 +130,24 @@ export async function extractPurchaseReceipt({ text }, { apiKey, fetchImpl=fetch
   let lastError;
   for(let attempt=1;attempt<=2;attempt++) try {
     const response=await fetchImpl(ENDPOINT,{method:'POST',headers:{Authorization:`Bearer ${apiKey}`,'Content-Type':'application/json'},body:JSON.stringify(body),signal:AbortSignal.timeout(timeoutMs)});
-    if(!response.ok) throw Object.assign(new Error('model unavailable'),{retry:response.status===429||response.status>=500});
+    if(!response.ok) {
+      const [code, permanent] = providerFailure(response.status);
+      throw Object.assign(new DiagnosisError(code, 'Receipt extraction provider rejected or could not complete the request'), {
+        permanent, retry: !permanent,
+      });
+    }
     const payload=await response.json(); await recordUsage({model,usage:payload.usage??null,attempt});
-    const content=payload?.choices?.[0]?.message?.content; if(typeof content!=='string'||content.length>24000) throw new Error('model output invalid');
-    return validate(JSON.parse(content),text,model);
-  } catch(error) { lastError=error; if(attempt>=2||error?.retry!==true) break; }
+    const content=payload?.choices?.[0]?.message?.content;
+    if(typeof content!=='string'||content.length>24000) throw new DiagnosisError('MODEL_INVALID_RESPONSE','Receipt extraction returned no usable structured response');
+    let parsed;
+    try { parsed=JSON.parse(content); }
+    catch { throw new DiagnosisError('MODEL_INVALID_RESPONSE','Receipt extraction returned invalid structured data'); }
+    return validate(parsed,text,model);
+  } catch(error) {
+    lastError=error;
+    if (error?.permanent) throw error;
+    if(attempt>=2||error?.retry!==true) break;
+  }
+  if (lastError?.code && /^MODEL_[A-Z_]+$/.test(lastError.code)) throw lastError;
   throw new DiagnosisError('MODEL_UNAVAILABLE','Receipt document extraction failed');
 }
