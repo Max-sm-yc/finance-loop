@@ -25,5 +25,7 @@ services:
         sync: false
       - key: PURCHASE_RECEIPT_MAX_OUTPUT_TOKENS
         value: "1400"
+      - key: PURCHASE_RECEIPT_MODEL_TIMEOUT_MS
+        value: "60000"
       - key: ACCOUNTING_TIMEZONE
         value: America/New_York

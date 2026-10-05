@@ -439,6 +439,7 @@ export function createWorker(dependencies) {
       const draft = await extractPurchaseReceipt({ text }, {
         apiKey: config.openRouterApiKey, fetchImpl, model: PURCHASE_RECEIPT_MODEL,
         maxOutputTokens: config.openRouterMaxOutputTokens ?? 1400,
+        timeoutMs: config.purchaseReceiptModelTimeoutMs ?? 60000,
         reserveBudget: args => db.reservePurchaseReceiptModelBudget({ organizationId: job.organizationId, receiptId, jobId: job.id, ...args }),
         recordUsage: args => db.recordPurchaseReceiptModelUsage({ organizationId: job.organizationId, receiptId, jobId: job.id, ...args }),
       });

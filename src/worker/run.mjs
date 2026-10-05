@@ -19,6 +19,7 @@ const integer = (name, fallback, min, max) => {
 
 const squareEnvironment = required('SQUARE_ENVIRONMENT');
 if (!['sandbox', 'production'].includes(squareEnvironment)) throw new Error('SQUARE_ENVIRONMENT must be sandbox or production');
+const purchaseReceiptModelTimeoutMs = integer('PURCHASE_RECEIPT_MODEL_TIMEOUT_MS', 60000, 5000, 120000);
 const accountingTimezone = process.env.ACCOUNTING_TIMEZONE?.trim() || 'America/New_York';
 try { new Intl.DateTimeFormat('en-US', { timeZone: accountingTimezone }).format(new Date()); }
 catch { throw new Error('ACCOUNTING_TIMEZONE must be a valid IANA time zone'); }
@@ -43,6 +44,7 @@ const worker = createWorker({
     openRouterApiKey: process.env.OPENROUTER_API_KEY?.trim() || '',
     openRouterModel: process.env.OPENROUTER_MODEL?.trim() || 'openai/gpt-6-luna',
     openRouterMaxOutputTokens: integer('PURCHASE_RECEIPT_MAX_OUTPUT_TOKENS', 1400, 100, 3000),
+    purchaseReceiptModelTimeoutMs,
     leaseSeconds: integer('WORKER_LEASE_SECONDS', 120, 30, 900),
     maxJobAttempts: integer('WORKER_MAX_JOB_ATTEMPTS', 5, 1, 12),
     maxBackfillPages: integer('WORKER_MAX_BACKFILL_PAGES', 10000, 1, 20000),
@@ -58,7 +60,7 @@ let stopping = false;
 for (const signal of ['SIGINT', 'SIGTERM']) process.on(signal, () => { stopping = true; });
 const log = (level, event, fields = {}) => process.stdout.write(`${JSON.stringify({ at: new Date().toISOString(), level, event, workerId, ...fields })}\n`);
 
-log('info', 'worker_started', { squareEnvironment, enabledJobTypes: ['square.webhook', 'square.sync', 'projection.replay', 'receipt.process'], receiptExtractionConfigured: Boolean(process.env.OPENROUTER_API_KEY?.trim()) });
+log('info', 'worker_started', { squareEnvironment, enabledJobTypes: ['square.webhook', 'square.sync', 'projection.replay', 'receipt.process'], receiptExtractionConfigured: Boolean(process.env.OPENROUTER_API_KEY?.trim()), receiptModelTimeoutMs: purchaseReceiptModelTimeoutMs });
 while (!stopping) {
   try {
     const result = await worker.runOne({ workerId });

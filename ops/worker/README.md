@@ -27,6 +27,7 @@ or paste secret values into chat.
 | `OPENROUTER_API_KEY` | Worker-only key for bounded diagnosis and supplier receipt extraction; drafts still require human approval |
 | `OPENROUTER_MODEL` | General-purpose chat model for issue investigation (default `openai/gpt-6-luna`); it must support chat completions and structured JSON |
 | `PURCHASE_RECEIPT_MAX_OUTPUT_TOKENS` | Receipt extraction response limit (default 1400, maximum 3000); organization budget reservations still apply |
+| `PURCHASE_RECEIPT_MODEL_TIMEOUT_MS` | Receipt extraction request timeout in milliseconds (default 60000; range 5000–120000) |
 
 Purchase document extraction is pinned to `openai/gpt-6-luna`, which is the
 model accepted by the receipt budget reservation RPC. Jev is pinned separately
@@ -39,8 +40,13 @@ Receipt extraction failures use sanitized provider categories in the failed
 receipt's error code. `MODEL_AUTH_FAILED`, `MODEL_ACCESS_DENIED`, and
 `MODEL_NOT_FOUND` point to worker credentials or model configuration;
 `MODEL_REQUEST_REJECTED` points to an unsupported request or schema;
-`MODEL_RATE_LIMITED` and `MODEL_PROVIDER_UNAVAILABLE` are retried. Correct the
-Render worker configuration before retrying intake. A terminal failed receipt
+`MODEL_TIMEOUT`, `MODEL_RATE_LIMITED`, and `MODEL_PROVIDER_UNAVAILABLE` receive
+one bounded retry within the job's two-attempt model reservation. If both
+attempts fail, the receipt is marked failed so an owner or reviewer can
+reprocess it after the provider issue is resolved. `MODEL_USAGE_RECORD_FAILED`
+means the provider response arrived but its token usage could not be recorded;
+the worker stops without requesting a second generation. Correct the Render
+worker configuration or provider issue before retrying intake. A terminal failed receipt
 can be retried by an owner or reviewer with **Reprocess document** after the
 underlying issue is corrected. Reprocessing keeps the same evidence and receipt
 ID but creates a fresh durable job and spends the organization's receipt model
