@@ -162,3 +162,9 @@
   .foldable-actions { justify-content: flex-start; }
   .analytics-snapshot { padding: 13px; }
 }
+.purchase-jev-control { display: flex; align-items: center; justify-content: space-between; gap: 14px; margin: 12px 0; padding: 11px 12px; border: 1px solid #2a332d; border-radius: 6px; background: #141916; }
+.purchase-jev-control > div { display: grid; gap: 4px; }
+.purchase-jev-control b { color: #d5ded7; font-size: 11px; }
+.purchase-jev-control small, .purchase-jev-status { color: #929d95; font-size: 10px; line-height: 1.5; }
+.purchase-jev-status { margin: 8px 0; }
+.purchase-jev-note { display: block; margin-top: 5px; color: #849087; font-size: 9px; line-height: 1.4; }

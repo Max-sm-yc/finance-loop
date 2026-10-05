@@ -30,7 +30,9 @@ Each alert needs a named owner, severity, runbook link, deduplication key, and r
 
 Track receipt submissions awaiting upload, processing queue age, OCR/extraction
 failures, budget-denied jobs, duplicate detections, human review backlog, and
-approved receipts waiting for projection replay. Separate document-processing
+approved receipts waiting for projection replay. Also track Jev inventory-match
+latency, provider failures and budget denials without logging receipt descriptions,
+inventory names, SKUs or returned choices. Separate document-processing
 failure from financial completeness: a processed receipt may still have pending
 delivery or payment. Correlate sanitized receipt/job IDs; never log document text,
 integration tokens, payment identifiers, or signed upload URLs. Alert on repeated

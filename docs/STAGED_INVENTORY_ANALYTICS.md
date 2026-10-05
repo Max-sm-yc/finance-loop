@@ -30,10 +30,12 @@ purchase tax and miscellaneous charges; the recorded cash paid may include them.
 Receipt costs do not silently replace effective-dated approved sale costs.
 
 The receipt text helper accepts user-pasted receipt text and returns a bounded,
-editable extraction draft. It does not read uploaded receipt files, identify
-Square catalog items, or write financial records. A human must map each line to
-an exact catalog variation, attach receipt evidence, review the unit cost and
-effective date, and approve. Approval can create a first approved cost for a
+editable extraction draft. It does not read uploaded receipt files or write
+financial records. In receipt review, an owner or reviewer can ask TypeSafe AI's
+Jev through OpenRouter to choose among server-provided same-currency inventory names and SKUs, or
+choose none. Those choices fill editable browser fields only; a human must verify
+the exact item. The reviewer must attach receipt
+evidence, review the unit cost and effective date, and approve. Approval can create a first approved cost for a
 variation or revise an existing cost; it writes an audited effective-dated item
 cost and queues a projection replay for effective dates that can affect current
 reports. A future-dated approval takes effect on that date. The helper does not record the purchase

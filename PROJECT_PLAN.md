@@ -117,7 +117,7 @@ The agent receives only necessary records with stable IDs and redacted sensitive
 `monitoring → diagnosing → [item_proposed | awaiting_clarification | resolved | failed] → monitoring`
 
 - Unknown Square catalog variation: locate exact catalog ID and candidate metadata. If approved cost is absent, hold COGS for affected sales. The agent may draft an item definition; the reviewer supplies cost and effective date.
-- Receipt cost helper: a user may paste bounded, unstructured receipt text for extraction into an editable draft. The model does not identify catalog items or write costs. A human maps a line to an exact Square catalog variation, confirms its unit acquisition cost and effective date, attaches receipt evidence, and approves the effective-dated COGS update. The update is audited and triggers a projection replay when it can affect current reports; purchase cash and stock are recorded separately.
+- Receipt cost helper: a user may paste bounded, unstructured receipt text for extraction into an editable draft. The extraction model does not identify catalog items or write costs. Separately, an owner or reviewer may ask Jev through OpenRouter to choose an exact same-currency inventory option for each uploaded receipt line, or none. The server constrains choices to current inventory entries and maps temporary option keys back to exact item identities; Jev output only pre-fills editable review fields. A human verifies or changes each identity, confirms unit acquisition cost and effective date, attaches receipt evidence, and approves the effective-dated COGS update. The update is audited and triggers a projection replay when it can affect current reports; purchase cash and stock are recorded separately.
 - Unnamed sale line with no catalog variation: offer the Square-supported unit price as a pass-through cost for that exact line, with the assumption recorded in the human approval reason. If source amounts do not support an exact per-unit value, leave the cost unresolved.
 - Ambiguous transaction: ask a targeted question showing the source record and why classification matters. After human response, recompute affected projections.
 - Invalid or missing source facts: fail with a reason code and retry policy. Do not fabricate an item or classify from a plausible name alone.
@@ -232,9 +232,11 @@ The same workflow supports Power Automate without depending on its Teams/email
 trigger implementation. See `docs/PURCHASE_RECEIPTS.md` and
 `docs/POWER_AUTOMATE_SETUP.md` for the API and deployment contract.
 
-Document extraction and catalog matching produce persisted, evidence-linked
-drafts. A verified owner/reviewer approves an explicit draft version, reason, and
-selected effects through one transactional database boundary. Receiving stock,
+Document extraction produces a persisted, evidence-linked draft. Jev inventory
+matching is an on-demand aid that fills editable browser fields only and is not
+persisted or approved. A verified owner/reviewer confirms or changes the exact
+item choices, then approves an explicit draft version, reason, and selected
+effects through one transactional database boundary. Receiving stock,
 updating an effective-dated cost, and confirming a payment are separate decisions
 and can occur on separate dates. A document total or authorization hold does not
 prove an account cash outflow. Linking an existing purchase movement must not

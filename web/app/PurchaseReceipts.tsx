@@ -15,6 +15,7 @@ type Receipt = { id: string; status: string; activeDraftVersion?: number; filena
 type IntegrationCredential = { id: string; name: string; createdAt?: string; revokedAt?: string | null };
 type ReceiptEffect = { id: string; source_line_id: string; effect_type: 'cost_update' | 'stock_receipt' | 'payment'; effect_payload: Record<string, unknown>; inventory_movement_id?: string | null; cash_movement_id?: string | null; created_at: string };
 type ReceiptDetail = { receipt: Receipt; draft: PurchaseDraft | null; version?: number; candidates?: Array<{ catalogObjectId: string; name: string; sku?: string | null; currency: string; archived?: boolean }>; inventoryItems?: InventoryItem[]; effects?: ReceiptEffect[]; evidenceUrl?: string };
+type JevMatch = { itemId: string | null; itemName: string | null; confidence: number | null; reason?: 'empty_description' | 'no_inventory_options' | null };
 type LineChoice = { itemId: string; costCatalogObjectId: string; effectiveFrom: string; packageQuantity: string; unitsPerPackage: string; unitCost: string; costEdited: boolean; receive: boolean; receivedQuantity: string; receivedAt: string; updateCost: boolean };
 const digitsFor = (currency: string) => new Intl.NumberFormat(undefined, { style: 'currency', currency }).resolvedOptions().maximumFractionDigits ?? 2;
 const formatMoney = (minor: number | null | undefined, currency: string) => minor == null ? '—' : new Intl.NumberFormat(undefined, { style: 'currency', currency }).format(minor / (10 ** digitsFor(currency)));
@@ -41,6 +42,9 @@ export default function PurchaseReceipts({ organizationId, role, accounts, curre
   const [selected, setSelected] = useState<ReceiptDetail | null>(null);
   const [items, setItems] = useState<InventoryItem[]>([]);
   const [choices, setChoices] = useState<Record<string, LineChoice>>({});
+  const [jevMatches, setJevMatches] = useState<Record<string, JevMatch>>({});
+  const [matching, setMatching] = useState(false);
+  const [matchNotice, setMatchNotice] = useState('');
   const [reason, setReason] = useState('');
   const [confirmedCurrency, setConfirmedCurrency] = useState('');
   const [confirmPurchaseDocument, setConfirmPurchaseDocument] = useState(false);
@@ -62,6 +66,8 @@ export default function PurchaseReceipts({ organizationId, role, accounts, curre
   const uploadSubmissionId = useRef<string | null>(null);
   const uploadFileIdentity = useRef('');
   const openedDeepLink = useRef('');
+  const activeReceiptId = useRef<string | null>(null);
+  const receiptEpoch = useRef(0);
   const canReview = ['owner', 'reviewer'].includes(role);
   const canUpload = ['owner', 'reviewer', 'operator'].includes(role);
   const canManageIntegration = role === 'owner';
@@ -148,18 +154,23 @@ export default function PurchaseReceipts({ organizationId, role, accounts, curre
     finally { setLoading(false); }
   }
   useEffect(() => {
-    setReceipts([]); setSelected(null); setChoices({}); setNewCredential(null);
+    receiptEpoch.current += 1;
+    setReceipts([]); setSelected(null); setChoices({}); setJevMatches({}); setMatchNotice(''); setMatching(false); activeReceiptId.current = null; setNewCredential(null);
     void (async () => { await load(); if (initialReceiptId && openedDeepLink.current !== initialReceiptId) { openedDeepLink.current = initialReceiptId; await openReceipt(initialReceiptId); } })();
     // org/currency changes intentionally reload the inbox; a receipt deep link is opened once.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [organizationId, currency, initialReceiptId, canManageIntegration]);
 
   async function openReceipt(id: string) {
+    const requestEpoch = ++receiptEpoch.current;
+    activeReceiptId.current = id; setMatching(false);
     setError(''); setNotice('');
     try {
       const result = await api<ReceiptDetail>(`/api/purchase-receipts/${encodeURIComponent(id)}?${detailQuery}`);
+      if (receiptEpoch.current !== requestEpoch) return;
       setSelected(result);
       setItems(result.inventoryItems ?? []);
+      setJevMatches({}); setMatchNotice('');
       const url = new URL(window.location.href); url.searchParams.set('purchaseReceipt', id); url.searchParams.set('organizationId', organizationId); window.history.replaceState(null, '', url.toString());
       const next: Record<string, LineChoice> = {};
       for (const line of result.draft?.lines ?? []) {
@@ -180,7 +191,7 @@ export default function PurchaseReceipts({ organizationId, role, accounts, curre
       setPaidAmount(total == null || !totalCurrency ? '' : (Math.max(0, total - priorPaid) / (10 ** digitsFor(totalCurrency))).toFixed(digitsFor(totalCurrency)));
       // The extraction date is only a reference; a human must confirm the actual payment timestamp.
       setPaidAt('');
-    } catch (reason) { setError(reason instanceof Error ? reason.message : 'Could not open this receipt.'); }
+    } catch (reason) { if (receiptEpoch.current === requestEpoch) setError(reason instanceof Error ? reason.message : 'Could not open this receipt.'); }
   }
   function suggestedCostText(lineId: string, packages: string, unitsPerPackage: string, code: string) {
     const line = selected?.draft?.lines.find(item => item.lineId === lineId);
@@ -205,6 +216,47 @@ export default function PurchaseReceipts({ organizationId, role, accounts, curre
       }
       return { ...current, [lineId]: next };
     });
+  }
+  async function matchInventoryWithJev() {
+    if (!selected?.draft) return;
+    const receiptId = selected.receipt.id;
+    const requestEpoch = receiptEpoch.current;
+    const expectedVersion = Number(selected.version ?? selected.receipt.activeDraftVersion);
+    if (!Number.isSafeInteger(expectedVersion) || expectedVersion < 1) { setMatchNotice('This receipt draft needs to be refreshed before Jev can match its items.'); return; }
+    setMatching(true); setError(''); setMatchNotice('');
+    try {
+      const result = await api<{ receiptId: string; version: number; matches: Array<{ lineId: string; itemId: string | null; itemName: string | null; confidence: number | null; reason?: JevMatch['reason'] }> }>(
+        `/api/purchase-receipts/${encodeURIComponent(receiptId)}/match`,
+        { method: 'POST', body: JSON.stringify({ organizationId, expectedVersion, currency: displayCurrency }) },
+      );
+      if (activeReceiptId.current !== receiptId || receiptEpoch.current !== requestEpoch) return;
+      if (result.receiptId !== receiptId || result.version !== expectedVersion) throw new Error('The receipt draft changed. Refresh it and try Jev matching again.');
+      const validLineIds = new Set(selected.draft.lines.map(line => line.lineId));
+      const matches = (result.matches ?? []).filter(match => validLineIds.has(match.lineId)
+        && (match.itemId === null || inventoryChoices.some(item => item.id === match.itemId)));
+      const inventoryById = new Map(inventoryChoices.map(item => [item.id, item]));
+      setJevMatches(Object.fromEntries(matches.map(match => [match.lineId, {
+        itemId: match.itemId, itemName: match.itemName, confidence: match.confidence, reason: match.reason,
+      }])));
+      setChoices(current => {
+        const next = { ...current };
+        for (const match of matches) {
+          if (!match.itemId || next[match.lineId]?.itemId) continue;
+          const item = inventoryById.get(match.itemId);
+          const choice = next[match.lineId];
+          if (!item || !choice) continue;
+          next[match.lineId] = { ...choice, itemId: item.id, costCatalogObjectId: item.squareCatalogObjectId ?? '' };
+        }
+        return next;
+      });
+      const matchedCount = matches.filter(match => match.itemId).length;
+      const filledCount = matches.filter(match => match.itemId && !choices[match.lineId]?.itemId).length;
+      const noMatchCount = matches.filter(match => !match.itemId).length;
+      const skippedCount = matches.filter(match => match.reason === 'empty_description').length;
+      const noInventoryCount = matches.filter(match => match.reason === 'no_inventory_options').length;
+      setMatchNotice(`Jev matched ${matchedCount} line${matchedCount === 1 ? '' : 's'} and filled ${filledCount} empty choice${filledCount === 1 ? '' : 's'}; no match for ${noMatchCount - skippedCount - noInventoryCount}${skippedCount ? `, skipped ${skippedCount} without a description` : ''}${noInventoryCount ? `, ${noInventoryCount} had no inventory options` : ''}. Review and edit the selections before approval.`);
+    } catch (reason) { if (activeReceiptId.current === receiptId && receiptEpoch.current === requestEpoch) setError(reason instanceof Error ? reason.message : 'Jev could not match these receipt lines.'); }
+    finally { if (activeReceiptId.current === receiptId && receiptEpoch.current === requestEpoch) setMatching(false); }
   }
   function confirmCurrency(code: string) {
     setConfirmedCurrency(code);
@@ -352,13 +404,15 @@ export default function PurchaseReceipts({ organizationId, role, accounts, curre
         {selected.receipt.lastErrorCode && ['failed','projection_pending'].includes(selected.receipt.status) && <div className="notice decision-context-warning"><b>Processing issue · {selected.receipt.lastErrorCode}</b></div>}
         <div className={`notice ${selected.draft.reconciliation?.status === 'matched' ? 'purchase-match' : 'decision-context-warning'}`}><b>Reconciliation · {selected.draft.reconciliation?.status ?? 'incomplete'}</b><span>Lines {formatMoney(displayedLineTotal, displayCurrency)} · Total {formatMoney(displayedDocumentTotal, displayCurrency)} · Difference {formatMoney(displayedDifference, displayCurrency)}</span></div>
         {!selected.draft.currency && <label className="purchase-currency">Confirm currency from the source document<select required value={confirmedCurrency} onChange={event => confirmCurrency(event.target.value)}><option value="">Choose currency</option>{[...new Set([currency, ...accounts.map(account => account.currency)])].map(code => <option key={code} value={code}>{code}</option>)}</select></label>}
+        {canReview && selected.receipt.status === 'needs_review' && <div className="purchase-jev-control"><div><b>Inventory matching</b><small>{inventoryChoices.length ? 'Jev will choose an item or none for each line. Its choices fill empty fields and remain editable.' : 'No same-currency inventory choices are available.'}</small></div><button type="button" className="secondary" onClick={() => void matchInventoryWithJev()} disabled={busy || matching || !inventoryChoices.length || !selected.draft.lines.length}>{matching ? 'Matching with Jev…' : 'Match inventory with Jev'}</button></div>}
+        {matchNotice && <p className="purchase-jev-status" role="status">{matchNotice}</p>}
         <div className="table-wrap"><table className="purchase-line-table"><thead><tr><th scope="col">Document line</th><th scope="col">Inventory identity</th><th scope="col">Packages</th><th scope="col">Units / package</th><th scope="col" className="numeric">Exact goods amount</th><th scope="col">Unit cost</th><th scope="col"><div className="purchase-effect-heading"><span>Effects</span><div className="purchase-effect-bulk"><label title="Select cost and stock effects for all available lines"><input ref={element => { if (element) element.indeterminate = someEffectsSelected && !allEffectsSelected; }} type="checkbox" aria-label="Select all cost and stock effects" checked={allEffectsSelected} disabled={!canReview || busy || (!costSelectableLines.length && !stockSelectableLines.length)} onChange={event => setAllReceiptEffects(event.currentTarget.checked)} />All</label></div></div></th></tr></thead><tbody>{selected.draft.lines.map(line => {
           const priorReceived = priorReceivedByLine(line.lineId);
           const choice = choices[line.lineId] ?? { itemId: '', costCatalogObjectId: '', effectiveFrom: selected.draft?.invoiceDate ?? new Date().toISOString().slice(0, 10), packageQuantity: '', unitsPerPackage: '', unitCost: '', costEdited: false, receive: false, receivedQuantity: '', receivedAt: localDateTime(), updateCost: false };
           const ext = Number(choice.packageQuantity) * Number(choice.unitsPerPackage);
           const exactLineAmount = amountMinor(line.lineAmountMinor, line.sourceAmounts?.lineAmount, displayCurrency);
           return <tr key={line.lineId}><td><b>{line.description || `Line ${line.lineNumber}`}</b>{(line.reviewFlags?.length || line.quantityText) && <small className="cell-sub">{line.reviewFlags?.length ? line.reviewFlags.join(' · ') : line.quantityText}</small>}</td>
-            <td><select value={choice.itemId} onChange={event => patchLine(line.lineId, { itemId: event.target.value })} disabled={!canReview}><option value="">Choose item</option>{inventoryChoices.map(item => <option key={item.id} value={item.id}>{item.name}{item.sku ? ` · ${item.sku}` : ''}{item.archived ? ' · archived Square item' : ''}</option>)}</select></td>
+            <td><select value={choice.itemId} onChange={event => patchLine(line.lineId, { itemId: event.target.value })} disabled={!canReview || matching}><option value="">Choose item</option>{inventoryChoices.map(item => <option key={item.id} value={item.id}>{item.name}{item.sku ? ` · ${item.sku}` : ''}{item.archived ? ' · archived Square item' : ''}</option>)}</select>{jevMatches[line.lineId] && <small className="purchase-jev-note">Jev {jevMatches[line.lineId].reason === 'empty_description' ? 'skipped: no receipt description' : jevMatches[line.lineId].reason === 'no_inventory_options' ? 'could not match: no inventory options' : jevMatches[line.lineId].itemName ? `suggested ${jevMatches[line.lineId].itemName}` : 'suggested no match'}{jevMatches[line.lineId].confidence == null ? '' : ` · ${Math.round(jevMatches[line.lineId].confidence! * 100)}% confidence`}</small>}</td>
             <td><input type="number" min="1" step="1" value={choice.packageQuantity} onChange={event => patchLine(line.lineId, { packageQuantity: event.target.value })} disabled={!canReview} aria-label="Packages" /></td>
             <td><input type="number" min="1" step="1" value={choice.unitsPerPackage} onChange={event => patchLine(line.lineId, { unitsPerPackage: event.target.value })} disabled={!canReview} aria-label="Units per package" /></td>
             <td className="numeric">{formatMoney(exactLineAmount, displayCurrency)}</td>
@@ -370,7 +424,7 @@ export default function PurchaseReceipts({ organizationId, role, accounts, curre
         {(selected.effects ?? []).length > 0 && <section className="purchase-payment"><div><h3>Approved effects</h3><div className="purchase-credentials-list">{selected.effects!.map(effect => { const payload = effect.effect_payload; const kind = effect.effect_type === 'cost_update' ? 'Cost update' : effect.effect_type === 'stock_receipt' ? 'Stock received' : 'Cash payment'; const amount = typeof payload.amountMinor === 'number' ? formatMoney(payload.amountMinor, String(payload.currency ?? displayCurrency)) : typeof payload.unitCostMinor === 'number' ? `${formatMoney(payload.unitCostMinor, String(payload.currency ?? displayCurrency))} / unit` : null; const detail = effect.effect_type === 'stock_receipt' ? `${payload.quantity ?? '?'} units received` : effect.effect_type === 'payment' ? `${amount ?? 'Amount unavailable'} paid` : `${amount ?? 'Cost updated'}`; return <div className="purchase-credential-row" key={effect.id}><span><b>{kind} · {detail}</b><small>{effect.source_line_id.startsWith('payment:') ? 'Document payment' : `Source line ${effect.source_line_id}`} · ${new Date(effect.created_at).toLocaleString()} {effect.inventory_movement_id ? `· Inventory movement ${effect.inventory_movement_id}` : ''}{effect.cash_movement_id ? `· Cash movement ${effect.cash_movement_id}` : ''}</small></span></div>; })}</div></div></section>}
         <section className="purchase-payment"><div><h3>Payment</h3><p>Recorded: {formatMoney(priorPaidMinor, displayCurrency)} of {formatMoney(displayedDocumentTotal, displayCurrency)} · Extracted status: {selected.draft.payment?.status ?? 'unknown'}{selected.draft.payment?.fundingHint ? ` · ${selected.draft.payment.fundingHint}` : ''}{selected.draft.payment?.paidAt ? ` · ${selected.draft.payment.paidAt}` : ''}. Confirm actual payment; holds do not count. For card purchases, wait for bank settlement.</p><label className="purchase-effect"><input type="checkbox" checked={paid} onChange={event => setPaid(event.target.checked)} disabled={!canReview || !canRecordPayment || (displayedDocumentTotal != null && priorPaidMinor >= displayedDocumentTotal)} /> Record or link cash payment</label>{!canRecordPayment ? <small className="cell-sub">Payment needs a verified currency and document total. Ambiguous currency currently supports USD only.</small> : null}</div>{paid && <div className="purchase-payment-fields"><label>Amount paid<input inputMode="decimal" value={paidAmount} onChange={event => setPaidAmount(event.target.value)} disabled={!canReview} /></label><label>Paid at<input type="datetime-local" required value={paidAt} onChange={event => setPaidAt(event.target.value)} disabled={!canReview} /></label><label>Funding account<select value={accountId} onChange={event => { setAccountId(event.target.value); setExistingMovementId(''); }} disabled={!canReview}><option value="">Select account</option>{accounts.filter(row => row.currency === displayCurrency).map(account => <option key={account.id} value={account.id}>{account.name} · {account.kind ?? 'account'}</option>)}</select></label><label>Or link movement ID<input value={existingMovementId} onChange={event => { setExistingMovementId(event.target.value); if (event.target.value) setAccountId(''); }} placeholder="Movement UUID" disabled={!canReview} /></label></div>}</section>
         <label className="purchase-reason">Decision reason<textarea rows={3} minLength={10} maxLength={1000} value={reason} onChange={event => setReason(event.target.value)} placeholder="Cite the supplier document and the basis for the cost, receipt, or payment decisions." disabled={!canReview} /></label>
-        {canReview && ['needs_review','approved','projection_pending','posted'].includes(selected.receipt.status) && <><label className="purchase-effect purchase-document-confirm"><input type="checkbox" checked={confirmPurchaseDocument} onChange={event => setConfirmPurchaseDocument(event.target.checked)} disabled={busy} /> Confirm supplier receipt or invoice</label><div className="form-actions"><button type="button" className="secondary reject-button with-icon" disabled={busy || selected.receipt.status !== 'needs_review'} onClick={() => void decide('reject')}><UiIcon name="reject" />Reject</button><button type="button" className="primary with-icon" disabled={busy} onClick={() => void decide('approve')}><UiIcon name="check" />{busy ? 'Saving…' : selected.receipt.status === 'needs_review' ? 'Approve effects' : 'Approve pending'}</button></div></>}
+        {canReview && ['needs_review','approved','projection_pending','posted'].includes(selected.receipt.status) && <><label className="purchase-effect purchase-document-confirm"><input type="checkbox" checked={confirmPurchaseDocument} onChange={event => setConfirmPurchaseDocument(event.target.checked)} disabled={busy || matching} /> Confirm supplier receipt or invoice</label><div className="form-actions"><button type="button" className="secondary reject-button with-icon" disabled={busy || matching || selected.receipt.status !== 'needs_review'} onClick={() => void decide('reject')}><UiIcon name="reject" />Reject</button><button type="button" className="primary with-icon" disabled={busy || matching} onClick={() => void decide('approve')}><UiIcon name="check" />{busy ? 'Saving…' : selected.receipt.status === 'needs_review' ? 'Approve effects' : 'Approve pending'}</button></div></>}
         {!canReview && <p className="field-hint">Approval requires an owner or reviewer.</p>}
       </>}
     </section>}
