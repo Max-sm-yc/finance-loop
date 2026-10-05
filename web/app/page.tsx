@@ -61,7 +61,7 @@ function sourceGapReviewContext(issue: Issue): IssueReviewContext | null {
   let nextStep = 'Sync the selected period. If the gap returns, check the Square connection and permissions with the workspace owner, then share the issue ID with support. Leave the issue open until the source data is complete.';
   if (issue.code === 'SOURCE_STALE') {
     summary = 'No recent successful Square sync is recorded, so the source data may be out of date.';
-    nextStep = 'Sync the selected period, then refresh the workspace after the worker finishes.';
+    nextStep = 'Sync the selected period; the workspace updates automatically when the worker finishes.';
   } else if (gapCode === 'NORMALIZATION_MISSING_MONEY_OR_IDENTITY') {
     summary = problems.length
       ? `${problems.length} Square source record${problems.length === 1 ? ' is' : 's are'} missing required information.`
@@ -84,7 +84,7 @@ function sourceGapReviewContext(issue: Issue): IssueReviewContext | null {
     nextStep = 'Confirm the transaction exists in the connected Square account, then sync the selected period. Developer Explorer sample events can refer to synthetic records that cannot be fetched.';
   } else if (gapCode === 'UNSUPPORTED_WEBHOOK_ACTIVITY') {
     summary = 'Square sent an activity type the app cannot process yet.';
-    nextStep = 'A catch-up sync is queued automatically. Refresh the workspace after it finishes; if the issue remains, share the issue ID with support.';
+    nextStep = 'A catch-up sync is queued automatically. The workspace updates when it finishes; if the issue remains, share the issue ID with support.';
   } else if (gapCode === 'GIFT_CARD_ACTIVITY_LINKAGE_MISSING') {
     summary = 'A gift card sale is missing its matching activation or load record.';
     nextStep = 'Check the related gift card activity in Square, then ask a workspace owner to sync the selected period again. Leave the issue open if the matching activity is absent.';
@@ -197,7 +197,7 @@ const nextDate = (dateText: string) => new Date(Date.parse(`${dateText}T00:00:00
 const localDateTimeNow = () => { const now = new Date(); return new Date(now.getTime() - now.getTimezoneOffset() * 60000).toISOString().slice(0, 16); };
 
 export default function Home() {
-  const [user, setUser] = useState<{ email?: string | null } | null>(null);
+  const [user, setUser] = useState<{ id: string; email?: string | null } | null>(null);
   const [organizations, setOrganizations] = useState<Organization[]>([]);
   const [organizationId, setOrganizationId] = useState('');
   const [loadingAuth, setLoadingAuth] = useState(true);
@@ -213,8 +213,13 @@ export default function Home() {
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
   const [syncing, setSyncing] = useState(false);
+  const [syncQueued, setSyncQueued] = useState(false);
+  const syncQueuedRef = useRef(false);
+  const syncBaselineRef = useRef<string | null>(null);
+  const syncBaselineStatusRef = useRef<string | null>(null);
   const [syncStatus, setSyncStatus] = useState('');
   const [syncError, setSyncError] = useState('');
+  const [, setClockTick] = useState(0);
   const [email, setEmail] = useState(''); const [password, setPassword] = useState('');
   const [accountId, setAccountId] = useState('');
   const [from, setFrom] = useState(() => new Date(Date.now() - 29 * 86400000).toISOString().slice(0, 10));
@@ -222,6 +227,11 @@ export default function Home() {
   const loadSequence = useRef(0);
   const supabase = useMemo(() => { try { return browserSupabase(); } catch { return null; } }, []);
   const reportTimezone = dashboard?.organization?.timezone ?? 'UTC';
+
+  useEffect(() => {
+    const timer = window.setInterval(() => setClockTick(tick => tick + 1), 60_000);
+    return () => window.clearInterval(timer);
+  }, []);
 
   function navigate(nextPage: Page) {
     setVisitedPages(current => current.has(nextPage) ? current : new Set(current).add(nextPage));
@@ -300,6 +310,14 @@ export default function Home() {
         cash: (raw.cash ?? accountCash ?? result.cash) as Dashboard['cash'],
         flags: (raw.flags ?? result.issues ?? []) as Dashboard['flags'],
       };
+      if (syncQueuedRef.current) {
+        const latestSync = data.freshness?.lastSyncedAt ?? null;
+        const syncFailed = data.freshness?.status === 'failed' && syncBaselineStatusRef.current !== 'failed';
+        if ((latestSync && latestSync !== syncBaselineRef.current) || syncFailed) {
+          syncQueuedRef.current = false; setSyncQueued(false);
+          setSyncStatus(syncFailed ? 'Square reported a sync problem. Review source status and open issues.' : 'Square sync finished. Workspace data was updated automatically.');
+        }
+      }
       setDashboard(data);
       if (!accountId && data.accounts?.length) setAccountId(data.accounts[0].id);
     }
@@ -313,6 +331,24 @@ export default function Home() {
   }
   useEffect(() => { void load(); /* Refreshed when filters or identity change. */ }, [user, organizationId, accountId, from, to, reportTimezone]);
 
+  useEffect(() => {
+    if (!syncQueued || !organizationId) return;
+    let checks = 0;
+    const timer = window.setInterval(() => {
+      if (document.visibilityState !== 'visible') return;
+      checks += 1;
+      if (checks >= 24) {
+        syncQueuedRef.current = false; setSyncQueued(false);
+        setSyncStatus('Square is still processing this sync. The workspace checked automatically and will show new data when it is available.');
+        return;
+      }
+      void load();
+    }, 15_000);
+    return () => window.clearInterval(timer);
+    // Keep checking the selected report window while its durable Square job runs.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [syncQueued, organizationId, from, to, accountId, reportTimezone]);
+
   async function signIn(e: FormEvent) {
     e.preventDefault(); if (!supabase) return;
     setBusy(true); setError('');
@@ -320,12 +356,14 @@ export default function Home() {
     catch { setError('Sign in could not reach the authentication service. Try again.'); }
     finally { setBusy(false); }
   }
-  async function signOut() { loadSequence.current += 1; await supabase?.auth.signOut(); setDashboard(null); setIssues([]); setMovements([]); setEvents([]); setFeatures({ inventoryTracking: false, productAnalytics: false }); setSyncStatus(''); setSyncError(''); }
+  async function signOut() { loadSequence.current += 1; await supabase?.auth.signOut(); setDashboard(null); setIssues([]); setMovements([]); setEvents([]); setFeatures({ inventoryTracking: false, productAnalytics: false }); syncQueuedRef.current = false; setSyncQueued(false); setSyncStatus(''); setSyncError(''); }
   async function syncSelectedPeriod(): Promise<boolean> {
     if (!organizationId || !from || !to || from > to) {
       setSyncError('Choose a valid period before syncing.'); setSyncStatus(''); return false;
     }
-    setSyncing(true); setSyncError(''); setSyncStatus('');
+    setSyncing(true); setSyncError(''); setSyncStatus(''); setSyncQueued(false); syncQueuedRef.current = false;
+    syncBaselineRef.current = dashboard?.freshness?.lastSyncedAt ?? null;
+    syncBaselineStatusRef.current = dashboard?.freshness?.status ?? null;
     try {
       const result = await api<{ skipped?: boolean; reason?: 'PERIOD_CURRENT' | 'SYNC_IN_PROGRESS'; queuedWindows?: number; syncScope?: 'period' | 'uncovered' }>('/api/sync', {
         method: 'POST',
@@ -337,14 +375,18 @@ export default function Home() {
         }),
       });
       if (result.skipped) {
+        const alreadyRunning = result.reason === 'SYNC_IN_PROGRESS';
+        syncQueuedRef.current = alreadyRunning; setSyncQueued(alreadyRunning);
         setSyncStatus(result.reason === 'SYNC_IN_PROGRESS'
           ? `A Square sync covering ${from} through ${to} is already queued or running.`
           : `Square data for ${from} through ${to} is already covered and current. The report uses the stored facts.`);
       } else if (result.syncScope === 'uncovered') {
         const count = result.queuedWindows ?? 1;
-        setSyncStatus(`Sync queued for ${count} uncovered ${count === 1 ? 'date range' : 'date ranges'} within ${from} through ${to}. Refresh after the worker finishes.`);
+        syncQueuedRef.current = true; setSyncQueued(true);
+        setSyncStatus(`Sync queued for ${count} uncovered ${count === 1 ? 'date range' : 'date ranges'} within ${from} through ${to}. The workspace will update automatically when it finishes.`);
       } else {
-        setSyncStatus(`Sync queued for ${from} through ${to}. Refresh after it finishes; incomplete Square data may still leave figures unavailable.`);
+        syncQueuedRef.current = true; setSyncQueued(true);
+        setSyncStatus(`Sync queued for ${from} through ${to}. The workspace will update automatically when it finishes.`);
       }
       return true;
     } catch (reason) {
@@ -361,12 +403,20 @@ export default function Home() {
         SQUARE_LOCATIONS_UNAVAILABLE: 'Square locations could not be loaded. Try again shortly.',
         SQUARE_SYNC_STATUS_UNAVAILABLE: 'Square sync coverage could not be checked. Try again shortly.',
       };
-      setSyncError(messages[code] ?? 'The sync could not be queued. Refresh the page and try again.');
+      setSyncError(messages[code] ?? 'The sync could not be queued. Try again shortly.');
       return false;
     } finally { setSyncing(false); }
   }
   const currency = dashboard?.period?.currency ?? dashboard?.income?.currency ?? 'USD';
   const openIssues = issues.filter(i => !['resolved', 'approved', 'rejected'].includes(i.state));
+  const isWorkspaceOwner = organizations.find(org => org.id === organizationId)?.role === 'owner';
+  const sourceFreshness = dashboard?.freshness?.status ?? 'unknown';
+  const sourceFreshnessTone = ({ fresh: 'good', incomplete: 'warn', stale: 'warn', failed: 'bad', unknown: 'neutral' } as Record<string, string>)[sourceFreshness] ?? 'neutral';
+  const sourceFreshnessLabel = ({ fresh: 'Synced with Square', incomplete: 'Sync incomplete', stale: 'Sync overdue', failed: 'Sync failed', unknown: 'Sync status unavailable' } as Record<string, string>)[sourceFreshness] ?? 'Sync status unavailable';
+  const sourceSyncAge = relativeTime(dashboard?.freshness?.lastSyncedAt);
+  const sourceSyncSummary = sourceFreshness === 'fresh'
+    ? sourceSyncAge ? `Synced ${sourceSyncAge}` : sourceFreshnessLabel
+    : `${sourceFreshnessLabel}${sourceSyncAge ? ` · ${sourceSyncAge}` : ''}`;
 
   if (loadingAuth) return <main className="auth-screen"><div className="auth-card">Loading secure workspace…</div></main>;
   if (!user) return <main className="auth-screen"><form className="auth-card" onSubmit={signIn}>
@@ -386,18 +436,18 @@ export default function Home() {
       <nav aria-label="Main navigation">{navItems.map(item => <button key={item.id} className={`nav-link ${page === item.id ? 'selected' : ''}`} onClick={() => navigate(item.id)} aria-current={page === item.id ? 'page' : undefined}><UiIcon name={item.icon} size={17} />{item.label}{item.id === 'review' && openIssues.length > 0 && <i>{openIssues.length}</i>}</button>)}</nav>
       <div className="sidebar-foot"><div className="profile"><span className="avatar">{user.email?.slice(0, 1).toUpperCase() ?? 'U'}</span><span className="profile-info"><b>{user.email}</b><small>Signed in</small></span><button className="icon-button" onClick={signOut} title="Sign out" aria-label="Sign out"><UiIcon name="signOut" /></button></div></div>
     </aside>
-    <section className="main-area"><header className="topbar"><div className="top-controls" role="group" aria-label={`Workspace and reporting controls. Period dates use ${reportTimezone}`}>{organizations.length > 1 && <label className="compact">Organization<select value={organizationId} onChange={e => { loadSequence.current += 1; setOrganizationId(e.target.value); setAccountId(''); setDashboard(null); setFeatures({ inventoryTracking: false, productAnalytics: false }); setSyncStatus(''); setSyncError(''); if (page === 'analytics') setPage('overview'); }}><option value="">Choose workspace</option>{organizations.map(org => <option key={org.id} value={org.id}>{org.name}</option>)}</select></label>}<details className="period-picker"><summary aria-label={`Reporting period ${periodLabel(from, to)}`}>{periodLabel(from, to)}<span aria-hidden="true">⌄</span></summary><div className="period-popover"><label>Start date<input aria-label="Period start date" type="date" value={from} onChange={e => { setFrom(e.target.value); setSyncStatus(''); setSyncError(''); }} /></label><label>End date<input aria-label="Period end date" type="date" value={to} onChange={e => { setTo(e.target.value); setSyncStatus(''); setSyncError(''); }} /></label><small>{reportTimezone}</small></div></details><button className="icon-button refresh" onClick={() => void load()} disabled={busy || syncing} aria-label="Refresh workspace data" title="Refresh"><UiIcon name="refresh" size={17} /></button></div></header>
-      <main className="page"><div className="page-head"><div><p className="eyebrow">{dashboard?.organization?.name ?? 'FINANCIAL OPERATIONS'}</p><h1>{title}</h1></div>{organizations.find(org => org.id === organizationId)?.role === 'owner' && <div className="page-actions"><button className="secondary with-icon" onClick={() => void syncSelectedPeriod()} disabled={syncing || busy} title="Sync the selected period"><UiIcon name="sync" />{syncing ? 'Queueing…' : 'Sync'}</button></div>}</div>
+    <section className="main-area"><header className="topbar"><div className="top-controls" role="group" aria-label={`Workspace and reporting controls. Period dates use ${reportTimezone}`}>{organizations.length > 1 && <label className="compact organization-picker">Organization<select value={organizationId} onChange={e => { loadSequence.current += 1; setOrganizationId(e.target.value); setAccountId(''); setDashboard(null); setFeatures({ inventoryTracking: false, productAnalytics: false }); syncQueuedRef.current = false; setSyncQueued(false); setSyncStatus(''); setSyncError(''); if (page === 'analytics') setPage('overview'); }}><option value="">Choose workspace</option>{organizations.map(org => <option key={org.id} value={org.id}>{org.name}</option>)}</select></label>}<details className="period-picker"><summary aria-label={`Reporting period ${periodLabel(from, to)}`}>{periodLabel(from, to)}<span aria-hidden="true">⌄</span></summary><div className="period-popover"><label>Start date<input aria-label="Period start date" type="date" value={from} onChange={e => { setFrom(e.target.value); setSyncStatus(''); setSyncError(''); }} /></label><label>End date<input aria-label="Period end date" type="date" value={to} onChange={e => { setTo(e.target.value); setSyncStatus(''); setSyncError(''); }} /></label><small>{reportTimezone}</small></div></details></div><div className="sync-controls"><span className={`sync-source tone-${sourceFreshnessTone}`} role="status" aria-live="polite" title={dashboard?.freshness?.lastSyncedAt ? `Last successful Square sync ${date(dashboard.freshness.lastSyncedAt)}` : sourceFreshnessLabel}><i className="sync-source-dot" aria-hidden="true" />{syncQueued ? 'Sync queued · checking automatically' : `Square · ${sourceSyncSummary}`}</span>{isWorkspaceOwner && <button className="primary with-icon sync-data-button" onClick={() => void syncSelectedPeriod()} disabled={syncing || busy || syncQueued} title="Fetch latest data from Square and connected sources" aria-label="Sync data"><UiIcon name="sync" />{syncing ? 'Starting…' : 'Sync data'}</button>}</div></header>
+      <main className="page"><div className="page-head"><div><p className="eyebrow">{dashboard?.organization?.name ?? 'FINANCIAL OPERATIONS'}</p><h1>{title}</h1></div></div>
         {error && <div className="notice error-box" role="alert"><b>Data request needs attention</b><span>{error}</span></div>}
         {syncError && <div className="notice error-box" role="alert"><b>Sync could not start</b><span>{syncError}</span></div>}
-        {syncStatus && <div className="notice" role="status"><b>Sync queued</b><span>{syncStatus}</span></div>}
+        {syncStatus && <div className="notice" role="status"><b>Sync status</b><span>{syncStatus}</span></div>}
         {!organizationId ? <section className="empty-state"><div className="empty-icon">⌁</div><h2>{organizations.length ? 'Choose a workspace' : 'No workspace membership found'}</h2><p>Ask a workspace owner to add your account.</p></section> : !dashboard ? <section className="empty-state"><div className="empty-icon">⌁</div><h2>{busy ? 'Loading workspace data' : 'No projection available yet'}</h2><p>A completed projection will appear here.</p><button className="secondary with-icon" onClick={() => void load()}><UiIcon name="refresh" />Retry</button></section> : <>
-          {visitedPages.has('overview') && <div hidden={page !== 'overview'}><Overview dashboard={dashboard} currency={currency} issues={openIssues} events={events} accountId={accountId} onNavigate={navigate} /></div>}
+          {visitedPages.has('overview') && <div hidden={page !== 'overview'}><Overview dashboard={dashboard} currency={currency} issues={openIssues} events={events} accountId={accountId} userId={user.id} onNavigate={navigate} /></div>}
           {visitedPages.has('income') && <div hidden={page !== 'income'}><Income dashboard={dashboard} currency={currency} /><GiftCardSummary income={dashboard.income} currency={currency} /></div>}
           {visitedPages.has('cash') && <div hidden={page !== 'cash'}><Cash key={organizationId} dashboard={dashboard} currency={currency} movements={movements} accounts={dashboard.accounts ?? []} accountId={accountId} organizationId={organizationId} inventoryEnabled={features.inventoryTracking} canManageSquareCatalog={organizations.find(org => org.id === organizationId)?.role === 'owner'} canAuthorizeSquareCatalog={organizations.find(org => org.id === organizationId)?.role === 'owner'} onAccount={setAccountId} onSaved={() => void load()} /></div>}
-          {visitedPages.has('purchases') && <div hidden={page !== 'purchases'}><PurchaseReceipts key={organizationId} organizationId={organizationId} role={organizations.find(org => org.id === organizationId)?.role ?? 'read_only'} accounts={dashboard.accounts ?? []} currency={currency} initialReceiptId={purchaseReceiptId} onSaved={() => void load()} /></div>}
-          {visitedPages.has('analytics') && features.productAnalytics && <div hidden={page !== 'analytics'}><Analytics key={organizationId} organizationId={organizationId} from={zonedMidnight(from, reportTimezone)} to={zonedMidnight(nextDate(to), reportTimezone)} currency={currency} timezone={reportTimezone} role={organizations.find(org => org.id === organizationId)?.role ?? 'read_only'} /></div>}
-          {visitedPages.has('review') && <div hidden={page !== 'review'}><Review key={organizationId} issues={openIssues} organizationId={organizationId} currency={currency} canSync={organizations.find(org => org.id === organizationId)?.role === 'owner'} syncing={syncing} syncPeriodLabel={periodLabel(from, to)} onSyncPeriod={syncSelectedPeriod} onSaved={() => void load()} /></div>}
+          {visitedPages.has('purchases') && <div hidden={page !== 'purchases'}><PurchaseReceipts key={organizationId} organizationId={organizationId} role={organizations.find(org => org.id === organizationId)?.role ?? 'read_only'} accounts={dashboard.accounts ?? []} currency={currency} initialReceiptId={purchaseReceiptId} active={page === 'purchases'} onSaved={() => void load()} /></div>}
+          {visitedPages.has('analytics') && features.productAnalytics && <div hidden={page !== 'analytics'}><Analytics key={organizationId} organizationId={organizationId} from={zonedMidnight(from, reportTimezone)} to={zonedMidnight(nextDate(to), reportTimezone)} currency={currency} timezone={reportTimezone} refreshKey={dashboard.freshness?.lastSyncedAt ?? ''} role={organizations.find(org => org.id === organizationId)?.role ?? 'read_only'} /></div>}
+          {visitedPages.has('review') && <div hidden={page !== 'review'}><Review key={organizationId} issues={openIssues} organizationId={organizationId} currency={currency} canSync={organizations.find(org => org.id === organizationId)?.role === 'owner'} syncPeriodLabel={periodLabel(from, to)} onSaved={() => void load()} /></div>}
           {visitedPages.has('ledger') && <div hidden={page !== 'ledger'}><Ledger events={events} /></div>}
           {visitedPages.has('settings') && <div hidden={page !== 'settings'}><Settings dashboard={dashboard} accountId={accountId} onAccount={setAccountId} /></div>}
           <footer className="projection-foot"><span>{dashboard.period?.from ?? from} – {dashboard.period?.to ?? to} · {currency}</span><details className="system-details"><summary>System details</summary><span>Calculation {dashboard.projectionVersion ?? 'version pending'} · {dashboard.income?.status === 'incomplete' ? 'Margin incomplete' : 'Operational reporting'}</span></details></footer>
@@ -429,7 +479,7 @@ function GiftCardSummary({ income, currency }: { income: Dashboard['income']; cu
     <div className="status-row"><span>Liability change this period</span><b>{money(income.giftCardLiabilityChangeMinor, currency)}</b></div>
   </section>;
 }
-function Overview({ dashboard: d, currency: c, issues, events, accountId, onNavigate }: { dashboard: Dashboard; currency: string; issues: Issue[]; events: AuditEvent[]; accountId: string; onNavigate: (p: Page) => void }) {
+function Overview({ dashboard: d, currency: c, issues, events, accountId, userId, onNavigate }: { dashboard: Dashboard; currency: string; issues: Issue[]; events: AuditEvent[]; accountId: string; userId: string; onNavigate: (p: Page) => void }) {
   const income = d.income;
   const cash = d.cash;
   const account = d.accounts?.find(item => item.id === accountId);
@@ -442,18 +492,42 @@ function Overview({ dashboard: d, currency: c, issues, events, accountId, onNavi
   const freshnessLabel = ({ fresh: 'Synced with Square', incomplete: 'Sync incomplete', stale: 'Sync overdue', failed: 'Sync failed', unknown: 'Sync status unavailable' } as Record<string, string>)[freshness] ?? 'Sync status unavailable';
   const freshnessTone = ({ fresh: 'good', incomplete: 'warn', stale: 'warn', failed: 'bad', unknown: 'neutral' } as Record<string, string>)[freshness] ?? 'neutral';
   const flags = d.flags ?? [];
-  const activityLabel = (event: AuditEvent) => (event.action ?? event.event_type ?? event.entity_type ?? 'Workspace event').replaceAll('_', ' ').replaceAll('.', ' ');
+  const activityLabel = (event: AuditEvent) => {
+    const action = (event.action ?? event.event_type ?? '').toLowerCase().replaceAll('_', ' ').replaceAll('.', ' ');
+    const entity = (event.entity_type ?? '').toLowerCase();
+    if (entity.includes('receipt') && action.includes('reprocess')) return 'Receipt reprocessed';
+    if (entity.includes('receipt') && /upload|create|submit/.test(action)) return 'Receipt uploaded';
+    if ((event.actor_kind ?? '').toLowerCase() === 'system' && /insert|import|upsert/.test(action)) return 'Square transaction imported';
+    if (/payout/.test(entity)) return 'Square payout updated';
+    if (/receipt/.test(entity)) return 'Receipt updated';
+    if (/issue|review/.test(entity)) return 'Review updated';
+    if (/insert|import|upsert/.test(action)) return 'New accounting record added';
+    if (/reprocess/.test(action)) return 'Record reprocessed';
+    if (/upload/.test(action)) return 'Document uploaded';
+    const label = action || (event.entity_type ?? 'Workspace update').replaceAll('_', ' ').replaceAll('.', ' ');
+    return label.charAt(0).toUpperCase() + label.slice(1);
+  };
+  const activityActor = (event: AuditEvent) => {
+    const actor = (event.actor_kind ?? '').toLowerCase();
+    if (actor === 'system' || actor === 'agent') return 'Automated';
+    if (actor === 'human') return event.actor_user_id === userId ? 'By you' : 'By a team member';
+    return 'Recorded';
+  };
+  const activityReference = (event: AuditEvent) => {
+    const reference = event.source_refs?.[0] ?? event.entity_id;
+    return reference && reference.length > 16 ? `${reference.slice(0, 8)}…${reference.slice(-4)}` : reference ?? '';
+  };
   const recentEvents = events.slice(0, 4);
   const discountsMinor = income?.discountsMinor;
   const refundsMinor = income?.refundsMinor;
   const discountsAndRefundsMinor = discountsMinor == null || refundsMinor == null ? null : discountsMinor + refundsMinor;
-  const balanceValue = cash?.expectedBalanceMinor == null ? account ? 'Unavailable' : 'Not configured' : money(cash.expectedBalanceMinor, cash.currency ?? c);
-  const balanceHint = !account ? 'No tracked account is available' : cash?.expectedBalanceMinor == null ? 'Balance evidence is unavailable for this period' : (cash.status ?? 'Expected account balance').replaceAll('_', ' ');
+  const balanceValue = cash?.expectedBalanceMinor == null ? account ? 'Unavailable' : '—' : money(cash.expectedBalanceMinor, cash.currency ?? c);
+  const balanceHint = !account ? 'No tracked account is configured' : cash?.expectedBalanceMinor == null ? 'Balance evidence is unavailable for this period' : (cash.status ?? 'Expected account balance').replaceAll('_', ' ');
   return <>
     <section className="overview-summary" aria-label="Period summary">
       <article className="summary-metric"><span>Net sales</span><strong>{money(income?.netSalesMinor, c)}</strong><small>{income?.grossItemSalesMinor == null ? 'After discounts and refunds' : `${money(income.grossItemSalesMinor, c)} gross sales`}</small></article>
       <article className="summary-metric"><span>Operational margin</span><strong className={income?.status !== 'complete' ? 'warn-text' : ''}>{money(operationalMarginMinor, c)}</strong><small>{marginHint}</small></article>
-      <article className="summary-metric"><span>Expected balance</span><strong className={cash?.expectedBalanceMinor == null ? 'value-muted' : ''}>{balanceValue}</strong><small>{balanceHint}</small></article>
+      <article className={`summary-metric ${!account ? 'summary-metric-empty' : ''}`}><span>Expected balance</span><strong className={cash?.expectedBalanceMinor == null ? 'value-muted' : ''}>{balanceValue}</strong><small>{balanceHint}</small></article>
       <article className="summary-metric"><span>Reviews</span><strong>{issues.length}</strong><small>{issues.length ? 'Needs attention' : 'All clear'}</small></article>
     </section>
 
@@ -478,7 +552,7 @@ function Overview({ dashboard: d, currency: c, issues, events, accountId, onNavi
 
       <section className="overview-section reconciliation-summary">
         <div className="overview-section-heading"><div><h2>Cash &amp; reconciliation</h2><p>{account ? `${account.name} · ${account.currency}` : 'Account status'}</p></div><button className="text-button with-icon" aria-label="View cash and inventory" title="View cash and inventory" onClick={() => onNavigate('cash')}><UiIcon name="arrowRight" /></button></div>
-        {!account ? <div className="reconciliation-empty"><strong>No tracked account</strong><p>A workspace administrator can configure an account before reconciliation.</p></div> : <dl className="reconciliation-values">
+        {!account ? <div className="reconciliation-empty"><strong>No account connected</strong><p>A workspace administrator can configure a tracked account to enable reconciliation.</p></div> : <dl className="reconciliation-values">
           <div><dt>Expected balance</dt><dd>{money(cash?.expectedBalanceMinor, cash?.currency ?? account.currency)}</dd></div>
           <div><dt>Observed balance</dt><dd>{money(cash?.observedBalanceMinor, cash?.currency ?? account.currency)}</dd></div>
           <div className={cash?.discrepancyMinor ? 'mismatch' : ''}><dt>Difference</dt><dd>{money(cash?.discrepancyMinor, cash?.currency ?? account.currency)}</dd></div>
@@ -496,7 +570,7 @@ function Overview({ dashboard: d, currency: c, issues, events, accountId, onNavi
 
     <section className="overview-section recent-activity">
       <div className="overview-section-heading"><div><h2>Recent activity</h2></div><button className="text-button with-icon" aria-label="View activity" title="View activity" onClick={() => onNavigate('ledger')}><UiIcon name="arrowRight" /></button></div>
-      {recentEvents.length ? <ul className="activity-list">{recentEvents.map(event => <li key={event.id}><time dateTime={event.created_at}>{date(event.created_at)}</time><span>{activityLabel(event)}</span><small>{event.actor_kind ?? 'Recorded event'}</small></li>)}</ul> : <p className="activity-empty">No audit events have been recorded for this workspace yet.</p>}
+      {recentEvents.length ? <ul className="activity-list">{recentEvents.map(event => { const reference = activityReference(event); return <li key={event.id}><time dateTime={event.created_at}>{new Intl.DateTimeFormat(undefined, { hour: 'numeric', minute: '2-digit' }).format(new Date(event.created_at))}</time><span>{activityLabel(event)}</span><small>{[reference, activityActor(event)].filter(Boolean).join(' · ')}</small></li>; })}</ul> : <p className="activity-empty">No audit events have been recorded for this workspace yet.</p>}
     </section>
   </>;
 }
@@ -612,7 +686,7 @@ function InventoryPanel({ organizationId, accountId, currency, timezone, account
       }
       const result = await api<{ projectionQueued: boolean }>('/api/inventory/receipt-costs', { method: 'POST', headers: { 'Idempotency-Key': receiptApprovalKey.current.key }, body: JSON.stringify({ organizationId, evidenceRef: receiptApprovalKey.current.evidenceId, reason: approvalReason, updates: prepared }) });
       receiptApprovalKey.current = null;
-      setReceiptNotice(result.projectionQueued ? 'Approved cost updates were recorded. Projection replay is queued; refresh after it completes.' : 'Approved cost updates were recorded. They take effect on the selected date.');
+      setReceiptNotice(result.projectionQueued ? 'Approved cost updates were recorded. Totals update automatically when projection replay completes.' : 'Approved cost updates were recorded. They take effect on the selected date.');
       setReceiptDraft(null); setReceiptLines([]); setReceiptCandidates([]); setReceiptText(''); setReceiptEvidence(null); setReceiptEvidenceRef(''); setReceiptReason('');
       await refresh(); onSaved();
     } catch (err) {
@@ -758,7 +832,7 @@ function InventoryPanel({ organizationId, accountId, currency, timezone, account
     {snapshot?.balances?.length ? <section className="panel stock-panel"><div className="panel-heading"><div><h3>Stock on hand</h3><p>Based on purchases, adjustments, and sales.</p></div><span className={`pill ${snapshot.status === 'complete' ? 'good' : 'warn'}`}>{snapshot.status === 'complete' ? 'Complete' : 'Incomplete'}</span></div>{snapshot.issues?.length ? <div className="inventory-issues" role="status">Inventory data is incomplete <span>{Array.from(new Set(snapshot.issues.map(issue => issue.code))).map(code => ({ OPENING_BALANCE_MISSING: 'Opening count needed', SOURCE_GAP: 'Source data incomplete', SOURCE_HEALTH_INCOMPLETE: 'Square sync incomplete', UNKNOWN_ITEM: 'Unidentified sale item' } as Record<string, string>)[code] ?? code.replaceAll('_', ' ').toLowerCase()).join(' · ')}</span></div> : null}<div className="table-wrap"><table><thead><tr><th>Item</th><th>Currency</th><th className="numeric">Units</th></tr></thead><tbody>{snapshot.balances.map(balance => <tr key={balance.itemDefinitionId}><td>{balance.itemName}</td><td>{balance.currency}</td><td className="numeric">{balance.quantity ?? 'Unknown'}</td></tr>)}</tbody></table></div></section> : null}{error && !mode && <p className="error" role="alert">{error}</p>}{loading ? <div className="inline-empty">Loading inventory…</div> : rows.length ? <div className="table-wrap"><table><thead><tr><th>Date</th><th>Item</th><th className="numeric">Change</th><th>Type</th><th>Reason</th></tr></thead><tbody>{rows.map(row => <tr key={row.id}><td>{date(row.occurred_at)}</td><td>{row.item_name}</td><td className="numeric">{row.quantity_delta > 0 ? '+' : ''}{row.quantity_delta}</td><td>{(row.movement_type ?? 'movement').replaceAll('_', ' ')}</td><td>{row.reason ?? '—'}</td></tr>)}</tbody></table></div> : !loading && <div className="inline-empty">No inventory movements in this period. Existing item definitions appear here after their first recorded movement.</div>}
   </section>;
 }
-function Analytics({ organizationId, from, to, currency, timezone, role }: { organizationId: string; from: string; to: string; currency: string; timezone: string; role: string }) {
+function Analytics({ organizationId, from, to, currency, timezone, refreshKey, role }: { organizationId: string; from: string; to: string; currency: string; timezone: string; refreshKey: string; role: string }) {
   const [report, setReport] = useState<AnalyticsReport | null>(null), [error, setError] = useState(''), [loading, setLoading] = useState(false), [search, setSearch] = useState(''), [catalogSearch, setCatalogSearch] = useState(''), [sortBy, setSortBy] = useState<'revenue' | 'cost' | 'net' | 'units'>('revenue'), [seriesView, setSeriesView] = useState<'monthly' | 'daily'>('monthly'), [selectedProductId, setSelectedProductId] = useState('');
   const [catalogView, setCatalogView] = useState<'active' | 'archived' | 'all'>('active');
   const [catalogMode, setCatalogMode] = useState<CatalogDialogMode | null>(null);
@@ -783,7 +857,7 @@ function Analytics({ organizationId, from, to, currency, timezone, role }: { org
       .catch(err => { if (active) setError(err instanceof Error ? err.message : 'Analytics could not be loaded.'); })
       .finally(() => { if (active) setLoading(false); });
     return () => { active = false; };
-  }, [organizationId, from, to, currency]);
+  }, [organizationId, from, to, currency, refreshKey]);
   async function reloadCatalog() {
     const query = new URLSearchParams({ organizationId, from, to, currency });
     const result = await api<{ analytics: AnalyticsReport }>(`/api/analytics?${query}`);
@@ -852,7 +926,7 @@ function Analytics({ organizationId, from, to, currency, timezone, role }: { org
       payload = { organizationId, name: catalogName.trim(), description: catalogDescription.trim(), variations, reason };
       method = 'POST';
     } else if (!target?.squareItemId) {
-      setCatalogError('This item is missing its Square item link. Refresh the catalogue and try again.'); return;
+      setCatalogError('This item is missing its Square link. Reopen the catalogue and try again.'); return;
     } else if (catalogMode === 'edit_item') {
       if (!catalogName.trim() || catalogName.trim().length > 200 || catalogDescription.length > 4096) { setCatalogError('Enter a valid item name and description.'); return; }
       payload = { organizationId, action: 'update_item', squareItemId: target.squareItemId,
@@ -910,7 +984,7 @@ function Analytics({ organizationId, from, to, currency, timezone, role }: { org
       };
       setCatalogNotice(notices[catalogMode]);
       try { await reloadCatalog(); }
-      catch { setCatalogError('The change was saved, but the catalogue could not refresh. Refresh the page to see it.'); }
+      catch { setCatalogError('The change was saved, but item details could not update. Reopen the catalogue to verify it.'); }
     } catch (err) {
       const code = err instanceof Error ? err.message : '';
       setCatalogReconnectNeeded(['SQUARE_NOT_CONNECTED','SQUARE_RECONNECT_REQUIRED','SQUARE_CATALOG_WRITE_PERMISSION_REQUIRED'].includes(code));
@@ -918,9 +992,9 @@ function Analytics({ organizationId, from, to, currency, timezone, role }: { org
         SQUARE_NOT_CONNECTED: 'Connect Square before changing the catalogue.',
         SQUARE_RECONNECT_REQUIRED: 'Square authorization needs renewal. Reconnect it to continue.',
         SQUARE_CATALOG_WRITE_PERMISSION_REQUIRED: 'Square item write access is needed. Reauthorize Square to grant it.',
-        SQUARE_CATALOG_CONFLICT: 'This item changed in Square after it was loaded. Refresh the catalogue and try again.',
+        SQUARE_CATALOG_CONFLICT: 'This item changed in Square after it was loaded. Reopen the catalogue and try again.',
         SQUARE_CATALOG_BUSY: 'Square is processing another catalogue update. Wait a moment, then retry.',
-        SQUARE_CATALOG_OBJECT_UNAVAILABLE: 'Square could not find this item. Refresh the catalogue and try again.',
+        SQUARE_CATALOG_OBJECT_UNAVAILABLE: 'Square could not find this item. Reopen the catalogue and choose it again.',
         SQUARE_CATALOG_VARIATION_LIMIT: 'Square items support a maximum of 250 variations.',
         SQUARE_CATALOG_SAVED_REFRESH_PENDING: 'Square saved the change, but Finance Loop could not refresh the historical item facts. Retry this same change or ask an owner to check the connection.',
         SQUARE_CATALOG_SAVED_AUDIT_PENDING: 'Square saved the change, but Finance Loop could not record its audit event. Retry this same change so the audit can finish.',
@@ -1008,11 +1082,11 @@ function ProductSalesChart({ product, from, to, currency, issues }: { product: A
   const hasIncompleteTrendBucket = Array.isArray(product.dailySales) && product.dailySales.some(day => day.revenueMinor === null);
   const hasCompleteItemTotals = product.revenueMinor !== null;
   const trendUnavailableReason = hasCompleteItemTotals && (hasMissingTrendPayload || hasIncompleteTrendBucket)
-    ? 'Product totals loaded, but their item trend buckets are missing or marked incomplete. Refresh the report; if this persists, deploy the latest analytics calculation.'
+    ? 'Product totals loaded, but their item trend buckets are missing or incomplete. If this persists after the next sync, deploy the latest analytics calculation.'
     : incompleteWindow
-      ? 'A completed Square sync does not cover the full selected period. Sync this period, then refresh the report.'
+      ? 'A completed Square sync does not cover the full selected period. Use Sync data for this period; the report updates when the sync finishes.'
       : hasIncompleteTrendBucket
-        ? 'One or more item revenue buckets have incomplete source data. Resolve the related source gap, then refresh the report.'
+        ? 'One or more item revenue buckets have incomplete source data. Resolve the related source gap, then sync the selected period.'
         : points.length === 0
           ? 'There are no UTC date buckets in the selected period.'
           : hasMissingTrendPayload
@@ -1048,13 +1122,12 @@ function ProductSalesChart({ product, from, to, currency, issues }: { product: A
   </div>;
 }
 
-function Review({ issues, organizationId, currency, canSync, syncing, syncPeriodLabel, onSyncPeriod, onSaved }: { issues: Issue[]; organizationId: string; currency: string; canSync: boolean; syncing: boolean; syncPeriodLabel: string; onSyncPeriod: () => Promise<boolean>; onSaved: () => void }) {
+function Review({ issues, organizationId, currency, canSync, syncPeriodLabel, onSaved }: { issues: Issue[]; organizationId: string; currency: string; canSync: boolean; syncPeriodLabel: string; onSaved: () => void }) {
   const [selected, setSelected] = useState<Issue | null>(null);
   const [issueDetails, setIssueDetails] = useState<Issue | null>(null);
   const [issueEvidence, setIssueEvidence] = useState<IssueEvidence[]>([]);
   const [issueEvidenceLoading, setIssueEvidenceLoading] = useState(false);
   const [issueEvidenceError, setIssueEvidenceError] = useState('');
-  const [issueSyncMessage, setIssueSyncMessage] = useState('');
   const issueEvidenceRequestId = useRef(0);
   const [correction, setCorrection] = useState<{ issue: Issue; kind: 'item' | 'refund' } | null>(null);
   const [reason, setReason] = useState(''); const [busyId, setBusyId] = useState(''); const [error, setError] = useState(''); const [notice, setNotice] = useState('');
@@ -1096,15 +1169,8 @@ function Review({ issues, organizationId, currency, canSync, syncing, syncPeriod
     } finally { if (requestId === issueEvidenceRequestId.current) setIssueEvidenceLoading(false); }
   }
   function openIssue(issue: Issue) {
-    setIssueDetails(issue); setIssueSyncMessage('');
+    setIssueDetails(issue);
     void loadIssueEvidence(issue);
-  }
-  async function syncIssuePeriod() {
-    setIssueSyncMessage('');
-    const queued = await onSyncPeriod();
-    setIssueSyncMessage(queued
-      ? `Sync queued for ${syncPeriodLabel}. Refresh the workspace after the worker finishes to check whether the issue cleared.`
-      : 'The sync could not be queued. Check the sync message on the page or ask a workspace owner to retry.');
   }
   async function openCorrection(issue: Issue, kind: 'item' | 'refund') {
     setCorrection({ issue, kind }); setError(''); setNotice(''); setReason(''); setEvidence([]); setEvidenceLoading(true);
@@ -1241,9 +1307,8 @@ function Review({ issues, organizationId, currency, canSync, syncing, syncPeriod
             <ul className="decision-context-lines">{issueDiagnosis.problems.map((problem, index) => <li key={`${index}-${problem.objectId ?? 'record'}`}><strong>{problem.objectId ?? `Source record ${index + 1}`}</strong><span>{problem.fields?.length ? problem.fields.map(issueFieldLabel).join('; ') : 'Required source information is missing.'}</span></li>)}</ul>
           </>}
           <p><strong>Next step:</strong> {issueDiagnosis.nextStep}</p>
-          {issueSyncMessage && <p role="status">{issueSyncMessage}</p>}
           {issueDiagnosis.queueSync && (canSync
-            ? <div className="form-actions"><button type="button" className="secondary with-icon" onClick={() => void syncIssuePeriod()} disabled={syncing}><UiIcon name="sync" />{syncing ? 'Queueing…' : 'Sync'}</button><span className="field-hint">{syncPeriodLabel}</span></div>
+            ? <p>Use Sync data in the workspace bar to retry {syncPeriodLabel}.</p>
             : <p>Only a workspace owner can start a Square sync. Ask an owner to sync the selected period.</p>)}
         </section>}
         <section className="issue-detail-section"><h3>Linked source references</h3>{issueDetails.source_refs?.length ? <ul className="issue-source-refs">{issueDetails.source_refs.map((ref, index) => <li key={`${index}-${ref}`}><code>{ref}</code></li>)}</ul> : issueDiagnosis?.objectId ? <ul className="issue-source-refs"><li><code>{issueDiagnosis.objectId}</code><small>Square object from the worker diagnostic</small></li></ul> : <p className="muted">{issueDiagnosis ? `No individual record reference was attached; the gap was reported during the Square ${issueDiagnosis.resource} check.` : 'No source references were attached to this issue.'}</p>}</section>
