@@ -25,8 +25,15 @@ or paste secret values into chat.
 | `SUPABASE_URL` | Supabase project URL |
 | `SUPABASE_SECRET_KEY` | Supabase service/secret key; grants the worker privileged RPC access |
 | `OPENROUTER_API_KEY` | Worker-only key for bounded diagnosis and supplier receipt extraction; drafts still require human approval |
-| `OPENROUTER_MODEL` | Agent model (default `openai/gpt-6-luna`) |
-| `PURCHASE_RECEIPT_MAX_OUTPUT_TOKENS` | Agent response limit for worker diagnosis and receipt extraction (default 1400, maximum 3000); organization budget reservations still apply |
+| `OPENROUTER_MODEL` | General-purpose chat model for issue investigation (default `openai/gpt-6-luna`); it must support chat completions and structured JSON |
+| `PURCHASE_RECEIPT_MAX_OUTPUT_TOKENS` | Receipt extraction response limit (default 1400, maximum 3000); organization budget reservations still apply |
+
+Purchase document extraction is pinned to `openai/gpt-6-luna`, which is the
+model accepted by the receipt budget reservation RPC. Jev is pinned separately
+to `typesafe/jev-1.13` for inventory matching through OpenRouter's Decisions
+API. Keep `OPENROUTER_MODEL` set to a general-purpose chat model: Jev returns
+typed decisions and cannot generate the supplier, amount, and line fields used
+to create a receipt draft.
 
 Receipt extraction failures use sanitized provider categories in the failed
 receipt's error code. `MODEL_AUTH_FAILED`, `MODEL_ACCESS_DENIED`, and

@@ -3,7 +3,7 @@ import { replayAccounting } from '../engine/index.mjs';
 import { backfillSquare, normalizeOrder, normalizePayment, normalizeRefund, normalizeCatalog, normalizePayout, normalizePayoutEntry, normalizeGiftCardActivity } from '../square/sync.mjs';
 import { refreshAccessToken } from '../square/client.mjs';
 import { diagnoseIssue } from '../agent/diagnosis.mjs';
-import { extractPurchaseReceipt } from '../agent/purchase-receipt.mjs';
+import { extractPurchaseReceipt, PURCHASE_RECEIPT_MODEL } from '../agent/purchase-receipt.mjs';
 import { extractDocumentText } from './purchase-receipt-document.mjs';
 
 const JOBS = new Set(['square.webhook', 'square.sync', 'projection.replay', 'issue.investigate', 'receipt.process']);
@@ -437,7 +437,7 @@ export function createWorker(dependencies) {
       if (!config.openRouterApiKey) throw Object.assign(new Error('Receipt model is not configured'), { code: 'RECEIPT_MODEL_UNAVAILABLE', permanent: true });
       const expectedVersion = Number(receipt.activeDraftVersion ?? receipt.active_draft_version ?? 0);
       const draft = await extractPurchaseReceipt({ text }, {
-        apiKey: config.openRouterApiKey, fetchImpl, model: config.openRouterModel,
+        apiKey: config.openRouterApiKey, fetchImpl, model: PURCHASE_RECEIPT_MODEL,
         maxOutputTokens: config.openRouterMaxOutputTokens ?? 1400,
         reserveBudget: args => db.reservePurchaseReceiptModelBudget({ organizationId: job.organizationId, receiptId, jobId: job.id, ...args }),
         recordUsage: args => db.recordPurchaseReceiptModelUsage({ organizationId: job.organizationId, receiptId, jobId: job.id, ...args }),
