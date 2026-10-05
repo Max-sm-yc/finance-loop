@@ -42,7 +42,7 @@ const worker = createWorker({
     enabledJobTypes: ['square.webhook', 'square.sync', 'projection.replay', 'receipt.process'],
     openRouterApiKey: process.env.OPENROUTER_API_KEY?.trim() || '',
     openRouterModel: process.env.OPENROUTER_MODEL?.trim() || 'openai/gpt-6-luna',
-    openRouterMaxOutputTokens: integer('PURCHASE_RECEIPT_MAX_OUTPUT_TOKENS', 1400, 100, 1500),
+    openRouterMaxOutputTokens: integer('PURCHASE_RECEIPT_MAX_OUTPUT_TOKENS', 1400, 100, 3000),
     leaseSeconds: integer('WORKER_LEASE_SECONDS', 120, 30, 900),
     maxJobAttempts: integer('WORKER_MAX_JOB_ATTEMPTS', 5, 1, 12),
     maxBackfillPages: integer('WORKER_MAX_BACKFILL_PAGES', 10000, 1, 20000),

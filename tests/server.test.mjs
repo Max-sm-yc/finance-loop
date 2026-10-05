@@ -7,7 +7,7 @@ const org = '11111111-1111-4111-8111-111111111111';
 const account = '22222222-2222-4222-8222-222222222222';
 const user = '33333333-3333-4333-8333-333333333333';
 
-function setup({ role = 'operator', proposalFixture = false, proposalType = 'unknown_item', proposalPolicyVersion = 'policy-v1', fetchImpl, budgetAllowed = true, inventoryFlag = false, analyticsFlag = false, inventoryServerFlag = false, analyticsServerFlag = false, squareLocations = [{ id: 'square-location-1' }], squareCatalog, syncCoverage } = {}) {
+function setup({ role = 'operator', proposalFixture = false, proposalType = 'unknown_item', proposalPolicyVersion = 'policy-v1', fetchImpl, budgetAllowed = true, receiptAgentMaxOutputTokens = 900, inventoryFlag = false, analyticsFlag = false, inventoryServerFlag = false, analyticsServerFlag = false, squareLocations = [{ id: 'square-location-1' }], squareCatalog, syncCoverage } = {}) {
   const calls = [];
   const inboxIds = new Set();
   const db = {
@@ -36,6 +36,9 @@ function setup({ role = 'operator', proposalFixture = false, proposalType = 'unk
     async recordRefundCostReview(arg) { calls.push(['refund-review', arg]); return { id: 'refund-review-1' }; },
     async createProposalAtomic(arg) { calls.push(['proposal', arg]); return { id: 'proposal' }; },
     async reserveModelBudget() { return budgetAllowed; }, async recordModelUsage() {},
+    async reserveReceiptModelBudget(arg) { calls.push(['receipt-budget', arg]); return budgetAllowed; },
+    async recordReceiptModelUsage(arg) { calls.push(['receipt-usage', arg]); },
+    async listReceiptCatalogCandidates(arg) { calls.push(['receipt-candidates', arg]); return []; },
     async getReplaySnapshot() { return null; }, async saveProjectionRun() { return {}; },
     asUser(token) { calls.push(['asUser', token]); return { async rpc(name, args) { calls.push(['rpc', name, args]); return { data: 'new-id', error: null }; } }; }
   };
@@ -46,7 +49,7 @@ function setup({ role = 'operator', proposalFixture = false, proposalType = 'unk
   const queue = { async enqueueSquareSync(arg) { calls.push(['sync', arg]); return { id: 'job-1' }; }, async enqueueSquareWebhook(arg) { calls.push(['webhook-job', arg]); }, async enqueueProjectionReplay(arg) { calls.push(['projection-replay', arg]); return { id: 'replay-1' }; } };
   const webhookInbox = { async putIfAbsent(id, record) { calls.push(['inbox', id]); const inserted = !inboxIds.has(id); inboxIds.add(id); return { inserted, record }; } };
   const supabase = { auth: { async getUser(token) { calls.push(['auth', token]); return { data: { user: { id: user } }, error: null }; } } };
-  return { handlers: createHandlers({ supabase, db, queue, webhookInbox, fetchImpl, squareCatalog, engine: { replayAccounting: () => ({}) }, listSquareLocations: async args => { calls.push(['square-locations', args]); return squareLocations; }, config: { squareWebhookSignatureKey: 'key', squareNotificationUrl: 'https://example.test/webhook', openRouterApiKey: 'test-key', inventoryTrackingEnabled: inventoryServerFlag, productAnalyticsEnabled: analyticsServerFlag } }), calls, db, queue };
+  return { handlers: createHandlers({ supabase, db, queue, webhookInbox, fetchImpl, squareCatalog, engine: { replayAccounting: () => ({}) }, listSquareLocations: async args => { calls.push(['square-locations', args]); return squareLocations; }, config: { squareWebhookSignatureKey: 'key', squareNotificationUrl: 'https://example.test/webhook', openRouterApiKey: 'test-key', receiptAgentMaxOutputTokens, inventoryTrackingEnabled: inventoryServerFlag, productAnalyticsEnabled: analyticsServerFlag } }), calls, db, queue };
 }
 const auth = { authorization: 'Bearer valid.jwt.token' };
 const post = (path, body, headers = {}) => new Request(`https://app.test${path}`, { method: 'POST', headers: { ...auth, 'content-type': 'application/json', ...headers }, body: JSON.stringify(body) });
@@ -343,6 +346,26 @@ test('issue proposal runs a budgeted model draft, persists only the validated pr
   assert.deepEqual(persisted.proposal, proposal);
   assert.equal(persisted.decision, 'pending');
   assert.equal(calls.some(x => x[0] === 'rpc'), false);
+});
+
+test('receipt draft uses the configured output ceiling and reserves that amount', async () => {
+  let requestBody;
+  const fetchImpl = async (_url, init) => {
+    requestBody = JSON.parse(init.body);
+    return new Response(JSON.stringify({
+      choices: [{ message: { content: JSON.stringify({
+        supplier: null, invoice_date: null,
+        lines: [{ description: 'Tea', quantity: '1', unit_price: '1.00', line_amount: '1.00' }]
+      }) } }], usage: { total_tokens: 12 }
+    }), { status: 200 });
+  };
+  const { handlers, calls } = setup({ role: 'owner', inventoryFlag: true, inventoryServerFlag: true, receiptAgentMaxOutputTokens: 3000, fetchImpl });
+  const response = await handlers.receiptDraft(post('/api/receipt-draft', {
+    organizationId: org, currency: 'USD', text: 'Tea\nQty 1\n$1.00'
+  }));
+  assert.equal(response.status, 200, await response.clone().text());
+  assert.equal(requestBody.max_tokens, 3000);
+  assert.equal(calls.find(call => call[0] === 'receipt-budget')[1].maxOutputTokens, 3000);
 });
 
 test('refund COGS review proposal can ask for a human decision while unsupported issue types are rejected clearly', async () => {

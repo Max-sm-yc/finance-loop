@@ -552,6 +552,8 @@ export function createHandlers(adapters) {
     const runId = randomUUID();
     const draft = await extractReceipt({ text: body.text, currency: body.currency }, {
       apiKey: config.openRouterApiKey,
+      fetchImpl: adapters.fetchImpl ?? fetch,
+      maxOutputTokens: config.receiptAgentMaxOutputTokens,
       reserveBudget: args => db.reserveReceiptModelBudget({ organizationId: body.organizationId, runId, ...args, accessToken: actor.accessToken }),
       recordUsage: args => db.recordReceiptModelUsage({ organizationId: body.organizationId, runId, ...args, accessToken: actor.accessToken })
     });

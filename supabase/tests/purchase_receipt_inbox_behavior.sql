@@ -1,5 +1,5 @@
 begin;
-select plan(46);
+select plan(47);
 
 insert into auth.users(id,aud,role,email,encrypted_password,email_confirmed_at,created_at,updated_at)
 values('7d9db4a4-37a8-4241-a885-3120f73b3377','authenticated','authenticated','purchase-receipt@example.invalid','',now(),now(),now());
@@ -33,9 +33,13 @@ update public.purchase_receipt_submissions set status='processing'
 where id=(select (result->>'receiptId')::uuid from receipt_test_upload);
 update private.durable_jobs set status='running'
 where id=(select (result->>'jobId')::uuid from receipt_test_upload);
+select throws_ok($$select public.reserve_purchase_receipt_model_budget('95c9874f-fb81-4f32-bc8b-bbc558d2ee07',
+  (select (result->>'receiptId')::uuid from receipt_test_upload),(select (result->>'jobId')::uuid from receipt_test_upload),
+  'openai/gpt-6-luna',12000,3001,1)$$,'P0001','Invalid receipt model budget request',
+  'worker rejects output limits above 3000 tokens');
 select ok(public.reserve_purchase_receipt_model_budget('95c9874f-fb81-4f32-bc8b-bbc558d2ee07',
   (select (result->>'receiptId')::uuid from receipt_test_upload),(select (result->>'jobId')::uuid from receipt_test_upload),
-  'openai/gpt-6-luna',12000,1500,1),'worker reserves budget for the active durable extraction job');
+  'openai/gpt-6-luna',12000,3000,1),'worker accepts the 3000-token output limit');
 select is((select reserved_tokens from private.receipt_agent_budget_reservations
   where run_id=(select (result->>'jobId')::uuid from receipt_test_upload)),4096,
   'receipt job receives the fixed 4,096-token reservation');

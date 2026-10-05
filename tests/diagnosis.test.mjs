@@ -34,12 +34,14 @@ test('accepts a refund COGS review draft that asks for human evidence without de
 test('sends only allowlisted evidence and returns an unposted draft', async () => {
   let requestBody;
   let reservedInputTokens;
+  let reservedOutputTokens;
   const result = await diagnoseIssue({
     issue: { id: 'issue-1', type: 'balance_mismatch', code: 'BALANCE_MISMATCH', details: { customerEmail: 'secret@example.com' } },
     records: [{ id: 'receipt-1', type: 'receipt', amount_minor: -1000, description: 'secret@example.com', card_number: 'secret' }],
     policyVersion: 'p1', allowedCategories: ['misc_spend']
   }, {
-    apiKey: 'fake', reserveBudget: async ({ maxInputTokens }) => { reservedInputTokens = maxInputTokens; return true; },
+    apiKey: 'fake', maxOutputTokens: 3000,
+    reserveBudget: async ({ maxInputTokens, maxOutputTokens }) => { reservedInputTokens = maxInputTokens; reservedOutputTokens = maxOutputTokens; return true; },
     fetchImpl: async (_url, options) => {
       requestBody = JSON.parse(options.body);
       return { ok: true, json: async () => ({ choices: [{ message: { content: JSON.stringify(proposal) } }], usage: { total_tokens: 20 } }) };
@@ -49,8 +51,21 @@ test('sends only allowlisted evidence and returns an unposted draft', async () =
   assert.equal(result.proposal.candidate_source_ids[0], 'receipt-1');
   assert.equal(JSON.stringify(requestBody).includes('secret'), false);
   assert.equal(requestBody.response_format.type, 'json_schema');
+  assert.equal(requestBody.max_tokens, 3000);
   assert.equal(reservedInputTokens, Buffer.byteLength(JSON.stringify(requestBody), 'utf8') + 256);
+  assert.equal(reservedOutputTokens, 3000);
   assert.ok(reservedInputTokens < 12_000);
+});
+
+test('rejects diagnosis output limits above 3000 tokens', async () => {
+  let reserved = false;
+  await assert.rejects(diagnoseIssue({
+    issue: { id: 'issue-1', type: 'balance_mismatch' }, records: [], policyVersion: 'p1'
+  }, {
+    apiKey: 'fake', maxOutputTokens: 3001,
+    reserveBudget: async () => { reserved = true; return true; }, fetchImpl: async () => { throw new Error('must not call model'); }
+  }), { code: 'INVALID_INPUT' });
+  assert.equal(reserved, false);
 });
 
 test('trims oversized evidence to the prompt bound and marks omitted context', async () => {

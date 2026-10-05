@@ -24,9 +24,9 @@ or paste secret values into chat.
 | `SQUARE_TOKEN_ENCRYPTION_KEY` | The same base64-encoded 32-byte key used by the web deployment; existing stored OAuth tokens depend on it |
 | `SUPABASE_URL` | Supabase project URL |
 | `SUPABASE_SECRET_KEY` | Supabase service/secret key; grants the worker privileged RPC access |
-| `OPENROUTER_API_KEY` | Worker-only key for bounded supplier receipt extraction; drafts still require human approval |
-| `OPENROUTER_MODEL` | Receipt extraction model (default `openai/gpt-6-luna`) |
-| `PURCHASE_RECEIPT_MAX_OUTPUT_TOKENS` | Receipt extraction response limit (default 1400, maximum 1500); organization budget reservations still apply |
+| `OPENROUTER_API_KEY` | Worker-only key for bounded diagnosis and supplier receipt extraction; drafts still require human approval |
+| `OPENROUTER_MODEL` | Agent model (default `openai/gpt-6-luna`) |
+| `PURCHASE_RECEIPT_MAX_OUTPUT_TOKENS` | Agent response limit for worker diagnosis and receipt extraction (default 1400, maximum 3000); organization budget reservations still apply |
 
 Receipt extraction failures use sanitized provider categories in the failed
 receipt's error code. `MODEL_AUTH_FAILED`, `MODEL_ACCESS_DENIED`, and

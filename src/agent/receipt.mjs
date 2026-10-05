@@ -199,7 +199,7 @@ export async function extractReceipt({ text, currency }, {
   if (typeof text !== 'string' || !text.trim() || text.length > MAX_RECEIPT_CHARS || !/^[A-Z]{3}$/.test(currency ?? ''))
     throw new DiagnosisError('INVALID_INPUT', 'Receipt text or currency is invalid');
   if (typeof reserveBudget !== 'function' || typeof recordUsage !== 'function') throw new DiagnosisError('INVALID_INPUT', 'A durable receipt model budget is required');
-  if (!Number.isInteger(maxAttempts) || maxAttempts < 1 || maxAttempts > 2 || !Number.isInteger(maxOutputTokens) || maxOutputTokens < 1 || maxOutputTokens > 1200)
+  if (!Number.isInteger(maxAttempts) || maxAttempts < 1 || maxAttempts > 2 || !Number.isInteger(maxOutputTokens) || maxOutputTokens < 1 || maxOutputTokens > 3000)
     throw new DiagnosisError('INVALID_INPUT', 'Invalid model limits');
   const body = {
     model, max_tokens: maxOutputTokens, stream: false, provider: { require_parameters: true },

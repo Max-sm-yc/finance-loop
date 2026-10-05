@@ -268,6 +268,7 @@ function handlers() {
       openRouterApiKey: process.env.OPENROUTER_API_KEY ?? '',
       openRouterModel: process.env.OPENROUTER_MODEL ?? 'openai/gpt-6-luna',
       openRouterMaxOutputTokens: Number(process.env.OPENROUTER_MAX_OUTPUT_TOKENS ?? 700),
+      receiptAgentMaxOutputTokens: Number(process.env.RECEIPT_AGENT_MAX_OUTPUT_TOKENS ?? 900),
       inventoryTrackingEnabled: process.env.INVENTORY_TRACKING_ENABLED === 'true',
       productAnalyticsEnabled: process.env.PRODUCT_ANALYTICS_ENABLED === 'true',
     },

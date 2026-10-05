@@ -2,9 +2,9 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { extractPurchaseReceipt } from '../src/agent/purchase-receipt.mjs';
 
-const makeFetch = result => async (_url, request) => {
+const makeFetch = (result, expectedMaxTokens = 1400) => async (_url, request) => {
   const input=JSON.parse(request.body);
-  assert.equal(input.max_tokens,1400);
+  assert.equal(input.max_tokens,expectedMaxTokens);
   return new Response(JSON.stringify({choices:[{message:{content:JSON.stringify(result)}}],usage:{prompt_tokens:200,completion_tokens:300}}),{status:200,headers:{'content-type':'application/json'}});
 };
 const base = overrides => ({
@@ -14,6 +14,19 @@ const base = overrides => ({
   lines:[{description:'Kit Kat 36 pack',quantity:'5',units_per_package:'36',unit_price:'42.56',line_amount:'212.80'},
     {description:'Other supplier items',quantity:'1',units_per_package:null,unit_price:null,line_amount:'251.94'}],
   ...overrides
+});
+
+test('purchase receipt extraction accepts 3000 output tokens and rejects larger limits',async()=>{
+  let reservedOutputTokens;
+  const draft=await extractPurchaseReceipt({text:'Supplier receipt'}, {
+    apiKey:'test-only',maxOutputTokens:3000,fetchImpl:makeFetch(base(),3000),
+    reserveBudget:async args=>{reservedOutputTokens=args.maxOutputTokens;return true;}
+  });
+  assert.equal(draft.documentKind,'receipt');
+  assert.equal(reservedOutputTokens,3000);
+  await assert.rejects(extractPurchaseReceipt({text:'Supplier receipt'}, {
+    apiKey:'test-only',maxOutputTokens:3001,fetchImpl:makeFetch(base(),3001),reserveBudget:async()=>true
+  }),{code:'INVALID_INPUT'});
 });
 
 test('reconciles net item amounts with separately printed discount, tax, shipping and total',async()=>{

@@ -4,14 +4,33 @@ import { extractReceipt } from '../src/agent/receipt.mjs';
 import { rankReceiptCatalogCandidates } from '../src/agent/receipt-matching.mjs';
 import { calculatePackageUnitCostMinor, parseReceiptPackageUnits } from '../src/agent/receipt-units.mjs';
 
-async function extractWith(response, text) {
+async function extractWith(response, text, { maxOutputTokens = 900, onRequest = () => {}, onReserve = () => {} } = {}) {
   return extractReceipt({ text, currency: 'USD' }, {
     apiKey: 'test-key',
-    fetchImpl: async () => ({ ok: true, json: async () => ({ choices: [{ message: { content: JSON.stringify(response) } }], usage: {} }) }),
-    reserveBudget: async () => true,
+    maxOutputTokens,
+    fetchImpl: async (_url, request) => { onRequest(JSON.parse(request.body)); return { ok: true, json: async () => ({ choices: [{ message: { content: JSON.stringify(response) } }], usage: {} }) }; },
+    reserveBudget: async args => { onReserve(args); return true; },
     recordUsage: async () => {},
   });
 }
+
+test('receipt extraction accepts 3000 output tokens and rejects larger limits', async () => {
+  let requestBody;
+  let reservedOutputTokens;
+  const result = await extractWith({ supplier: null, invoice_date: null, lines: [
+    { description: 'Supplier item', quantity: null, unit_price: null, line_amount: null }
+  ] }, 'Supplier item', {
+    maxOutputTokens: 3000,
+    onRequest: body => { requestBody = body; },
+    onReserve: args => { reservedOutputTokens = args.maxOutputTokens; },
+  });
+  assert.equal(result.model, 'openai/gpt-6-luna');
+  assert.equal(requestBody.max_tokens, 3000);
+  assert.equal(reservedOutputTokens, 3000);
+  await assert.rejects(extractWith({ supplier: null, invoice_date: null, lines: [
+    { description: 'Supplier item', quantity: null, unit_price: null, line_amount: null }
+  ] }, 'Supplier item', { maxOutputTokens: 3001 }), { code: 'INVALID_INPUT' });
+});
 
 test('receipt extraction preserves a printed total and flags an exact missing-decimal match', async () => {
   const text = `[KIT KAT Milk Chocolate Wafer Candy, Full Size, 1.5 oz., 36 pk.](https://supplier.example/item)\n\n$42.56/ea\n\nQty 5\n\n**$21280**\n\n**Add to Cart**`;

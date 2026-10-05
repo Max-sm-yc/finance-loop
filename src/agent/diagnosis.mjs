@@ -66,7 +66,7 @@ export async function diagnoseIssue({ issue, records, policyVersion, allowedCate
   if (!issue || !ISSUE_TYPES.has(issue.type) || !isText(issue.id, 1, 200) || !isText(policyVersion, 1, 100))
     throw new DiagnosisError('INVALID_INPUT', 'Invalid issue or policy version');
   if (typeof reserveBudget !== 'function') throw new DiagnosisError('INVALID_INPUT', 'A durable budget reservation is required');
-  if (!Number.isInteger(maxAttempts) || maxAttempts < 1 || maxAttempts > 3 || !Number.isInteger(maxOutputTokens) || maxOutputTokens < 1 || maxOutputTokens > 1500)
+  if (!Number.isInteger(maxAttempts) || maxAttempts < 1 || maxAttempts > 3 || !Number.isInteger(maxOutputTokens) || maxOutputTokens < 1 || maxOutputTokens > 3000)
     throw new DiagnosisError('INVALID_INPUT', 'Invalid model limits');
   if (!Array.isArray(records)) throw new DiagnosisError('INVALID_INPUT', 'Evidence must be a list');
   let evidence = redactEvidence(records.slice(0, 20));
