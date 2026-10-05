@@ -7,6 +7,8 @@ import UiIcon from './UiIcon';
 
 type Account = { id: string; name: string; currency: string; kind?: string };
 type InventoryItem = { id: string; name: string; currency: string; sku?: string | null; squareCatalogObjectId?: string | null; unitCostMinor?: number | null; itemKind?: string };
+type CatalogTarget = { catalogObjectId: string; name: string; sku?: string | null; currency: string; archived?: boolean };
+type InventoryChoice = { id: string; name: string; sku?: string | null; squareCatalogObjectId?: string | null; unitCostMinor?: number | null; archived: boolean };
 type PurchaseLine = { lineId: string; lineNumber: number; description: string; quantityText?: string | null; packageQuantity?: number | null; unitsPerPackage?: number | null; lineAmountMinor?: number | null; unitPriceMinor?: number | null; suggestedUnitCostMinor?: number | null; sourceAmounts?: { lineAmount?: string | null; unitPrice?: string | null }; reviewFlags?: string[] };
 type PurchaseDraft = { supplier?: string | null; invoiceDate?: string | null; purchaseReference?: string | null; currency: string | null; totals?: { subtotalMinor?: number | null; discountMinor?: number | null; taxMinor?: number | null; shippingMinor?: number | null; otherChargesMinor?: number | null; totalMinor?: number | null; totalAmount?: string | null; rawAmounts?: Record<string, string | null> }; payment?: { status?: string; paidAt?: string | null; fundingHint?: string | null }; lines: PurchaseLine[]; reconciliation?: { lineTotalMinor?: number | null; documentTotalMinor?: number | null; unexplainedMinor?: number | null; status?: string }; extraction?: { model?: string; promptVersion?: string } };
 type Receipt = { id: string; status: string; activeDraftVersion?: number; filename?: string; originalFilename?: string; createdAt?: string; submittedAt?: string; evidenceFileId?: string; duplicateOfReceiptId?: string | null; lastErrorCode?: string | null };
@@ -66,6 +68,15 @@ export default function PurchaseReceipts({ organizationId, role, accounts, curre
   // Currency here is only a candidate-search hint. It never fills the human confirmation field.
   const detailQuery = useMemo(() => new URLSearchParams({ organizationId, currency: confirmedCurrency || currency }), [organizationId, currency, confirmedCurrency]);
   const displayCurrency = selected?.draft?.currency || confirmedCurrency || currency;
+  const candidateCatalogIds = useMemo(() => new Set((selected?.candidates ?? []).map(candidate => candidate.catalogObjectId)), [selected?.candidates]);
+  const costTargets = useMemo<CatalogTarget[]>(() => [
+    ...(selected?.candidates ?? []),
+    ...items.filter(item => item.squareCatalogObjectId && !candidateCatalogIds.has(item.squareCatalogObjectId)).map(item => ({ catalogObjectId: item.squareCatalogObjectId!, name: item.name, sku: item.sku, currency: item.currency, archived: false })),
+  ].filter(target => target.currency === displayCurrency).sort((a, b) => Number(Boolean(a.archived)) - Number(Boolean(b.archived)) || a.name.localeCompare(b.name)), [selected?.candidates, items, candidateCatalogIds, displayCurrency]);
+  const inventoryChoices = useMemo<InventoryChoice[]>(() => [
+    ...(selected?.candidates ?? []).filter(candidate => candidate.currency === displayCurrency).map(candidate => ({ id: `square:${candidate.catalogObjectId}`, name: candidate.name, sku: candidate.sku, squareCatalogObjectId: candidate.catalogObjectId, unitCostMinor: items.find(item => item.squareCatalogObjectId === candidate.catalogObjectId && item.currency === displayCurrency)?.unitCostMinor ?? null, archived: candidate.archived ?? false })),
+    ...items.filter(item => !item.squareCatalogObjectId || !candidateCatalogIds.has(item.squareCatalogObjectId)).filter(item => item.currency === displayCurrency).map(item => ({ ...item, archived: false })),
+  ], [selected?.candidates, items, candidateCatalogIds, displayCurrency]);
   const purchaseTotals = selected?.draft?.totals;
   const displayedSubtotal = purchaseTotals ? amountMinor(purchaseTotals.subtotalMinor, purchaseTotals.rawAmounts?.subtotal, displayCurrency) : null;
   const displayedDiscount = purchaseTotals ? amountMinor(purchaseTotals.discountMinor, purchaseTotals.rawAmounts?.discount, displayCurrency) : null;
@@ -80,6 +91,43 @@ export default function PurchaseReceipts({ organizationId, role, accounts, curre
   const priorPaidMinor = (selected?.effects ?? []).filter(effect => effect.effect_type === 'payment').reduce((sum, effect) => sum + (Number(effect.effect_payload.amountMinor) || 0), 0);
   const priorReceivedByLine = (lineId: string) => (selected?.effects ?? []).filter(effect => effect.effect_type === 'stock_receipt' && effect.source_line_id === lineId).reduce((sum, effect) => sum + (Number(effect.effect_payload.quantity) || 0), 0);
   const hasCostForLine = (lineId: string) => (selected?.effects ?? []).some(effect => effect.effect_type === 'cost_update' && effect.source_line_id === lineId);
+  const draftLines = selected?.draft?.lines ?? [];
+  const costSelectableLines = draftLines.filter(line => !hasCostForLine(line.lineId));
+  const stockSelectableLines = draftLines.filter(line => {
+    const orderedUnits = (line.packageQuantity ?? 0) * (line.unitsPerPackage ?? 0);
+    return orderedUnits <= 0 || priorReceivedByLine(line.lineId) < orderedUnits;
+  });
+  const allCostsSelected = costSelectableLines.length > 0 && costSelectableLines.every(line => choices[line.lineId]?.updateCost);
+  const someCostsSelected = costSelectableLines.some(line => choices[line.lineId]?.updateCost);
+  const allStockSelected = stockSelectableLines.length > 0 && stockSelectableLines.every(line => choices[line.lineId]?.receive);
+  const someStockSelected = stockSelectableLines.some(line => choices[line.lineId]?.receive);
+  const allEffectsSelected = (costSelectableLines.length === 0 || allCostsSelected) && (stockSelectableLines.length === 0 || allStockSelected) && (costSelectableLines.length > 0 || stockSelectableLines.length > 0);
+  const someEffectsSelected = someCostsSelected || someStockSelected;
+
+  function defaultCostCatalogId(itemId: string) {
+    const matchedVariation = inventoryChoices.find(item => item.id === itemId)?.squareCatalogObjectId;
+    return (matchedVariation && costTargets.some(target => target.catalogObjectId === matchedVariation) ? matchedVariation : null)
+      ?? costTargets.find(target => !target.archived)?.catalogObjectId
+      ?? costTargets[0]?.catalogObjectId
+      ?? '';
+  }
+
+  function setAllReceiptEffects(checked: boolean) {
+    setChoices(current => {
+      const next = { ...current };
+      for (const line of costSelectableLines) {
+        const choice = current[line.lineId];
+        if (!choice) continue;
+        next[line.lineId] = { ...choice, updateCost: checked, costCatalogObjectId: checked ? choice.costCatalogObjectId || defaultCostCatalogId(choice.itemId) : choice.costCatalogObjectId };
+      }
+      for (const line of stockSelectableLines) {
+        const choice = next[line.lineId] ?? current[line.lineId];
+        if (!choice) continue;
+        next[line.lineId] = { ...choice, receive: checked };
+      }
+      return next;
+    });
+  }
 
   async function load() {
     if (!organizationId) return;
@@ -145,6 +193,11 @@ export default function PurchaseReceipts({ organizationId, role, accounts, curre
   function patchLine(lineId: string, patch: Partial<LineChoice>) {
     setChoices(current => {
       const next = { ...current[lineId], ...patch };
+      if (patch.itemId !== undefined) {
+        const matchedVariation = inventoryChoices.find(item => item.id === patch.itemId)?.squareCatalogObjectId;
+        next.costCatalogObjectId = matchedVariation ?? '';
+      }
+      if (patch.updateCost === true) next.costCatalogObjectId = next.costCatalogObjectId || defaultCostCatalogId(next.itemId);
       if (patch.packageQuantity !== undefined || patch.unitsPerPackage !== undefined) {
         const orderedUnits = next.packageQuantity && next.unitsPerPackage ? Number(next.packageQuantity) * Number(next.unitsPerPackage) : 0;
         next.receivedQuantity = orderedUnits ? String(Math.max(0, orderedUnits - priorReceivedByLine(lineId))) : '';
@@ -287,8 +340,8 @@ export default function PurchaseReceipts({ organizationId, role, accounts, curre
 
   return <div className="purchase-receipts">
     <section className="panel">
-      <div className="panel-heading"><div><h2>Supplier receipts</h2><p>Review costs, stock, and payments separately.</p></div><button type="button" className="icon-button" onClick={() => void load()} disabled={loading || busy} aria-label="Refresh receipts" title="Refresh"><UiIcon name="refresh" /></button></div>
-      {canUpload && <form className="purchase-upload" onSubmit={uploadReceipt}><label>Supplier document<input type="file" accept="application/pdf,image/jpeg,image/png" required onChange={event => setFile(event.target.files?.[0] ?? null)} /></label><button className="primary with-icon" disabled={busy || !file}><UiIcon name="upload" />{busy ? 'Uploading…' : 'Upload'}</button><p className="field-hint">PDF, JPEG, or PNG. Upload starts extraction; financial effects still need approval.</p></form>}
+      <div className="panel-heading"><div><h2>Supplier receipts</h2></div><button type="button" className="icon-button" onClick={() => void load()} disabled={loading || busy} aria-label="Refresh receipts" title="Refresh"><UiIcon name="refresh" /></button></div>
+      {canUpload && <form className="purchase-upload" onSubmit={uploadReceipt}><label>Supplier document<input type="file" accept="application/pdf,image/jpeg,image/png" required onChange={event => setFile(event.target.files?.[0] ?? null)} /></label><button className="primary with-icon" disabled={busy || !file}><UiIcon name="upload" />{busy ? 'Uploading…' : 'Upload'}</button></form>}
       {error && <p className="error" role="alert">{error}</p>}{notice && <p className="purchase-success" role="status">{notice}</p>}
       <div className="purchase-receipt-list">{receipts.map(receipt => <button type="button" key={receipt.id} className={`purchase-receipt-row ${selected?.receipt.id === receipt.id ? 'selected' : ''}`} onClick={() => void openReceipt(receipt.id)}><span className="purchase-receipt-file">{receipt.originalFilename || receipt.filename || 'Supplier document'}<small>{receipt.submittedAt || receipt.createdAt ? new Date(receipt.submittedAt ?? receipt.createdAt!).toLocaleString() : receipt.id}{receipt.duplicateOfReceiptId ? ' · possible duplicate' : ''}</small></span><span className={`pill ${['posted','approved'].includes(receipt.status) ? 'good' : ['failed','rejected','duplicate'].includes(receipt.status) ? 'bad' : 'warn'}`}>{receipt.status.replaceAll('_', ' ')}</span></button>)}{!loading && receipts.length === 0 && <div className="inline-empty">No receipts yet.</div>}</div>
     </section>
@@ -297,27 +350,18 @@ export default function PurchaseReceipts({ organizationId, role, accounts, curre
       {selected.receipt.duplicateOfReceiptId && <div className="notice decision-context-warning">Possible duplicate. <button type="button" className="secondary with-icon" onClick={() => void openReceipt(selected.receipt.duplicateOfReceiptId!)}><UiIcon name="external" />View original</button></div>}
       {!selected.draft ? selected.receipt.status === 'failed' ? <div className="notice decision-context-warning"><b>Processing failed{selected.receipt.lastErrorCode ? ` · ${selected.receipt.lastErrorCode}` : ''}</b><span>Fix the processing issue, then retry. Receipts with a draft, decision, or financial effect cannot be retried.</span>{canReview && <div className="purchase-review-actions"><button type="button" className="secondary with-icon" disabled={busy} onClick={() => void reprocessFailedReceipt()}><UiIcon name="refresh" />Retry</button><button type="button" className="icon-button reject-button" disabled={busy} onClick={() => void deleteFailedReceipt()} aria-label="Delete failed receipt" title="Delete failed receipt"><UiIcon name="trash" /></button></div>}</div> : <div className="inline-empty">Extraction pending. Refresh to check status.</div> : <>
         {selected.receipt.lastErrorCode && ['failed','projection_pending'].includes(selected.receipt.status) && <div className="notice decision-context-warning"><b>Processing issue · {selected.receipt.lastErrorCode}</b></div>}
-        <div className={`notice ${selected.draft.reconciliation?.status === 'matched' ? 'purchase-match' : 'decision-context-warning'}`}><b>Reconciliation · {selected.draft.reconciliation?.status ?? 'incomplete'}</b><span>Lines {formatMoney(displayedLineTotal, displayCurrency)} · Total {formatMoney(displayedDocumentTotal, displayCurrency)} · Difference {formatMoney(displayedDifference, displayCurrency)}. Verify discounts and charges against the source.</span></div>
+        <div className={`notice ${selected.draft.reconciliation?.status === 'matched' ? 'purchase-match' : 'decision-context-warning'}`}><b>Reconciliation · {selected.draft.reconciliation?.status ?? 'incomplete'}</b><span>Lines {formatMoney(displayedLineTotal, displayCurrency)} · Total {formatMoney(displayedDocumentTotal, displayCurrency)} · Difference {formatMoney(displayedDifference, displayCurrency)}</span></div>
         {!selected.draft.currency && <label className="purchase-currency">Confirm currency from the source document<select required value={confirmedCurrency} onChange={event => confirmCurrency(event.target.value)}><option value="">Choose currency</option>{[...new Set([currency, ...accounts.map(account => account.currency)])].map(code => <option key={code} value={code}>{code}</option>)}</select></label>}
-        <div className="table-wrap"><table className="purchase-line-table"><thead><tr><th>Document line</th><th>Inventory identity</th><th>Packages × units</th><th className="numeric">Exact goods amount</th><th>Effects</th></tr></thead><tbody>{selected.draft.lines.map(line => {
+        <div className="table-wrap"><table className="purchase-line-table"><thead><tr><th>Document line</th><th>Inventory identity</th><th>Packages × units</th><th className="numeric">Exact goods amount</th><th><div className="purchase-effect-heading"><span>Effects</span><div className="purchase-effect-bulk"><label title="Select cost and stock effects for all available lines"><input ref={element => { if (element) element.indeterminate = someEffectsSelected && !allEffectsSelected; }} type="checkbox" aria-label="Select all cost and stock effects" checked={allEffectsSelected} disabled={!canReview || busy || (!costSelectableLines.length && !stockSelectableLines.length)} onChange={event => setAllReceiptEffects(event.currentTarget.checked)} />All</label></div></div></th></tr></thead><tbody>{selected.draft.lines.map(line => {
           const priorReceived = priorReceivedByLine(line.lineId);
           const choice = choices[line.lineId] ?? { itemId: '', costCatalogObjectId: '', effectiveFrom: selected.draft?.invoiceDate ?? new Date().toISOString().slice(0, 10), packageQuantity: '', unitsPerPackage: '', unitCost: '', costEdited: false, receive: false, receivedQuantity: '', receivedAt: localDateTime(), updateCost: false };
           const ext = Number(choice.packageQuantity) * Number(choice.unitsPerPackage);
           const exactLineAmount = amountMinor(line.lineAmountMinor, line.sourceAmounts?.lineAmount, displayCurrency);
-          const exactUnit = exactLineAmount != null && Number.isSafeInteger(ext) && ext > 0 ? calculatePackageUnitCostMinor(exactLineAmount, 1, ext)?.unitCostMinor ?? null : null;
-          const enteredCost = parseMinor(choice.unitCost, displayCurrency);
-          const rounding = enteredCost != null && exactUnit != null && exactLineAmount != null ? enteredCost * ext - exactLineAmount : 0;
-          const costTargets = [...(selected.candidates ?? []), ...items.filter(item => item.squareCatalogObjectId && !(selected.candidates ?? []).some(candidate => candidate.catalogObjectId === item.squareCatalogObjectId)).map(item => ({ catalogObjectId: item.squareCatalogObjectId!, name: item.name, sku: item.sku, currency: item.currency }))].filter(candidate => candidate.currency === displayCurrency);
-          const candidateCatalogIds = new Set((selected.candidates ?? []).map(candidate => candidate.catalogObjectId));
-          const inventoryChoices = [
-            ...(selected.candidates ?? []).filter(candidate => candidate.currency === displayCurrency).map(candidate => ({ id: `square:${candidate.catalogObjectId}`, name: candidate.name, sku: candidate.sku, squareCatalogObjectId: candidate.catalogObjectId, unitCostMinor: items.find(item => item.squareCatalogObjectId === candidate.catalogObjectId && item.currency === displayCurrency)?.unitCostMinor ?? null, archived: candidate.archived ?? false })),
-            ...items.filter(item => !item.squareCatalogObjectId || !candidateCatalogIds.has(item.squareCatalogObjectId)).filter(item => item.currency === displayCurrency).map(item => ({ ...item, archived: false })),
-          ];
-          return <tr key={line.lineId}><td><b>{line.description || `Line ${line.lineNumber}`}</b><small className="cell-sub">{line.reviewFlags?.length ? line.reviewFlags.join(' · ') : line.quantityText || 'Check source details'}</small><small className="cell-sub">Suggested rounded cost {formatMoney(exactUnit, displayCurrency)}</small></td>
-            <td><select value={choice.itemId} onChange={event => patchLine(line.lineId, { itemId: event.target.value })} disabled={!canReview}><option value="">Choose exact item</option>{inventoryChoices.map(item => <option key={item.id} value={item.id}>{item.name}{item.sku ? ` · ${item.sku}` : ''}{item.archived ? ' · archived Square item' : ''}</option>)}</select>{selected.candidates?.length ? <small className="cell-sub">Choose the exact variation. Stock needs a cost effective on the receipt date.</small> : null}</td>
+          return <tr key={line.lineId}><td><b>{line.description || `Line ${line.lineNumber}`}</b>{(line.reviewFlags?.length || line.quantityText) && <small className="cell-sub">{line.reviewFlags?.length ? line.reviewFlags.join(' · ') : line.quantityText}</small>}</td>
+            <td><select value={choice.itemId} onChange={event => patchLine(line.lineId, { itemId: event.target.value })} disabled={!canReview}><option value="">Choose item</option>{inventoryChoices.map(item => <option key={item.id} value={item.id}>{item.name}{item.sku ? ` · ${item.sku}` : ''}{item.archived ? ' · archived Square item' : ''}</option>)}</select></td>
             <td><div className="purchase-quantity-fields"><label>Packages<input type="number" min="1" step="1" value={choice.packageQuantity} onChange={event => patchLine(line.lineId, { packageQuantity: event.target.value })} disabled={!canReview} /></label><span>×</span><label>Units / package<input type="number" min="1" step="1" value={choice.unitsPerPackage} onChange={event => patchLine(line.lineId, { unitsPerPackage: event.target.value })} disabled={!canReview} /></label></div></td>
-            <td className="numeric">{formatMoney(exactLineAmount, displayCurrency)}<small className="cell-sub">{ext > 0 ? `${ext} units · ${exactUnit == null ? 'unit amount unavailable' : `${formatMoney(exactUnit, displayCurrency)} rounded / unit`}` : 'Confirm package contents'}{rounding ? ` · rounding difference ${formatMoney(rounding, displayCurrency)}` : ''}</small><label className="purchase-cost-input">Approved unit acquisition cost<input inputMode="decimal" value={choice.unitCost} onChange={event => patchLine(line.lineId, { unitCost: event.target.value, costEdited: true })} placeholder="0.00" disabled={!canReview || !displayCurrency} /></label></td>
-            <td>{hasCostForLine(line.lineId) ? <small className="cell-sub">Effective cost was already recorded for this line.</small> : <><label className="purchase-effect"><input type="checkbox" checked={choice.updateCost} onChange={event => patchLine(line.lineId, { updateCost: event.target.checked })} disabled={!canReview} /> Update effective item cost</label>{choice.updateCost && <div className="purchase-stock-fields"><label>Catalog variation for cost<select value={choice.costCatalogObjectId} onChange={event => patchLine(line.lineId, { costCatalogObjectId: event.target.value })} disabled={!canReview}><option value="">Choose exact variation</option>{costTargets.map(target => <option key={target.catalogObjectId} value={target.catalogObjectId}>{target.name}{target.sku ? ` · ${target.sku}` : ''}{'archived' in target && target.archived ? ' · archived Square item' : ''}</option>)}</select></label><label>Cost effective from<input type="date" value={choice.effectiveFrom} onChange={event => patchLine(line.lineId, { effectiveFrom: event.target.value })} disabled={!canReview} /></label></div>}</>}<small className="cell-sub">Previously received: {priorReceived}{ext > 0 ? ` · ${Math.max(0, ext - priorReceived)} remaining` : ''} units</small><label className="purchase-effect"><input type="checkbox" checked={choice.receive} onChange={event => patchLine(line.lineId, { receive: event.target.checked })} disabled={!canReview || (ext > 0 && priorReceived >= ext)} /> Record received stock</label>{choice.receive && <div className="purchase-stock-fields"><label>Units received<input type="number" min="1" max={ext > 0 ? Math.max(0, ext - priorReceived) : undefined} step="1" value={choice.receivedQuantity} onChange={event => patchLine(line.lineId, { receivedQuantity: event.target.value })} disabled={!canReview} /></label><label>Received at<input type="datetime-local" value={choice.receivedAt} onChange={event => patchLine(line.lineId, { receivedAt: event.target.value })} disabled={!canReview} /></label><small className="cell-sub">Cannot exceed {Math.max(0, ext - priorReceived) || 'confirmed ordered'} remaining units.</small></div>}</td>
+            <td className="numeric">{formatMoney(exactLineAmount, displayCurrency)}<label className="purchase-cost-input">Unit cost<input inputMode="decimal" value={choice.unitCost} onChange={event => patchLine(line.lineId, { unitCost: event.target.value, costEdited: true })} placeholder="0.00" disabled={!canReview || !displayCurrency} /></label></td>
+            <td>{hasCostForLine(line.lineId) ? <small className="cell-sub">Cost recorded</small> : <><label className="purchase-effect"><input type="checkbox" checked={choice.updateCost} onChange={event => patchLine(line.lineId, { updateCost: event.target.checked })} disabled={!canReview || busy} /> Update cost</label>{choice.updateCost && <div className="purchase-stock-fields"><label>Variation<select value={choice.costCatalogObjectId} onChange={event => patchLine(line.lineId, { costCatalogObjectId: event.target.value })} disabled={!canReview}><option value="">Choose variation</option>{costTargets.map(target => <option key={target.catalogObjectId} value={target.catalogObjectId}>{target.name}{target.sku ? ` · ${target.sku}` : ''}{target.archived ? ' · archived Square item' : ''}</option>)}</select></label><label>Effective from<input type="date" value={choice.effectiveFrom} onChange={event => patchLine(line.lineId, { effectiveFrom: event.target.value })} disabled={!canReview} /></label></div>}</>}<label className="purchase-effect"><input type="checkbox" checked={choice.receive} onChange={event => patchLine(line.lineId, { receive: event.target.checked })} disabled={!canReview || busy || (ext > 0 && priorReceived >= ext)} /> Receive stock</label>{choice.receive && <div className="purchase-stock-fields"><label>Units received<input type="number" min="1" max={ext > 0 ? Math.max(0, ext - priorReceived) : undefined} step="1" value={choice.receivedQuantity} onChange={event => patchLine(line.lineId, { receivedQuantity: event.target.value })} disabled={!canReview} /></label><label>Received at<input type="datetime-local" value={choice.receivedAt} onChange={event => patchLine(line.lineId, { receivedAt: event.target.value })} disabled={!canReview} /></label></div>}</td>
           </tr>;
         })}</tbody></table></div>
         <div className="purchase-totals"><span>Subtotal <b>{formatMoney(displayedSubtotal, displayCurrency)}</b></span><span>Discount <b>{formatMoney(displayedDiscount, displayCurrency)}</b></span><span>Tax <b>{formatMoney(displayedTax, displayCurrency)}</b></span><span>Shipping <b>{formatMoney(displayedShipping, displayCurrency)}</b></span><span>Other charges <b>{formatMoney(displayedOther, displayCurrency)}</b></span><span>Document total <b>{formatMoney(displayedDocumentTotal, displayCurrency)}</b></span></div>
