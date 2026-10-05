@@ -439,8 +439,8 @@ export function createWorker(dependencies) {
       const draft = await extractPurchaseReceipt({ text }, {
         apiKey: config.openRouterApiKey, fetchImpl, model: config.openRouterModel,
         maxOutputTokens: config.openRouterMaxOutputTokens ?? 1400,
-        reserveBudget: args => db.reservePurchaseReceiptModelBudget({ organizationId: job.organizationId, receiptId, ...args }),
-        recordUsage: args => db.recordPurchaseReceiptModelUsage({ organizationId: job.organizationId, receiptId, ...args }),
+        reserveBudget: args => db.reservePurchaseReceiptModelBudget({ organizationId: job.organizationId, receiptId, jobId: job.id, ...args }),
+        recordUsage: args => db.recordPurchaseReceiptModelUsage({ organizationId: job.organizationId, receiptId, jobId: job.id, ...args }),
       });
       const result = await db.savePurchaseReceiptDraftSystem({ organizationId: job.organizationId, receiptId, expectedVersion, draft });
       return { receiptId, outcome: 'needs_review', draftVersion: result?.version ?? result?.draftVersion ?? expectedVersion + 1 };

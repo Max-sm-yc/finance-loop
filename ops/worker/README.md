@@ -34,8 +34,11 @@ receipt's error code. `MODEL_AUTH_FAILED`, `MODEL_ACCESS_DENIED`, and
 `MODEL_REQUEST_REJECTED` points to an unsupported request or schema;
 `MODEL_RATE_LIMITED` and `MODEL_PROVIDER_UNAVAILABLE` are retried. Correct the
 Render worker configuration before retrying intake. A terminal failed receipt
-does not restart when its submission ID is reused; delete the failed receipt
-from the inbox and submit the document again with a new submission ID.
+can be retried by an owner or reviewer with **Reprocess document** after the
+underlying issue is corrected. Reprocessing keeps the same evidence and receipt
+ID but creates a fresh durable job and spends the organization's receipt model
+budget. Failed receipts with drafts, decisions, or financial effects cannot be
+reprocessed.
 
 `SUPABASE_PUBLISHABLE_KEY` is not used by worker requests. The image installs
 Poppler and Tesseract for searchable/scanned PDFs and JPEG/PNG receipts. Each

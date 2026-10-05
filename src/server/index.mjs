@@ -126,6 +126,10 @@ function safeThrown(error) {
   const safeDatabaseMessage=typeof error?.message==='string'?error.message.toLowerCase():'';
   if (error?.code==='P0001' || error?.code==='23505') {
     if (safeDatabaseMessage.includes('period_closed')) return bad(409,'PERIOD_CLOSED');
+    if (safeDatabaseMessage.includes('organization owner or reviewer role required')) return bad(403,'FORBIDDEN');
+    if (safeDatabaseMessage.includes('only failed receipts without drafts, decisions or effects can be reprocessed')) return bad(409,'RECEIPT_NOT_REPROCESSABLE');
+    if (safeDatabaseMessage.includes('receipt processing job is still active')) return bad(409,'RECEIPT_REPROCESS_IN_PROGRESS');
+    if (safeDatabaseMessage.includes('receipt source evidence is unavailable')) return bad(409,'RECEIPT_EVIDENCE_UNAVAILABLE');
     if (safeDatabaseMessage.includes('version conflict') || safeDatabaseMessage.includes('draft version')) return bad(409,'RECEIPT_VERSION_CONFLICT');
     if (safeDatabaseMessage.includes('idempotency key collision')) return bad(409,'IDEMPOTENCY_CONFLICT');
     if (safeDatabaseMessage.includes('currency')) return bad(409,'RECEIPT_CURRENCY_CONFLICT');
@@ -633,7 +637,7 @@ export function createHandlers(adapters) {
   const purchaseReceipts = run(async req => {
     const url=new URL(req.url), queryOrganizationId=url.searchParams.get('organizationId');
     const pathParts=url.pathname.split('/').filter(Boolean);
-    const action=['complete','approve','reject'].includes(pathParts.at(-1)) ? pathParts.at(-1) : null;
+    const action=['complete','approve','reject','reprocess'].includes(pathParts.at(-1)) ? pathParts.at(-1) : null;
     const receiptId=action ? pathParts.at(-2) : pathParts.at(-1);
     const actionBody=req.method==='POST'&&action ? await readJson(req,action==='approve'?80_000:32_000) : null;
     const deleteBody=req.method==='DELETE' ? await readJson(req,12_000) : null;
@@ -649,7 +653,8 @@ export function createHandlers(adapters) {
       const upload=await db.createPurchaseReceiptUploadUrl({objectKey:submission.objectKey});
       return created({receiptId:submission.receiptId,status:submission.status??'awaiting_upload',upload:{url:upload.url,token:upload.token,method:'PUT',contentType:body.contentType,headers:{'x-upsert':'false'}}});
     }
-    const actor=await authorize(req,organizationId,action==='complete'?['owner','operator','reviewer']:['owner','operator','reviewer','read_only']);
+    const actionRoles=action==='complete'?['owner','operator','reviewer']:action==='reprocess'?['owner','reviewer']:['owner','operator','reviewer','read_only'];
+    const actor=await authorize(req,organizationId,actionRoles);
     if (req.method==='GET' && !UUID.test(receiptId ?? '')) {
       const rows=await db.listPurchaseReceipts({organizationId,accessToken:actor.accessToken});
       return ok({receipts:rows.map(receiptPublicRecord)});
@@ -663,6 +668,12 @@ export function createHandlers(adapters) {
       if(receipt.status!=='failed'||Number(receipt.active_draft_version??receipt.activeDraftVersion??0)>0) throw new HttpError(409,'RECEIPT_NOT_DELETABLE');
       await db.deleteFailedPurchaseReceipt({organizationId,receiptId,accessToken:reviewer.accessToken});
       return ok({receiptId,deleted:true});
+    }
+    if(req.method==='POST'&&action==='reprocess') {
+      if(!exactObject(actionBody,['organizationId'])||actionBody.organizationId!==organizationId) throw new HttpError(400,'INVALID_RECEIPT_REPROCESS');
+      if(typeof db.reprocessFailedPurchaseReceipt!=='function') throw new HttpError(503,'RECEIPT_REPROCESS_UNAVAILABLE');
+      const result=await db.reprocessFailedPurchaseReceipt({organizationId,receiptId,accessToken:actor.accessToken});
+      return response(202,{receiptId,status:result?.status??'queued',jobId:result?.jobId??result?.job_id??null,alreadyQueued:result?.alreadyQueued??result?.already_queued??false});
     }
     if(req.method==='POST'&&action==='complete') {
       const body=actionBody;

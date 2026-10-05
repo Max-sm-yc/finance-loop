@@ -28,6 +28,10 @@ schema is available. The worker needs document-processing binaries and a
 server-only OpenRouter key for receipt extraction. No external credentials or live
 merchant evidence belong in SQL fixtures.
 
+Migration `202610050002_reprocess_failed_purchase_receipts.sql` adds the
+owner/reviewer-only audited retry for failed extractions without a draft or
+financial effects. It reuses the retained evidence while enqueuing a fresh job.
+
 See `../docs/PURCHASE_RECEIPTS.md` for operational verification and
 `../docs/POWER_AUTOMATE_SETUP.md` for unattended document delivery. Receipt intake
 does not grant the integration authority to approve financial records.

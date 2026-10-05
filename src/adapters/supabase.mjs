@@ -493,17 +493,17 @@ export function createSupabaseAdapters({ url, publishableKey, secretKey, tokenEn
       if (error) throw error;
       return data;
     },
-    async reservePurchaseReceiptModelBudget({ organizationId, receiptId, model, maxInputTokens, maxOutputTokens, maxAttempts }) {
+    async reservePurchaseReceiptModelBudget({ organizationId, receiptId, jobId, model, maxInputTokens, maxOutputTokens, maxAttempts }) {
       const { data, error } = await serviceRest().rpc('reserve_purchase_receipt_model_budget', {
-        p_organization_id: organizationId, p_receipt_id: receiptId, p_model_id: model,
+        p_organization_id: organizationId, p_receipt_id: receiptId, ...(jobId ? { p_run_id: jobId } : {}), p_model_id: model,
         p_max_input_tokens: maxInputTokens, p_max_output_tokens: maxOutputTokens, p_max_attempts: maxAttempts,
       });
       if (error) throw error;
       return data === true;
     },
-    async recordPurchaseReceiptModelUsage({ organizationId, receiptId, model, usage, attempt }) {
+    async recordPurchaseReceiptModelUsage({ organizationId, receiptId, jobId, model, usage, attempt }) {
       const { data, error } = await serviceRest().rpc('record_purchase_receipt_model_usage', {
-        p_organization_id: organizationId, p_receipt_id: receiptId, p_model_id: model,
+        p_organization_id: organizationId, p_receipt_id: receiptId, ...(jobId ? { p_run_id: jobId } : {}), p_model_id: model,
         p_usage: usage ?? {}, p_attempt: attempt,
       });
       if (error) throw error;
@@ -516,6 +516,13 @@ export function createSupabaseAdapters({ url, publishableKey, secretKey, tokenEn
     },
     async deleteFailedPurchaseReceipt({ organizationId, receiptId, accessToken }) {
       const { data, error } = await userRest(accessToken).rpc('delete_failed_purchase_receipt', {
+        p_organization_id: organizationId, p_receipt_id: receiptId,
+      });
+      if (error) throw error;
+      return data;
+    },
+    async reprocessFailedPurchaseReceipt({ organizationId, receiptId, accessToken }) {
+      const { data, error } = await userRest(accessToken).rpc('reprocess_failed_purchase_receipt', {
         p_organization_id: organizationId, p_receipt_id: receiptId,
       });
       if (error) throw error;
