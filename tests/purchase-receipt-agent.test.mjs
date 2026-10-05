@@ -29,6 +29,26 @@ test('purchase receipt extraction accepts 3000 output tokens and rejects larger 
   }),{code:'INVALID_INPUT'});
 });
 
+test('retries one invalid structured response within the reserved two model attempts',async()=>{
+  let calls=0;
+  let reservation;
+  const usageAttempts=[];
+  const draft=await extractPurchaseReceipt({text:'Supplier receipt'}, {
+    apiKey:'test-only',maxOutputTokens:3000,
+    reserveBudget:async args=>{reservation=args;return true;},
+    recordUsage:async args=>{usageAttempts.push(args.attempt);},
+    fetchImpl:async()=>{
+      calls++;
+      const content=calls===1?'{invalid json':JSON.stringify(base());
+      return new Response(JSON.stringify({choices:[{message:{content}}],usage:{prompt_tokens:100,completion_tokens:200}}),{status:200,headers:{'content-type':'application/json'}});
+    },
+  });
+  assert.equal(draft.documentKind,'receipt');
+  assert.equal(calls,2);
+  assert.equal(reservation.maxAttempts,2);
+  assert.deepEqual(usageAttempts,[1,2]);
+});
+
 test('reconciles net item amounts with separately printed discount, tax, shipping and total',async()=>{
   let reserved, recorded;
   const draft=await extractPurchaseReceipt({text:'[page 1]\nKit Kat 36 pack\nQty 5\n$42.56 each\n$212.80\nSubtotal $468.74\nSavings $4.00\nShipping $8.00\nTax $4.14\nTotal $476.88'}, {
