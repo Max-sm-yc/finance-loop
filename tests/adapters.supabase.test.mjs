@@ -265,6 +265,10 @@ test('dashboard returns actual projection or explicit unavailable values and ten
   assert.equal(dashboard.cash, null);
   assert.equal(dashboard.accounts.length, 1);
   assert.ok(dashboard.flags.some(flag => flag.code === 'PROJECTION_UNAVAILABLE'));
+  const projectionRequest = calls.find(call => call.url.includes('/projection_runs?'));
+  const projectionUrl = new URL(projectionRequest.url);
+  assert.equal(projectionUrl.searchParams.get('period_start'), 'eq.2026-01-01T00:00:00Z');
+  assert.equal(projectionUrl.searchParams.get('period_end'), 'eq.2026-02-01T00:00:00Z');
   assert.ok(calls.every(call => {
     const url = new URL(call.url);
     return url.searchParams.get(url.pathname.endsWith('/organizations') ? 'id' : 'organization_id') === `eq.${org}`;

@@ -721,19 +721,24 @@ export function createSupabaseAdapters({ url, publishableKey, secretKey, tokenEn
       const accountQuery = new URLSearchParams({ select: 'id,name,kind,currency,active', organization_id: eq(organizationId), order: 'name.asc', limit: '500' });
       const policyQuery = new URLSearchParams({ select: 'currency,timezone,tax_treatment,inventory_cost_method,gift_card_treatment,reconciliation_tolerance_minor', organization_id: eq(organizationId), limit: '2' });
       if (accountId) accountQuery.set('id', eq(accountId));
-      const runQuery = new URLSearchParams({ select: '*', organization_id: eq(organizationId), period_start: `gte.${from}`, period_end: `lte.${to}`, order: 'created_at.desc', limit: '1' });
+      const runQuery = new URLSearchParams({ select: '*', organization_id: eq(organizationId), period_start: eq(from), period_end: eq(to), order: 'created_at.desc', limit: '1' });
       const [orgRows, accounts, policies, rows, workerHealth] = await Promise.all([
         table(rest, 'organizations', orgQuery), table(rest, 'accounts', accountQuery),
         table(rest, 'organization_accounting_policies', policyQuery), table(rest, 'projection_runs', runQuery),
         getWorkerHealth(organizationId),
       ]);
       const latest = rows[0] ?? null;
-      const result = latest?.result ?? null;
+      const sourceRevision = Number.isSafeInteger(workerHealth?.sourceRevision) ? workerHealth.sourceRevision : null;
+      const storedProjectionRevision = Number(latest?.source_snapshot?.sourceRevision);
+      const projectionCurrent = Boolean(latest && latest.status !== 'failed'
+        && (sourceRevision === null || (Number.isSafeInteger(storedProjectionRevision) && storedProjectionRevision === sourceRevision)));
+      const result = projectionCurrent ? latest?.result ?? null : null;
       const flags = Array.isArray(result?.issues) ? result.issues.map(issue => ({
         code: String(issue.code ?? 'PROJECTION_ISSUE').slice(0, 100),
         message: String(issue.message ?? 'Projection issue requires review.').slice(0, 500)
       })) : [];
       if (!latest) flags.push({ code: 'PROJECTION_UNAVAILABLE', message: 'No projection is available for this period.', severity: 'info' });
+      else if (!projectionCurrent) flags.push({ code: 'PROJECTION_STALE', message: 'The projection does not match the latest source data. Sync this period to rebuild it.', severity: 'info' });
       if (!workerHealth) flags.push({ code: 'SOURCE_FRESHNESS_UNAVAILABLE', message: 'Source sync freshness is unavailable.', severity: 'info' });
       const organization = one(orgRows, 'organization');
       const policy = one(policies, 'accounting policy');
@@ -746,6 +751,8 @@ export function createSupabaseAdapters({ url, publishableKey, secretKey, tokenEn
         organization,
         period: { from, to, accountId: accountId ?? null, currency: selectedAccount?.currency ?? policy?.currency ?? organization?.base_currency ?? null, toleranceMinor: policy?.reconciliation_tolerance_minor ?? null },
         projectionVersion: latest?.calculation_version ?? null,
+        projectionCurrent,
+        sourceRevision,
         freshness: { status: workerHealth?.status ?? 'unknown', lastSyncedAt: workerHealth?.lastSuccessfulSyncAt ?? null },
         income: result?.income ?? null,
         cash,

@@ -7,12 +7,12 @@ const org = '11111111-1111-4111-8111-111111111111';
 const account = '22222222-2222-4222-8222-222222222222';
 const user = '33333333-3333-4333-8333-333333333333';
 
-function setup({ role = 'operator', proposalFixture = false, proposalType = 'unknown_item', proposalPolicyVersion = 'policy-v1', fetchImpl, budgetAllowed = true, receiptAgentMaxOutputTokens = 900, inventoryFlag = false, analyticsFlag = false, inventoryServerFlag = false, analyticsServerFlag = false, squareLocations = [{ id: 'square-location-1' }], squareCatalog, syncCoverage } = {}) {
+function setup({ role = 'operator', proposalFixture = false, proposalType = 'unknown_item', proposalPolicyVersion = 'policy-v1', fetchImpl, budgetAllowed = true, receiptAgentMaxOutputTokens = 900, inventoryFlag = false, analyticsFlag = false, inventoryServerFlag = false, analyticsServerFlag = false, squareLocations = [{ id: 'square-location-1' }], squareCatalog, syncCoverage, dashboardProjectionCurrent = true } = {}) {
   const calls = [];
   const inboxIds = new Set();
   const db = {
     async getMembership(arg) { calls.push(['membership', arg]); return { role }; },
-    async getDashboard(arg) { calls.push(['dashboard', arg]); return { income: { status: 'complete' }, freshness: 'fresh' }; },
+    async getDashboard(arg) { calls.push(['dashboard', arg]); return { income: { status: 'complete' }, freshness: 'fresh', projectionCurrent: dashboardProjectionCurrent }; },
     async listIssues(arg) { calls.push(['issues', arg]); return []; },
     async listManualMovements(arg) { calls.push(['movements', arg]); return []; },
     async listObservations(arg) { calls.push(['observations', arg]); return []; },
@@ -253,6 +253,27 @@ test('sync skips a fully covered period when source health is fresh', async () =
   assert.deepEqual(await read(response), { skipped: true, reason: 'PERIOD_CURRENT', startAt: body.startAt, endAt: body.endAt });
   assert.equal(calls.some(call => call[0] === 'square-locations'), false);
   assert.equal(calls.some(call => call[0] === 'sync'), false);
+});
+
+test('sync refreshes a whole covered period when its exact projection is missing', async () => {
+  const app = setup({ role: 'owner', dashboardProjectionCurrent: false, syncCoverage: {
+    windows: [
+      { from: '2026-01-01T00:00:00Z', to: '2026-01-15T00:00:00Z' },
+      { from: '2026-01-15T00:00:00Z', to: '2026-02-01T00:00:00Z' },
+    ], pendingWindows: [], sourceHealthFresh: true,
+    sourceGaps: { missingParentOrderLineCount: 0, missingPayoutEntryHealthCount: 0 },
+  } });
+  const body = { organizationId: org, startAt: '2026-01-01T00:00:00Z', endAt: '2026-02-01T00:00:00Z' };
+  const response = await app.handlers.sync(post('/api/sync', body, { 'idempotency-key': 'sync:projection-missing' }));
+  assert.equal(response.status, 201);
+  assert.equal((await read(response)).syncScope, 'period');
+  assert.deepEqual(app.calls.find(call => call[0] === 'dashboard')[1], {
+    organizationId: org, accountId: null, from: body.startAt, to: body.endAt, accessToken: 'valid.jwt.token',
+  });
+  const queued = app.calls.filter(call => call[0] === 'sync').map(call => call[1]);
+  assert.deepEqual(queued.map(({ startAt, endAt }) => ({ startAt, endAt })), [
+    { startAt: body.startAt, endAt: body.endAt },
+  ]);
 });
 
 test('sync queues only uncovered gaps when existing coverage and source health are fresh', async () => {

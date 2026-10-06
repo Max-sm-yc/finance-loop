@@ -371,10 +371,22 @@ export function createHandlers(adapters) {
     const canTrustCoverage = coverage && typeof coverage.sourceHealthFresh === 'boolean' && Array.isArray(coverage.windows)
       && Array.isArray(coverage.pendingWindows)
       && Number.isSafeInteger(sourceGaps.missingParentOrderLineCount) && Number.isSafeInteger(sourceGaps.missingPayoutEntryHealthCount);
-    if (canTrustCoverage && coverage.sourceHealthFresh && !hasSourceGaps && gaps.length === 0) {
-      return ok({ skipped: true, reason: 'PERIOD_CURRENT', startAt: body.startAt, endAt: body.endAt });
+    const coverageCurrent = canTrustCoverage && coverage.sourceHealthFresh && !hasSourceGaps && gaps.length === 0;
+    let projectionCurrent = false;
+    if (coverageCurrent) {
+      const dashboard = await db.getDashboard({ organizationId: body.organizationId, accountId: null,
+        from: body.startAt, to: body.endAt, accessToken: actor.accessToken });
+      projectionCurrent = dashboard?.projectionCurrent === true;
+      if (projectionCurrent) {
+        return ok({ skipped: true, reason: 'PERIOD_CURRENT', startAt: body.startAt, endAt: body.endAt });
+      }
     }
-    const refreshWholeWindow = !canTrustCoverage || !coverage.sourceHealthFresh || hasSourceGaps;
+    if (coverageCurrent && !projectionCurrent && pendingWindows.some(window =>
+      Number.isFinite(Date.parse(window?.from)) && Number.isFinite(Date.parse(window?.to))
+      && Date.parse(window.from) < Date.parse(body.endAt) && Date.parse(window.to) > Date.parse(body.startAt))) {
+      return ok({ skipped: true, reason: 'SYNC_IN_PROGRESS', startAt: body.startAt, endAt: body.endAt });
+    }
+    const refreshWholeWindow = !canTrustCoverage || !coverage.sourceHealthFresh || hasSourceGaps || (coverageCurrent && !projectionCurrent);
     const plannedWindows = refreshWholeWindow ? [{ startAt: body.startAt, endAt: body.endAt }] : gaps;
     const windowsToSync = plannedWindows.flatMap(window => uncoveredWindows(pendingWindows, window.startAt, window.endAt));
     if (!windowsToSync.length) return ok({ skipped: true, reason: 'SYNC_IN_PROGRESS', startAt: body.startAt, endAt: body.endAt });
