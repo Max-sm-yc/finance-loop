@@ -4,6 +4,7 @@ import { backfillSquare, normalizeOrder, normalizePayment, normalizeRefund, norm
 import { refreshAccessToken } from '../square/client.mjs';
 import { diagnoseIssue } from '../agent/diagnosis.mjs';
 import { extractPurchaseReceipt, PURCHASE_RECEIPT_MODEL } from '../agent/purchase-receipt.mjs';
+import { buildReceiptInventoryChoices, JevInventoryMatchError, matchReceiptLinesWithJev } from '../agent/jev-inventory-match.mjs';
 import { extractDocumentText } from './purchase-receipt-document.mjs';
 
 const JOBS = new Set(['square.webhook', 'square.sync', 'projection.replay', 'issue.investigate', 'receipt.process']);
@@ -443,8 +444,11 @@ export function createWorker(dependencies) {
         reserveBudget: args => db.reservePurchaseReceiptModelBudget({ organizationId: job.organizationId, receiptId, jobId: job.id, ...args }),
         recordUsage: args => db.recordPurchaseReceiptModelUsage({ organizationId: job.organizationId, receiptId, jobId: job.id, ...args }),
       });
-      const result = await db.savePurchaseReceiptDraftSystem({ organizationId: job.organizationId, receiptId, expectedVersion, draft });
-      return { receiptId, outcome: 'needs_review', draftVersion: result?.version ?? result?.draftVersion ?? expectedVersion + 1 };
+      const inventoryMatching = await suggestReceiptInventoryMatches({ job, receiptId, draft });
+      const reviewDraft = { ...draft, inventoryMatching };
+      const result = await db.savePurchaseReceiptDraftSystem({ organizationId: job.organizationId, receiptId, expectedVersion, draft: reviewDraft });
+      return { receiptId, outcome: 'needs_review', draftVersion: result?.version ?? result?.draftVersion ?? expectedVersion + 1,
+        inventoryMatchingStatus: inventoryMatching.status };
     } catch (error) {
       const code = typeof error?.code === 'string' && /^[A-Z0-9_.-]{1,80}$/.test(error.code) ? error.code : 'RECEIPT_PROCESSING_FAILED';
       if (receipt && (error.permanent || code === 'BUDGET_EXCEEDED' || code === 'MODEL_UNAVAILABLE' || code === 'MODEL_INVALID_RESPONSE')) {
@@ -452,6 +456,46 @@ export function createWorker(dependencies) {
         error.permanent = true;
       }
       throw error;
+    }
+  }
+
+  async function suggestReceiptInventoryMatches({ job, receiptId, draft }) {
+    if (!/^[A-Z]{3}$/.test(draft.currency ?? '')) {
+      return { status: 'awaiting_currency_confirmation', matches: [] };
+    }
+    if (typeof db.getPurchaseReceiptMatchingOptionsSystem !== 'function'
+        || typeof db.reservePurchaseReceiptJevBudget !== 'function'
+        || typeof db.recordPurchaseReceiptJevUsage !== 'function') {
+      return { status: 'unavailable', errorCode: 'JEV_MATCHING_UNAVAILABLE', matches: [] };
+    }
+    try {
+      const { catalogRows, inventoryRows } = await db.getPurchaseReceiptMatchingOptionsSystem({
+        organizationId: job.organizationId, currency: draft.currency, asOf: new Date().toISOString(),
+      });
+      const inventoryChoices = buildReceiptInventoryChoices({ catalogRows, inventoryRows, currency: draft.currency });
+      const result = await matchReceiptLinesWithJev({
+        lines: draft.lines,
+        inventoryItems: inventoryChoices,
+        apiKey: config.openRouterApiKey,
+        fetchImpl,
+        reserveBudget: args => db.reservePurchaseReceiptJevBudget({
+          organizationId: job.organizationId, receiptId, jobId: job.id, ...args,
+        }),
+        recordUsage: args => db.recordPurchaseReceiptJevUsage({
+          organizationId: job.organizationId, receiptId, jobId: job.id, ...args,
+        }),
+      });
+      return { status: 'completed', model: result.model, matches: result.matches };
+    } catch (error) {
+      const errorCode = error instanceof JevInventoryMatchError
+        ? error.code
+        : typeof error?.code === 'string' && /^[A-Z0-9_.-]{1,80}$/.test(error.code)
+          ? error.code : 'JEV_MATCHING_UNAVAILABLE';
+      return {
+        status: errorCode === 'BUDGET_EXCEEDED' ? 'budget_exceeded' : 'unavailable',
+        errorCode,
+        matches: [],
+      };
     }
   }
 

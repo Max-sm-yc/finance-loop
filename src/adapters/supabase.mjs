@@ -509,13 +509,53 @@ export function createSupabaseAdapters({ url, publishableKey, secretKey, tokenEn
       if (error) throw error;
       return data;
     },
+    async getPurchaseReceiptMatchingOptionsSystem({ organizationId, currency, asOf }) {
+      const rest = serviceRest();
+      const definitionsQuery = new URLSearchParams({
+        select: 'id,sku,square_catalog_object_id,name,currency,effective_from,effective_until',
+        organization_id: eq(organizationId), effective_from: `lte.${asOf}`, order: 'name.asc,effective_from.desc', limit: '1000',
+      });
+      definitionsQuery.set('or', `(effective_until.is.null,effective_until.gt.${asOf})`);
+      const manualQuery = new URLSearchParams({
+        select: 'id,sku,name,currency', organization_id: eq(organizationId), order: 'name.asc', limit: '1000',
+      });
+      const [catalogResult, definitions, manualItems] = await Promise.all([
+        rest.rpc('list_purchase_receipt_catalog_candidates', { p_organization_id: organizationId, p_currency: currency }),
+        table(rest, 'item_definitions', definitionsQuery),
+        table(rest, 'inventory_items', manualQuery),
+      ]);
+      if (catalogResult.error) throw catalogResult.error;
+      return {
+        catalogRows: Array.isArray(catalogResult.data) ? catalogResult.data : [],
+        inventoryRows: [
+          ...definitions.map(item => ({ ...item, item_kind: 'catalog' })),
+          ...manualItems.map(item => ({ ...item, square_catalog_object_id: null, item_kind: 'manual' })),
+        ],
+      };
+    },
+    async reservePurchaseReceiptJevBudget({ organizationId, receiptId, jobId, runId, model, maxInputTokens, maxOutputTokens, maxAttempts }) {
+      const { data, error } = await serviceRest().rpc('reserve_purchase_receipt_jev_budget', {
+        p_organization_id: organizationId, p_receipt_id: receiptId, p_job_id: jobId, p_run_id: runId,
+        p_model_id: model, p_max_input_tokens: maxInputTokens, p_max_output_tokens: maxOutputTokens, p_max_attempts: maxAttempts,
+      });
+      if (error) throw error;
+      return data === true;
+    },
+    async recordPurchaseReceiptJevUsage({ organizationId, receiptId, jobId, runId, model, usage, attempt }) {
+      const { data, error } = await serviceRest().rpc('record_purchase_receipt_jev_usage', {
+        p_organization_id: organizationId, p_receipt_id: receiptId, p_job_id: jobId, p_run_id: runId,
+        p_model_id: model, p_usage: usage ?? {}, p_attempt: attempt,
+      });
+      if (error) throw error;
+      return data === true;
+    },
     async failPurchaseReceiptProcessing({ organizationId, receiptId, code }) {
       const { data, error } = await serviceRest().rpc('fail_purchase_receipt_processing', { p_organization_id: organizationId, p_receipt_id: receiptId, p_code: code });
       if (error) throw error;
       return data;
     },
-    async deleteFailedPurchaseReceipt({ organizationId, receiptId, accessToken }) {
-      const { data, error } = await userRest(accessToken).rpc('delete_failed_purchase_receipt', {
+    async deletePurchaseReceipt({ organizationId, receiptId, accessToken }) {
+      const { data, error } = await userRest(accessToken).rpc('delete_purchase_receipt', {
         p_organization_id: organizationId, p_receipt_id: receiptId,
       });
       if (error) throw error;

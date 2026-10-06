@@ -32,6 +32,13 @@ Migration `202610050002_reprocess_failed_purchase_receipts.sql` adds the
 owner/reviewer-only audited retry for failed extractions without a draft or
 financial effects. It reuses the retained evidence while enqueuing a fresh job.
 
+Migration `202610050008_jev_receipt_autorun.sql` adds the worker-scoped Jev
+matching budget RPCs and lets the worker read organization-scoped receipt
+catalog candidates. Receipt processing now saves Jev's suggestions with the
+extraction draft when its currency is known. Apply the migration only after
+reviewing the linked project and migration history; production `db push`
+requires explicit user authorization.
+
 See `../docs/PURCHASE_RECEIPTS.md` for operational verification and
 `../docs/POWER_AUTOMATE_SETUP.md` for unattended document delivery. Receipt intake
 does not grant the integration authority to approve financial records.

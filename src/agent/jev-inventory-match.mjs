@@ -34,6 +34,32 @@ function redactText(value) {
 
 function questionKey(index) { return `line_${index}`; }
 
+/** Normalize the inventory options shared by the browser endpoint and worker.
+ * Square variation IDs use the same browser-facing key in both paths.
+ */
+export function buildReceiptInventoryChoices({ catalogRows = [], inventoryRows = [], currency }) {
+  const inventoryChoices = [];
+  const seenInventoryIds = new Set();
+  const validText = (value, max) => typeof value === 'string' && value.trim().length > 0 && value.length <= max;
+  for (const candidate of catalogRows ?? []) {
+    if (candidate?.currency !== currency || !validText(candidate.catalogObjectId, 200) || !validText(candidate.name, 200)) continue;
+    const id = `square:${candidate.catalogObjectId}`;
+    if (seenInventoryIds.has(id)) continue;
+    seenInventoryIds.add(id);
+    inventoryChoices.push({ id, name: candidate.name, sku: typeof candidate.sku === 'string' ? candidate.sku : null, currency: candidate.currency });
+  }
+  for (const item of inventoryRows ?? []) {
+    if (item?.currency !== currency || !validText(item.name, 200)) continue;
+    const squareCatalogObjectId = typeof item.square_catalog_object_id === 'string' && item.square_catalog_object_id
+      ? item.square_catalog_object_id : null;
+    const id = squareCatalogObjectId ? `square:${squareCatalogObjectId}` : item.id;
+    if (!validText(id, 220) || seenInventoryIds.has(id)) continue;
+    seenInventoryIds.add(id);
+    inventoryChoices.push({ id, name: item.name, sku: typeof item.sku === 'string' ? item.sku : null, currency: item.currency });
+  }
+  return inventoryChoices;
+}
+
 async function mapWithConcurrency(values, concurrency, mapper) {
   const results = new Array(values.length);
   let nextIndex = 0;

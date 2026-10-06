@@ -6,7 +6,7 @@ import { createHandlers } from '../src/server/index.mjs';
 const org='11111111-1111-4111-8111-111111111111', receiptId='55555555-5555-4555-8555-555555555555';
 const userToken='valid.user.jwt', integrationToken='flpr_abcdefghijklmnopqrstuvwxyz0123456789';
 const bytes=Buffer.from('%PDF-1.7\nminimal test fixture');
-function harness({role='owner',receiptBytes=bytes,receiptStatus='needs_review',draftVersion=2}={}) {
+function harness({role='owner',receiptBytes=bytes,receiptStatus='needs_review',draftVersion=2,budgetError}={}) {
   const calls=[];
   const db={
     async getMembership(args){calls.push(['membership',args]);return {role};},
@@ -23,10 +23,13 @@ function harness({role='owner',receiptBytes=bytes,receiptStatus='needs_review',d
     async completePurchaseReceiptUpload(args){calls.push(['complete',args]);return {receiptId,status:'queued',jobId:'job-1'};},
     async getPurchaseReceiptForIntegration(args){calls.push(['integrationReceipt',args]);return {id:receiptId,status:'awaiting_upload',original_filename:'source.pdf',declared_mime_type:'application/pdf'};},
     async getPurchaseReceipt(args){calls.push(['getReceipt',args]);return {id:receiptId,status:receiptStatus,active_draft_version:draftVersion,original_filename:'source.pdf',declared_mime_type:'application/pdf',submitted_at:'2026-10-03T00:00:00Z',evidence_file_id:null};},
-    async deleteFailedPurchaseReceipt(args){calls.push(['deleteReceipt',args]);return {receiptId,deleted:true};},
-    async getPurchaseReceiptDraft(args){calls.push(['getDraft',args]);return {version:2,draft:{documentKind:'receipt',currency:null,totals:{totalMinor:47688,totalAmount:'476.88'},lines:[{lineId:'line-1'}]}};},
+    async deletePurchaseReceipt(args){calls.push(['deleteReceipt',args]);return {receiptId,deleted:true};},
+    async getPurchaseReceiptDraft(args){calls.push(['getDraft',args]);return {version:2,draft:{documentKind:'receipt',currency:null,totals:{totalMinor:47688,totalAmount:'476.88'},lines:[{lineId:'line-1',description:'Tea'}]}};},
     async listPurchaseReceipts(){return [];}, async listPurchaseReceiptCatalogCandidates(){return [{catalogObjectId:'variation-1',name:'Tea',sku:'T-1',currency:'USD'}];},
     async listInventoryItems(){return [{id:'88888888-8888-4888-8888-888888888888',name:'Tea',sku:'T-1',currency:'USD',square_catalog_object_id:'variation-1',item_kind:'catalog'}];},
+    async getOrganizationFeatureFlags(){return {inventoryTracking:true};},
+    async reserveReceiptModelBudget(args){calls.push(['receiptBudget',args]);if(budgetError)throw budgetError;return true;},
+    async recordReceiptModelUsage(args){calls.push(['receiptUsage',args]);return true;},
     async getEvidenceSignedUrl(){return {url:'https://storage.test/view?token=short'};},
     async listPurchaseReceiptEffects(){return []},async listPurchaseReceiptDecisions(){return []},
     async approvePurchaseReceipt(args){calls.push(['approve',args]);return {receiptId,status:'projection_pending'};},
@@ -34,33 +37,41 @@ function harness({role='owner',receiptBytes=bytes,receiptStatus='needs_review',d
   };
   const queue={async enqueueSquareSync(){return {id:'sync'}},async enqueueSquareWebhook(){},async enqueueProjectionReplay(){return {id:'replay'}}};
   const supabase={auth:{async getUser(token){return token===userToken?{data:{user:{id:'user-1'}},error:null}:{data:null,error:new Error('bad token')};}}};
-  return {handlers:createHandlers({supabase,db,queue,config:{inventoryTrackingEnabled:true,productAnalyticsEnabled:false},webhookInbox:{async putIfAbsent(){return {inserted:true}}}}),calls};
+  const fetchImpl=async(_url,init)=>{
+    const body=JSON.parse(init.body);
+    const answers=Object.fromEntries(Object.keys(body.questions).map(key=>{
+      const choices=Object.keys(body.questions[key].criteria),choice=choices.find(value=>value.startsWith('item_'))??'__none__';
+      return [key,{type:'choice',choice,confidence:0.9,probabilities:Object.fromEntries(choices.map(value=>[value,value===choice?0.9:0.1/(choices.length-1)]))}];
+    }));
+    return new Response(JSON.stringify({model:'typesafe/jev-1.13',usage:{input_tokens:100,output_tokens:20},answers}),{status:200});
+  };
+  return {handlers:createHandlers({supabase,db,queue,fetchImpl,config:{inventoryTrackingEnabled:true,productAnalyticsEnabled:false,openRouterApiKey:'test-only-key'},webhookInbox:{async putIfAbsent(){return {inserted:true}}}}),calls};
 }
 const auth={authorization:`Bearer ${userToken}`};
 const post=(url,body,headers={})=>new Request(`https://app.test${url}`,{method:'POST',headers:{...auth,'content-type':'application/json',...headers},body:JSON.stringify(body)});
 
 const deleteRequest=(body={organizationId:org})=>new Request(`https://app.test/api/purchase-receipts/${receiptId}`,{method:'DELETE',headers:{...auth,'content-type':'application/json'},body:JSON.stringify(body)});
-test('owner and reviewer delete failed receipts using their caller JWT',async()=>{
+test('owner and reviewer delete any receipt using their caller JWT while preserving server authorization',async()=>{
   for(const role of ['owner','reviewer']) {
-    const {handlers,calls}=harness({role,receiptStatus:'failed',draftVersion:null});
+    const {handlers,calls}=harness({role,receiptStatus:'posted',draftVersion:2});
     const response=await handlers.purchaseReceipts(deleteRequest());
     assert.equal(response.status,200);
     assert.deepEqual(calls.find(call=>call[0]==='deleteReceipt')[1],{organizationId:org,receiptId,accessToken:userToken});
     assert.ok(!calls.some(call=>['download','approve','reject'].includes(call[0])));
   }
 });
-test('operators and read-only members cannot delete failed receipts',async()=>{
+test('operators and read-only members cannot delete receipts',async()=>{
   for(const role of ['operator','read_only']) {
     const {handlers,calls}=harness({role,receiptStatus:'failed',draftVersion:null});
     assert.equal((await handlers.purchaseReceipts(deleteRequest())).status,403);
     assert.ok(!calls.some(call=>call[0]==='deleteReceipt'));
   }
 });
-test('receipt deletion rejects non-failed states and receipts with a draft',async()=>{
-  for(const [receiptStatus,draftVersion] of [['queued',null],['processing',null],['needs_review',2],['posted',2],['failed',2]]) {
+test('receipt deletion accepts all workflow states, including receipts with drafts',async()=>{
+  for(const [receiptStatus,draftVersion] of [['awaiting_upload',null],['queued',null],['processing',null],['needs_review',2],['posted',2],['rejected',2],['duplicate',null],['failed',2]]) {
     const {handlers,calls}=harness({receiptStatus,draftVersion});
-    assert.equal((await handlers.purchaseReceipts(deleteRequest())).status,409);
-    assert.ok(!calls.some(call=>call[0]==='deleteReceipt'));
+    assert.equal((await handlers.purchaseReceipts(deleteRequest())).status,200);
+    assert.ok(calls.some(call=>call[0]==='deleteReceipt'));
   }
 });
 test('receipt deletion requires a valid body and authenticated session',async()=>{
@@ -137,6 +148,24 @@ test('detail returns normalized receipt metadata, private preview URL, stock cho
   assert.equal(response.status,200);assert.equal(detail.receipt.activeDraftVersion,2);assert.equal(detail.receipt.originalFilename,'source.pdf');
   assert.equal(detail.evidenceUrl,null);assert.equal(detail.candidates[0].catalogObjectId,'variation-1');
   assert.equal(detail.inventoryItems[0].id,'88888888-8888-4888-8888-888888888888');assert.deepEqual(detail.effects,[]);
+});
+
+test('receipt Jev retry returns same-currency choices and records budget usage',async()=>{
+  const {handlers,calls}=harness();
+  const response=await handlers.purchaseReceipts(post(`/api/purchase-receipts/${receiptId}/match`,{organizationId:org,expectedVersion:2,currency:'USD'}));
+  const result=await response.json();
+  assert.equal(response.status,200);
+  assert.equal(result.matches[0].itemId,'square:variation-1');
+  assert.equal(result.matches[0].itemName,'Tea');
+  assert.ok(calls.some(call=>call[0]==='receiptBudget'&&call[1].model==='typesafe/jev-1.13'));
+  assert.ok(calls.some(call=>call[0]==='receiptUsage'&&call[1].attempt===1));
+});
+
+test('receipt Jev budget RPC errors return a safe unavailable response instead of an internal error',async()=>{
+  const {handlers}=harness({budgetError:Object.assign(new Error('Invalid receipt model budget request'),{code:'P0001'})});
+  const response=await handlers.purchaseReceipts(post(`/api/purchase-receipts/${receiptId}/match`,{organizationId:org,expectedVersion:2,currency:'USD'}));
+  assert.equal(response.status,503);
+  assert.deepEqual(await response.json(),{error:'JEV_BUDGET_UNAVAILABLE',code:'JEV_BUDGET_UNAVAILABLE'});
 });
 
 test('owner can list and revoke integration metadata without receiving token hashes',async()=>{

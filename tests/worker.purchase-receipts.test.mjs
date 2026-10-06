@@ -8,7 +8,8 @@ const org = '22222222-2222-4222-8222-222222222222';
 const job = { id: 'receipt-job', organizationId: org, type: 'receipt.process',
   payload: { receiptId }, attempts: 1, leaseToken: 'receipt-lease' };
 
-function harness({ processed = false, budget = true, downloadError, attempts = 1, wrongHash = false, modelResponse } = {}) {
+function harness({ processed = false, budget = true, downloadError, attempts = 1, wrongHash = false, modelResponse,
+  matchingOptions = { catalogRows: [], inventoryRows: [] }, jevFailure = false } = {}) {
   const events = [];
   let saved = processed;
   const db = Object.fromEntries(['getWebhookNotification','upsertSquareFacts','recordSourceHealth',
@@ -26,6 +27,9 @@ function harness({ processed = false, budget = true, downloadError, attempts = 1
     },
     reservePurchaseReceiptModelBudget: async () => { events.push('reserve'); return budget; },
     recordPurchaseReceiptModelUsage: async () => { events.push('usage'); },
+    getPurchaseReceiptMatchingOptionsSystem: async args => { events.push(['matching-options', args]); return matchingOptions; },
+    reservePurchaseReceiptJevBudget: async args => { events.push(['jev-reserve', args]); return true; },
+    recordPurchaseReceiptJevUsage: async args => { events.push(['jev-usage', args]); },
     savePurchaseReceiptDraftSystem: async args => { saved = true; events.push(['draft', args]); return { version: 1 }; },
     failPurchaseReceiptProcessing: async args => { events.push(['failed', args]); },
   });
@@ -39,7 +43,19 @@ function harness({ processed = false, budget = true, downloadError, attempts = 1
     config: { squareApiVersion: 'test', enabledJobTypes: ['receipt.process'], openRouterApiKey: 'test-only-key', maxJobAttempts: 2 },
     makeSquareClient: () => { throw new Error('Receipt must not call Square'); },
     extractReceiptDocumentTextFn: async () => 'Supplier USD purchase receipt',
-    fetchImpl: async () => {
+    fetchImpl: async (url, request) => {
+      if (String(url).includes('/alpha/decisions')) {
+        events.push('jev-model');
+        if (jevFailure) throw Object.assign(new Error('provider details must not be saved'), { code: 'JEV_UNAVAILABLE' });
+        const body = JSON.parse(request.body);
+        const answers = Object.fromEntries(Object.keys(body.questions).map(key => {
+          const choices = Object.keys(body.questions[key].criteria);
+          const choice = choices.find(value => value.startsWith('item_')) ?? '__none__';
+          return [key, { type: 'choice', choice, confidence: 0.9,
+            probabilities: Object.fromEntries(choices.map(value => [value, value === choice ? 0.9 : 0.1 / (choices.length - 1)])) }];
+        }));
+        return new Response(JSON.stringify({ model: 'typesafe/jev-1.13', usage: { input_tokens: 100, output_tokens: 20 }, answers }), { status: 200 });
+      }
       events.push('model');
       if (!modelResponse) throw new Error('Budget denial must prevent model calls');
       return new Response(JSON.stringify({ choices: [{ message: { content: JSON.stringify(modelResponse) } }] }), { status: 200 });
@@ -106,6 +122,45 @@ test('successful document processing saves an evidence draft and never posts acc
   assert.equal(savedDraft.expectedVersion, 0);
   assert.equal(savedDraft.draft.totals.totalMinor, 1200);
   assert.equal(savedDraft.draft.payment.status, 'unpaid');
+  assert.equal(savedDraft.draft.inventoryMatching.status, 'completed');
+  assert.equal(savedDraft.draft.inventoryMatching.matches[0].reason, 'no_inventory_options');
   assert.ok(!events.some(event => ['saveProjectionRunSystem', 'upsertSquareFacts'].includes(event)));
   assert.equal(events.at(-1)[0], 'ack');
+});
+
+test('receipt upload processing saves automatic Jev suggestions alongside extraction without posting them', async () => {
+  const modelResponse = { document_kind: 'invoice', supplier: 'Synthetic supplier', invoice_date: '2026-10-03',
+    purchase_reference: null, currency: 'USD',
+    totals: { subtotal: '12.00', discount: '0.00', tax: '0.00', shipping: '0.00', other_charges: '0.00', total: '12.00' },
+    payment: { status: 'unpaid', paid_date: null, funding_hint: null },
+    lines: [{ description: 'Synthetic stock', quantity: '2', units_per_package: '1', unit_price: '6.00', line_amount: '12.00' }] };
+  const matchingOptions = { catalogRows: [{ catalogObjectId: 'variation-1', name: 'Synthetic stock · 2 pack', currency: 'USD' }], inventoryRows: [] };
+  const { worker, events } = harness({ modelResponse, matchingOptions });
+  const result = await worker.runOne({ workerId: 'receipt-worker' });
+  assert.equal(result.status, 'completed');
+  const savedDraft = events.find(event => Array.isArray(event) && event[0] === 'draft')[1].draft;
+  assert.deepEqual(savedDraft.inventoryMatching.matches, [{ lineId: 'line-1', itemId: 'square:variation-1',
+    itemName: 'Synthetic stock · 2 pack', confidence: 0.9, reason: null }]);
+  assert.ok(events.indexOf('jev-model') < events.findIndex(event => Array.isArray(event) && event[0] === 'draft'));
+  assert.ok(events.some(event => Array.isArray(event) && event[0] === 'jev-reserve' && event[1].jobId === job.id));
+  assert.ok(events.some(event => Array.isArray(event) && event[0] === 'jev-usage'));
+  assert.ok(!events.some(event => ['saveProjectionRunSystem', 'upsertSquareFacts'].includes(event)));
+});
+
+test('Jev provider failure preserves the extracted draft for human review', async () => {
+  const modelResponse = { document_kind: 'receipt', supplier: 'Synthetic supplier', invoice_date: '2026-10-03',
+    purchase_reference: null, currency: 'USD',
+    totals: { subtotal: '12.00', discount: '0.00', tax: '0.00', shipping: '0.00', other_charges: '0.00', total: '12.00' },
+    payment: { status: 'unpaid', paid_date: null, funding_hint: null },
+    lines: [{ description: 'Synthetic stock', quantity: '2', units_per_package: '1', unit_price: '6.00', line_amount: '12.00' }] };
+  const { worker, events } = harness({ modelResponse, matchingOptions: {
+    catalogRows: [{ catalogObjectId: 'variation-1', name: 'Synthetic stock', currency: 'USD' }], inventoryRows: [],
+  }, jevFailure: true });
+  const result = await worker.runOne({ workerId: 'receipt-worker' });
+  assert.equal(result.status, 'completed');
+  const savedDraft = events.find(event => Array.isArray(event) && event[0] === 'draft')[1].draft;
+  assert.equal(savedDraft.inventoryMatching.status, 'unavailable');
+  assert.equal(savedDraft.inventoryMatching.errorCode, 'JEV_UNAVAILABLE');
+  assert.equal(savedDraft.supplier, 'Synthetic supplier');
+  assert.ok(!events.some(event => Array.isArray(event) && event[0] === 'failed'));
 });

@@ -1,7 +1,7 @@
 import { acceptSquareWebhook } from '../square/webhooks.mjs';
 import { diagnoseIssue, DiagnosisError, SUPPORTED_DIAGNOSIS_ISSUE_TYPES } from '../agent/diagnosis.mjs';
 import { extractReceipt } from '../agent/receipt.mjs';
-import { JevInventoryMatchError, matchReceiptLinesWithJev } from '../agent/jev-inventory-match.mjs';
+import { buildReceiptInventoryChoices, JevInventoryMatchError, matchReceiptLinesWithJev } from '../agent/jev-inventory-match.mjs';
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { calculateProductAnalytics } from '../engine/analytics.mjs';
 import { calculateInventory } from '../engine/inventory.mjs';
@@ -668,8 +668,8 @@ export function createHandlers(adapters) {
       const reviewer=await authorize(req,organizationId,['owner','reviewer']);
       const receipt=await db.getPurchaseReceipt({organizationId,receiptId,accessToken:reviewer.accessToken});
       if(!receipt) throw new HttpError(404,'RECEIPT_NOT_FOUND');
-      if(receipt.status!=='failed'||Number(receipt.active_draft_version??receipt.activeDraftVersion??0)>0) throw new HttpError(409,'RECEIPT_NOT_DELETABLE');
-      await db.deleteFailedPurchaseReceipt({organizationId,receiptId,accessToken:reviewer.accessToken});
+      if(typeof db.deletePurchaseReceipt!=='function') throw new HttpError(503,'RECEIPT_DELETE_UNAVAILABLE');
+      await db.deletePurchaseReceipt({organizationId,receiptId,accessToken:reviewer.accessToken});
       return ok({receiptId,deleted:true});
     }
     if(req.method==='POST'&&action==='reprocess') {
@@ -700,26 +700,15 @@ export function createHandlers(adapters) {
       if(typeof db.reserveReceiptModelBudget!=='function'||typeof db.recordReceiptModelUsage!=='function') {
         throw new HttpError(503,'JEV_BUDGET_UNAVAILABLE');
       }
-      const [catalogRows,inventoryRows]=await Promise.all([
-        db.listPurchaseReceiptCatalogCandidates({organizationId,currency:actionBody.currency,accessToken:actor.accessToken}),
-        db.listInventoryItems({organizationId,asOf:new Date().toISOString(),accessToken:actor.accessToken}),
-      ]);
-      const inventoryChoices=[],seenInventoryIds=new Set();
-      for(const candidate of catalogRows??[]) {
-        if(candidate?.currency!==actionBody.currency||!text(candidate.catalogObjectId,200)||!text(candidate.name,200)) continue;
-        const id=`square:${candidate.catalogObjectId}`;
-        if(seenInventoryIds.has(id)) continue;
-        seenInventoryIds.add(id);
-        inventoryChoices.push({id,name:candidate.name,sku:typeof candidate.sku==='string'?candidate.sku:null,currency:candidate.currency});
-      }
-      for(const item of inventoryRows??[]) {
-        if(item?.currency!==actionBody.currency||!text(item.name,200)) continue;
-        const squareCatalogObjectId=typeof item.square_catalog_object_id==='string'&&item.square_catalog_object_id
-          ?item.square_catalog_object_id:null;
-        const id=squareCatalogObjectId?`square:${squareCatalogObjectId}`:item.id;
-        if(!text(id,220)||seenInventoryIds.has(id)) continue;
-        seenInventoryIds.add(id);
-        inventoryChoices.push({id,name:item.name,sku:typeof item.sku==='string'?item.sku:null,currency:item.currency});
+      let inventoryChoices;
+      try {
+        const [catalogRows,inventoryRows]=await Promise.all([
+          db.listPurchaseReceiptCatalogCandidates({organizationId,currency:actionBody.currency,accessToken:actor.accessToken}),
+          db.listInventoryItems({organizationId,asOf:new Date().toISOString(),accessToken:actor.accessToken}),
+        ]);
+        inventoryChoices=buildReceiptInventoryChoices({catalogRows,inventoryRows,currency:actionBody.currency});
+      } catch {
+        throw new HttpError(503,'INVENTORY_MATCH_UNAVAILABLE');
       }
       try {
         const result=await matchReceiptLinesWithJev({
@@ -727,13 +716,19 @@ export function createHandlers(adapters) {
           inventoryItems:inventoryChoices,
           apiKey:config.openRouterApiKey,
           fetchImpl:adapters.fetchImpl??fetch,
-          reserveBudget:args=>db.reserveReceiptModelBudget({...args,organizationId,accessToken:actor.accessToken}),
-          recordUsage:args=>db.recordReceiptModelUsage({...args,organizationId,accessToken:actor.accessToken}),
+          reserveBudget:async args=>{
+            try { return await db.reserveReceiptModelBudget({...args,organizationId,accessToken:actor.accessToken}); }
+            catch { throw new JevInventoryMatchError('JEV_BUDGET_UNAVAILABLE'); }
+          },
+          recordUsage:async args=>{
+            try { return await db.recordReceiptModelUsage({...args,organizationId,accessToken:actor.accessToken}); }
+            catch { throw new JevInventoryMatchError('JEV_USAGE_UNAVAILABLE'); }
+          },
         });
         return ok({receiptId,version,model:result.model,matches:result.matches});
       } catch(error) {
         if(error instanceof JevInventoryMatchError) throw new HttpError(error.status,error.code);
-        throw error;
+        throw new HttpError(503,'JEV_UNAVAILABLE');
       }
     }
     if(req.method==='POST'&&action==='complete') {

@@ -1,5 +1,5 @@
 begin;
-select plan(47);
+select plan(57);
 
 insert into auth.users(id,aud,role,email,encrypted_password,email_confirmed_at,created_at,updated_at)
 values('7d9db4a4-37a8-4241-a885-3120f73b3377','authenticated','authenticated','purchase-receipt@example.invalid','',now(),now(),now());
@@ -75,6 +75,31 @@ select is((select sum(reserved_tokens) from private.receipt_agent_budget_reserva
 select ok(public.record_purchase_receipt_model_usage('95c9874f-fb81-4f32-bc8b-bbc558d2ee07',
   (select (result->>'receiptId')::uuid from receipt_test_upload),(select (result->>'jobId')::uuid from receipt_test_retry),
   'openai/gpt-6-luna','{}'::jsonb,1),'reallocated reservation accepts usage for the retry job');
+update private.ai_model_budgets set daily_token_limit=200000
+where organization_id='95c9874f-fb81-4f32-bc8b-bbc558d2ee07';
+create temporary table receipt_test_jev_run as select gen_random_uuid() as run_id;
+select ok(public.reserve_purchase_receipt_jev_budget('95c9874f-fb81-4f32-bc8b-bbc558d2ee07',
+  (select (result->>'receiptId')::uuid from receipt_test_upload),(select (result->>'jobId')::uuid from receipt_test_retry),
+  (select run_id from receipt_test_jev_run),'typesafe/jev-1.13',100,200,1),'worker Jev request reserves against its active receipt job');
+select is((select reserved_tokens from private.receipt_agent_budget_reservations where run_id=(select run_id from receipt_test_jev_run)),300,
+  'worker Jev reservation records the bounded request allowance');
+select ok(public.record_purchase_receipt_jev_usage('95c9874f-fb81-4f32-bc8b-bbc558d2ee07',
+  (select (result->>'receiptId')::uuid from receipt_test_upload),(select (result->>'jobId')::uuid from receipt_test_retry),
+  (select run_id from receipt_test_jev_run),'typesafe/jev-1.13','{"input_tokens":80,"output_tokens":20}'::jsonb,1),
+  'worker Jev usage is linked to its active receipt job and reservation');
+select throws_ok($$select public.reserve_purchase_receipt_jev_budget('95c9874f-fb81-4f32-bc8b-bbc558d2ee07',
+  (select (result->>'receiptId')::uuid from receipt_test_upload),'00000000-0000-4000-8000-000000000000',
+  gen_random_uuid(),'typesafe/jev-1.13',100,200,1)$$,'P0001','Active purchase receipt job not found',
+  'worker Jev reservation cannot be detached from the active receipt job');
+select set_config('request.jwt.claims','{"sub":"7d9db4a4-37a8-4241-a885-3120f73b3377","role":"authenticated"}',true);
+create temporary table receipt_test_manual_jev_run as select gen_random_uuid() as run_id;
+select ok(public.reserve_receipt_agent_budget('95c9874f-fb81-4f32-bc8b-bbc558d2ee07',
+  (select run_id from receipt_test_manual_jev_run),'typesafe/jev-1.13',100,200,1),
+  'reviewer Jev retry can reserve within the shared daily budget');
+select ok(public.record_receipt_agent_usage('95c9874f-fb81-4f32-bc8b-bbc558d2ee07',
+  (select run_id from receipt_test_manual_jev_run),'typesafe/jev-1.13','{"input_tokens":80,"output_tokens":20}'::jsonb,1),
+  'reviewer Jev retry records usage against its reservation');
+select set_config('request.jwt.claims','{"role":"service_role"}',true);
 create temporary table receipt_test_duplicate_submission as
 select public.create_purchase_receipt_submission('95c9874f-fb81-4f32-bc8b-bbc558d2ee07',
   (select (result->>'id')::uuid from receipt_test_integration),'external-test-002','supplier-copy.pdf','application/pdf') as result;
@@ -105,6 +130,10 @@ insert into private.square_fact_current(organization_id,fact_kind,object_id,obje
 select ok(public.list_purchase_receipt_catalog_candidates('95c9874f-fb81-4f32-bc8b-bbc558d2ee07','USD') @>
   '[{"catalogObjectId":"CAT-UNSOLD","name":"Dry goods — Brown rice","sku":"RICE-1","currency":"USD"},{"catalogObjectId":"CAT-UNKNOWN-CURRENCY","name":"Dry goods — Local produce","sku":null,"currency":"USD"}]'::jsonb,
   'purchase candidate listing includes unsold variations with matching or unknown price currency');
+select set_config('request.jwt.claims','{"role":"service_role"}',true);
+select lives_ok($$select public.list_purchase_receipt_catalog_candidates('95c9874f-fb81-4f32-bc8b-bbc558d2ee07','USD')$$,
+  'receipt worker can load the same organization-scoped catalog candidates');
+select set_config('request.jwt.claims','{"sub":"7d9db4a4-37a8-4241-a885-3120f73b3377","role":"authenticated"}',true);
 insert into public.item_definitions(organization_id,square_catalog_object_id,name,unit_cost_minor,currency,effective_from,approved_by,version)
 values('95c9874f-fb81-4f32-bc8b-bbc558d2ee07','CAT-RECEIPT-1','Test purchase item',100,'USD',now()-interval '1 day','7d9db4a4-37a8-4241-a885-3120f73b3377',1);
 create temporary table receipt_test_item as
@@ -219,6 +248,20 @@ select lives_ok($$select public.reject_purchase_receipt('95c9874f-fb81-4f32-bc8b
 select lives_ok($$select public.reject_purchase_receipt('95c9874f-fb81-4f32-bc8b-bbc558d2ee07',
   (select (result->>'receiptId')::uuid from receipt_test_rejection_upload),1,'This source is not a supplier purchase','receipt-reject-001')$$,'identical reject retry is idempotent');
 select is((select status from public.purchase_receipt_submissions where id=(select (result->>'receiptId')::uuid from receipt_test_rejection_upload)),'rejected','rejection remains visible and creates no financial effect');
+
+create temporary table receipt_test_deleted_posted as
+select public.delete_purchase_receipt('95c9874f-fb81-4f32-bc8b-bbc558d2ee07',
+  (select (result->>'receiptId')::uuid from receipt_test_upload)) as result;
+select is((select result->>'deleted' from receipt_test_deleted_posted),'true','owner can remove a posted receipt from the inbox');
+select ok((select deleted_at is not null and deleted_by='7d9db4a4-37a8-4241-a885-3120f73b3377'::uuid and status='posted'
+  from public.purchase_receipt_submissions where id=(select (result->>'receiptId')::uuid from receipt_test_upload)),
+  'deleting a posted receipt records the actor while retaining its workflow status');
+select ok(exists(select 1 from public.evidence_files where id=(select evidence_file_id from public.purchase_receipt_submissions
+    where id=(select (result->>'receiptId')::uuid from receipt_test_upload)))
+  and exists(select 1 from public.purchase_receipt_decisions where receipt_id=(select (result->>'receiptId')::uuid from receipt_test_upload)
+    and decision='approved')
+  and exists(select 1 from public.purchase_receipt_effects where receipt_id=(select (result->>'receiptId')::uuid from receipt_test_upload)),
+  'deletion preserves original evidence, human decisions, and posted receipt effects');
 
 select * from finish();
 rollback;

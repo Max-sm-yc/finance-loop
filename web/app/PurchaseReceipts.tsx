@@ -10,12 +10,13 @@ type InventoryItem = { id: string; name: string; currency: string; sku?: string 
 type CatalogTarget = { catalogObjectId: string; name: string; sku?: string | null; currency: string; archived?: boolean };
 type InventoryChoice = { id: string; name: string; sku?: string | null; squareCatalogObjectId?: string | null; unitCostMinor?: number | null; archived: boolean };
 type PurchaseLine = { lineId: string; lineNumber: number; description: string; quantityText?: string | null; packageQuantity?: number | null; unitsPerPackage?: number | null; lineAmountMinor?: number | null; unitPriceMinor?: number | null; suggestedUnitCostMinor?: number | null; sourceAmounts?: { lineAmount?: string | null; unitPrice?: string | null }; reviewFlags?: string[] };
-type PurchaseDraft = { supplier?: string | null; invoiceDate?: string | null; purchaseReference?: string | null; currency: string | null; totals?: { subtotalMinor?: number | null; discountMinor?: number | null; taxMinor?: number | null; shippingMinor?: number | null; otherChargesMinor?: number | null; totalMinor?: number | null; totalAmount?: string | null; rawAmounts?: Record<string, string | null> }; payment?: { status?: string; paidAt?: string | null; fundingHint?: string | null }; lines: PurchaseLine[]; reconciliation?: { lineTotalMinor?: number | null; documentTotalMinor?: number | null; unexplainedMinor?: number | null; status?: string }; extraction?: { model?: string; promptVersion?: string } };
+type JevMatch = { itemId: string | null; itemName: string | null; confidence: number | null; reason?: 'empty_description' | 'no_inventory_options' | null };
+type InventoryMatching = { status: 'completed' | 'budget_exceeded' | 'unavailable' | 'awaiting_currency_confirmation'; model?: string; errorCode?: string; matches: Array<JevMatch & { lineId: string }> };
+type PurchaseDraft = { supplier?: string | null; invoiceDate?: string | null; purchaseReference?: string | null; currency: string | null; totals?: { subtotalMinor?: number | null; discountMinor?: number | null; taxMinor?: number | null; shippingMinor?: number | null; otherChargesMinor?: number | null; totalMinor?: number | null; totalAmount?: string | null; rawAmounts?: Record<string, string | null> }; payment?: { status?: string; paidAt?: string | null; fundingHint?: string | null }; lines: PurchaseLine[]; reconciliation?: { lineTotalMinor?: number | null; documentTotalMinor?: number | null; unexplainedMinor?: number | null; status?: string }; extraction?: { model?: string; promptVersion?: string }; inventoryMatching?: InventoryMatching };
 type Receipt = { id: string; status: string; activeDraftVersion?: number; filename?: string; originalFilename?: string; supplier?: string | null; createdAt?: string; submittedAt?: string; evidenceFileId?: string; duplicateOfReceiptId?: string | null; lastErrorCode?: string | null };
 type IntegrationCredential = { id: string; name: string; createdAt?: string; revokedAt?: string | null };
 type ReceiptEffect = { id: string; source_line_id: string; effect_type: 'cost_update' | 'stock_receipt' | 'payment'; effect_payload: Record<string, unknown>; inventory_movement_id?: string | null; cash_movement_id?: string | null; created_at: string };
 type ReceiptDetail = { receipt: Receipt; draft: PurchaseDraft | null; version?: number; candidates?: Array<{ catalogObjectId: string; name: string; sku?: string | null; currency: string; archived?: boolean }>; inventoryItems?: InventoryItem[]; effects?: ReceiptEffect[]; evidenceUrl?: string };
-type JevMatch = { itemId: string | null; itemName: string | null; confidence: number | null; reason?: 'empty_description' | 'no_inventory_options' | null };
 type LineChoice = { itemId: string; costCatalogObjectId: string; effectiveFrom: string; packageQuantity: string; unitsPerPackage: string; unitCost: string; costEdited: boolean; receive: boolean; receivedQuantity: string; receivedAt: string; updateCost: boolean };
 const digitsFor = (currency: string) => new Intl.NumberFormat(undefined, { style: 'currency', currency }).resolvedOptions().maximumFractionDigits ?? 2;
 const formatMoney = (minor: number | null | undefined, currency: string) => minor == null ? '—' : new Intl.NumberFormat(undefined, { style: 'currency', currency }).format(minor / (10 ** digitsFor(currency)));
@@ -224,7 +225,25 @@ export default function PurchaseReceipts({ organizationId, role, accounts, curre
       const version = Number(result.version ?? result.receipt.activeDraftVersion);
       const matchCurrency = result.draft?.currency ?? (effectCurrencies.length === 1 ? effectCurrencies[0] : currency);
       const matchKey = `${organizationId}:${id}:${version}:${matchCurrency}`;
-      setJevMatches(jevMatchCache.current.get(matchKey) ?? {}); setMatchNotice('');
+      const storedMatching = result.draft?.inventoryMatching;
+      const validLineIds = new Set((result.draft?.lines ?? []).map(line => line.lineId));
+      const validInventoryIds = new Set([
+        ...(result.candidates ?? []).map(candidate => `square:${candidate.catalogObjectId}`),
+        ...(result.inventoryItems ?? []).map(item => item.squareCatalogObjectId ? `square:${item.squareCatalogObjectId}` : item.id),
+      ]);
+      const storedSuggestions = Object.fromEntries((storedMatching?.matches ?? [])
+        .filter(match => validLineIds.has(match.lineId) && (match.itemId === null || validInventoryIds.has(match.itemId)))
+        .map(match => [match.lineId, { itemId: match.itemId, itemName: match.itemName, confidence: match.confidence, reason: match.reason }])) as Record<string, JevMatch>;
+      const suggestions = jevMatchCache.current.get(matchKey) ?? storedSuggestions;
+      if (storedMatching) jevMatchCache.current.set(matchKey, suggestions);
+      setJevMatches(suggestions); setMatchNotice(storedMatching?.status === 'completed'
+        ? 'Jev suggestions were generated during receipt processing. Review and edit each selection before approval.'
+        : storedMatching?.status === 'budget_exceeded'
+          ? 'Jev matching was skipped because the organization AI budget is exhausted. You can retry matching later.'
+          : storedMatching?.status === 'awaiting_currency_confirmation'
+            ? 'Confirm the receipt currency to generate same-currency inventory suggestions.'
+            : storedMatching?.status === 'unavailable'
+              ? 'Jev matching was unavailable during processing. You can retry it here.' : '');
       const url = new URL(window.location.href); url.searchParams.set('purchaseReceipt', id); url.searchParams.set('organizationId', organizationId); window.history.replaceState(null, '', url.toString());
       const next: Record<string, LineChoice> = {};
       for (const line of result.draft?.lines ?? []) {
@@ -234,6 +253,18 @@ export default function PurchaseReceipts({ organizationId, role, accounts, curre
         const alreadyReceived = (result.effects ?? []).filter(effect => effect.effect_type === 'stock_receipt' && effect.source_line_id === line.lineId).reduce((sum, effect) => sum + (Number(effect.effect_payload.quantity) || 0), 0);
         const orderedUnits = (line.packageQuantity ?? 0) * (line.unitsPerPackage ?? 0);
         next[line.lineId] = { itemId: '', costCatalogObjectId: '', effectiveFrom: result.draft?.invoiceDate ?? new Date().toISOString().slice(0, 10), packageQuantity: line.packageQuantity == null ? '' : String(line.packageQuantity), unitsPerPackage: line.unitsPerPackage == null ? '' : String(line.unitsPerPackage), unitCost: cost == null || !draftCurrency ? '' : minorText(cost, draftCurrency), costEdited: false, receive: false, receivedQuantity: orderedUnits ? String(Math.max(0, orderedUnits - alreadyReceived)) : '', receivedAt: localDateTime(), updateCost: false };
+      }
+      const inventoryById = new Map<string, InventoryItem | CatalogTarget>([
+        ...(result.candidates ?? []).map(candidate => [`square:${candidate.catalogObjectId}`, candidate] as const),
+        ...(result.inventoryItems ?? []).map(item => [item.squareCatalogObjectId ? `square:${item.squareCatalogObjectId}` : item.id, item] as const),
+      ]);
+      for (const [lineId, suggestion] of Object.entries(suggestions)) {
+        if (!suggestion.itemId || !next[lineId]) continue;
+        const item = inventoryById.get(suggestion.itemId);
+        if (!item) continue;
+        next[lineId].itemId = suggestion.itemId;
+        next[lineId].costCatalogObjectId = 'squareCatalogObjectId' in item && item.squareCatalogObjectId
+          ? item.squareCatalogObjectId : 'catalogObjectId' in item ? item.catalogObjectId : '';
       }
       setChoices(next);
       const previouslyVerifiedCurrency = result.draft?.currency ?? (effectCurrencies.length === 1 ? effectCurrencies[0] : '');
@@ -276,14 +307,16 @@ export default function PurchaseReceipts({ organizationId, role, accounts, curre
     const requestEpoch = receiptEpoch.current;
     const expectedVersion = Number(selected.version ?? selected.receipt.activeDraftVersion);
     if (!Number.isSafeInteger(expectedVersion) || expectedVersion < 1) { setMatchNotice('Reload this receipt before matching items with Jev.'); return; }
-    const matchKey = `${organizationId}:${receiptId}:${expectedVersion}:${displayCurrency}`;
+    const matchCurrency = selected.draft.currency || confirmedCurrency;
+    if (!/^[A-Z]{3}$/.test(matchCurrency)) { setMatchNotice('Confirm the receipt currency before matching inventory.'); return; }
+    const matchKey = `${organizationId}:${receiptId}:${expectedVersion}:${matchCurrency}`;
     if (automatic && autoJevAttempts.current.has(matchKey)) return;
     if (automatic) autoJevAttempts.current.add(matchKey);
     setMatching(true); setError(''); setMatchNotice(automatic ? 'Jev is matching the receipt lines to the available inventory…' : '');
     try {
       const result = await api<{ receiptId: string; version: number; matches: Array<{ lineId: string; itemId: string | null; itemName: string | null; confidence: number | null; reason?: JevMatch['reason'] }> }>(
         `/api/purchase-receipts/${encodeURIComponent(receiptId)}/match`,
-        { method: 'POST', body: JSON.stringify({ organizationId, expectedVersion, currency: displayCurrency }) },
+        { method: 'POST', body: JSON.stringify({ organizationId, expectedVersion, currency: matchCurrency }) },
       );
       if (activeReceiptId.current !== receiptId || receiptEpoch.current !== requestEpoch) return;
       if (result.receiptId !== receiptId || result.version !== expectedVersion) throw new Error('The receipt draft changed. Reopen this receipt and try Jev matching again.');
@@ -320,15 +353,16 @@ export default function PurchaseReceipts({ organizationId, role, accounts, curre
   useEffect(() => {
     if (!active || !canReview || !selected?.draft || selected.receipt.status !== 'needs_review'
         || !selected.draft.lines.length || !inventoryChoices.length) return;
+    const matchCurrency = selected.draft.currency || confirmedCurrency;
+    if (!/^[A-Z]{3}$/.test(matchCurrency)) return;
     const version = Number(selected.version ?? selected.receipt.activeDraftVersion);
     if (!Number.isSafeInteger(version) || version < 1) return;
-    const matchCurrency = displayCurrency;
     const matchKey = `${organizationId}:${selected.receipt.id}:${version}:${matchCurrency}`;
     if (autoJevAttempts.current.has(matchKey) || jevMatchCache.current.has(matchKey)) return;
     void matchInventoryWithJev(true);
     // One automatic Jev request per receipt draft version; the button remains available to retry.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [active, canReview, organizationId, selected?.draft, selected?.receipt.id, selected?.receipt.status, selected?.receipt.activeDraftVersion, selected?.version, inventoryChoices, displayCurrency]);
+  }, [active, canReview, organizationId, selected?.draft, selected?.receipt.id, selected?.receipt.status, selected?.receipt.activeDraftVersion, selected?.version, inventoryChoices, selected?.draft?.currency, confirmedCurrency]);
   function confirmCurrency(code: string) {
     setConfirmedCurrency(code);
     const totals = selected?.draft?.totals;
@@ -425,9 +459,9 @@ export default function PurchaseReceipts({ organizationId, role, accounts, curre
     catch (reason) { setError(reason instanceof Error ? reason.message : 'Could not create the integration credential.'); }
     finally { setBusy(false); }
   }
-  async function deleteFailedReceipt() {
-    if (!selected || !canReview || selected.receipt.status !== 'failed' || selected.draft) return;
-    if (!window.confirm('Delete this failed receipt? Evidence and audit history stay. Fix the processing issue before uploading again.')) return;
+  async function deleteReceipt() {
+    if (!selected || !canReview) return;
+    if (!window.confirm('Remove this receipt from the inbox? Queued processing may continue. The source document, decisions, posted financial effects, and audit history will be retained. This cannot be undone.')) return;
     const receiptId = selected.receipt.id;
     setBusy(true); setError(''); setNotice('');
     try {
@@ -435,8 +469,8 @@ export default function PurchaseReceipts({ organizationId, role, accounts, curre
       setReceipts(current => current.filter(receipt => receipt.id !== receiptId)); setSelected(null);
       uploadSubmissionId.current = null; uploadFileIdentity.current = '';
       const url = new URL(window.location.href); url.searchParams.delete('purchaseReceipt'); window.history.replaceState(null, '', url.toString());
-      setNotice('Failed receipt deleted from the inbox.'); onSaved();
-    } catch (reason) { setError(reason instanceof Error ? reason.message : 'Could not delete the failed receipt.'); }
+      setNotice('Receipt removed from the inbox. Source and financial history were retained.'); onSaved();
+    } catch (reason) { setError(reason instanceof Error ? reason.message : 'Could not delete the receipt.'); }
     finally { setBusy(false); }
   }
   async function reprocessFailedReceipt() {
@@ -487,13 +521,13 @@ export default function PurchaseReceipts({ organizationId, role, accounts, curre
     </section>
     {uploadOpen && <div className="purchase-upload-backdrop" role="presentation" onMouseDown={event => { if (event.target === event.currentTarget) closeUpload() }}><section className="purchase-upload-dialog" role="dialog" aria-modal="true" aria-labelledby="receipt-upload-title"><div className="panel-heading"><div><h2 id="receipt-upload-title">Upload receipt</h2><p>Choose a supplier invoice or receipt. Extraction runs automatically.</p></div><button type="button" className="icon-button" aria-label="Close upload dialog" onClick={closeUpload} disabled={busy}>×</button></div><form className="receipt-upload-form" onSubmit={uploadReceipt}><div className="receipt-dropzone" onDragOver={event => event.preventDefault()} onDrop={event => { event.preventDefault(); const dropped = event.dataTransfer.files?.[0]; if (dropped) setFile(dropped); }}><UiIcon name="upload" size={22} /><strong>{file?.name ?? 'Drop a receipt here'}</strong><small>PDF, JPEG, or PNG</small><input ref={fileInputRef} className="receipt-file-input" type="file" accept="application/pdf,image/jpeg,image/png" onChange={event => setFile(event.target.files?.[0] ?? null)} /><button type="button" className="secondary" onClick={() => fileInputRef.current?.click()}>Choose file</button></div>{error && <p className="error" role="alert">{error}</p>}<div className="form-actions"><button type="button" className="secondary" onClick={closeUpload} disabled={busy}>Cancel</button><button className="primary with-icon" disabled={busy || !file}><UiIcon name="upload" />{busy ? 'Uploading…' : 'Upload receipt'}</button></div></form></section></div>}
     {selected && <section className="panel purchase-review">
-      <div className="panel-heading"><div><h2>{selected.draft?.supplier || receiptPrimaryName(selected.receipt)}</h2><p>{selected.draft?.purchaseReference ? `Reference ${selected.draft.purchaseReference} · ` : ''}{selected.draft?.invoiceDate || 'Date not extracted'}</p></div><div className="purchase-review-actions">{selected.evidenceUrl && <a className="secondary button-link icon-button" href={selected.evidenceUrl} target="_blank" rel="noreferrer" aria-label="Open source document" title="Open source document"><UiIcon name="file" /></a>}<span className={`pill status-pill ${receiptStatusTone(selected.receipt.status)}`}><i aria-hidden="true" />{receiptStatusLabel(selected.receipt.status)}</span></div></div>
+      <div className="panel-heading"><div><h2>{selected.draft?.supplier || receiptPrimaryName(selected.receipt)}</h2><p>{selected.draft?.purchaseReference ? `Reference ${selected.draft.purchaseReference} · ` : ''}{selected.draft?.invoiceDate || 'Date not extracted'}</p></div><div className="purchase-review-actions">{selected.evidenceUrl && <a className="secondary button-link icon-button" href={selected.evidenceUrl} target="_blank" rel="noreferrer" aria-label="Open source document" title="Open source document"><UiIcon name="file" /></a>}{canReview && <button type="button" className="icon-button reject-button" disabled={busy} onClick={() => void deleteReceipt()} aria-label="Delete receipt" title="Delete receipt"><UiIcon name="trash" /></button>}<span className={`pill status-pill ${receiptStatusTone(selected.receipt.status)}`}><i aria-hidden="true" />{receiptStatusLabel(selected.receipt.status)}</span></div></div>
       {selected.receipt.duplicateOfReceiptId && <div className="notice decision-context-warning">Possible duplicate. <button type="button" className="secondary with-icon" onClick={() => void openReceipt(selected.receipt.duplicateOfReceiptId!)}><UiIcon name="external" />View original</button></div>}
-      {!selected.draft ? selected.receipt.status === 'failed' ? <div className="notice decision-context-warning"><b>Processing failed{selected.receipt.lastErrorCode ? ` · ${selected.receipt.lastErrorCode}` : ''}</b><span>Fix the processing issue, then retry. Receipts with a draft, decision, or financial effect cannot be retried.</span>{canReview && <div className="purchase-review-actions"><button type="button" className="secondary with-icon" disabled={busy} onClick={() => void reprocessFailedReceipt()}><UiIcon name="refresh" />Reprocess document</button><button type="button" className="icon-button reject-button" disabled={busy} onClick={() => void deleteFailedReceipt()} aria-label="Delete failed receipt" title="Delete failed receipt"><UiIcon name="trash" /></button></div>}</div> : <div className="inline-empty">Extraction is in progress. Status updates automatically.</div> : <>
+      {!selected.draft ? selected.receipt.status === 'failed' ? <div className="notice decision-context-warning"><b>Processing failed{selected.receipt.lastErrorCode ? ` · ${selected.receipt.lastErrorCode}` : ''}</b><span>Fix the processing issue, then retry. Receipts with a draft, decision, or financial effect cannot be retried.</span>{canReview && <div className="purchase-review-actions"><button type="button" className="secondary with-icon" disabled={busy} onClick={() => void reprocessFailedReceipt()}><UiIcon name="refresh" />Reprocess document</button></div>}</div> : <div className="inline-empty">Extraction is in progress. Status updates automatically.</div> : <>
         {selected.receipt.lastErrorCode && ['failed','projection_pending'].includes(selected.receipt.status) && <div className="notice decision-context-warning"><b>Processing issue · {selected.receipt.lastErrorCode}</b></div>}
         <div className={`notice ${selected.draft.reconciliation?.status === 'matched' ? 'purchase-match' : 'decision-context-warning'}`}><b>Reconciliation · {selected.draft.reconciliation?.status ?? 'incomplete'}</b><span>Lines {formatMoney(displayedLineTotal, displayCurrency)} · Total {formatMoney(displayedDocumentTotal, displayCurrency)} · Difference {formatMoney(displayedDifference, displayCurrency)}</span></div>
         {!selected.draft.currency && <label className="purchase-currency">Confirm currency from the source document<select required value={confirmedCurrency} onChange={event => confirmCurrency(event.target.value)}><option value="">Choose currency</option>{[...new Set([currency, ...accounts.map(account => account.currency)])].map(code => <option key={code} value={code}>{code}</option>)}</select></label>}
-        {canReview && selected.receipt.status === 'needs_review' && <div className="purchase-jev-control"><div><b>Inventory matching</b><small>{inventoryChoices.length ? 'Jev automatically suggests an identity for each line when this review opens. Suggestions fill empty choices and remain editable.' : 'No same-currency inventory choices are available.'}</small></div><button type="button" className="secondary" onClick={() => void matchInventoryWithJev()} disabled={busy || matching || !inventoryChoices.length || !selected.draft.lines.length}>{matching ? 'Matching with Jev…' : Object.keys(jevMatches).length ? 'Match again with Jev' : 'Run Jev matching'}</button></div>}
+        {canReview && selected.receipt.status === 'needs_review' && <div className="purchase-jev-control"><div><b>Inventory matching</b><small>{inventoryChoices.length ? 'Jev runs with receipt extraction when the document provides a currency. Suggestions appear beside each line and remain editable.' : 'No same-currency inventory choices are available.'}</small></div><button type="button" className="secondary" onClick={() => void matchInventoryWithJev()} disabled={busy || matching || !inventoryChoices.length || !selected.draft.lines.length || (!selected.draft.currency && !confirmedCurrency)}>{matching ? 'Matching with Jev…' : selected.draft.inventoryMatching || Object.keys(jevMatches).length ? 'Retry Jev matching' : 'Run Jev matching'}</button></div>}
         {matchNotice && <p className="purchase-jev-status" role="status">{matchNotice}</p>}
         <div className="table-wrap"><table className="purchase-line-table"><thead><tr><th scope="col">Document line</th><th scope="col">Inventory identity</th><th scope="col">Packages</th><th scope="col">Units / package</th><th scope="col" className="numeric">Exact goods amount</th><th scope="col">Unit cost</th><th scope="col"><div className="purchase-effect-heading"><span>Effects</span><div className="purchase-effect-bulk"><label title="Select cost and stock effects for all available lines"><input ref={element => { if (element) element.indeterminate = someEffectsSelected && !allEffectsSelected; }} type="checkbox" aria-label="Select all cost and stock effects" checked={allEffectsSelected} disabled={!canReview || busy || (!costSelectableLines.length && !stockSelectableLines.length)} onChange={event => setAllReceiptEffects(event.currentTarget.checked)} />All</label></div></div></th></tr></thead><tbody>{selected.draft.lines.map(line => {
           const priorReceived = priorReceivedByLine(line.lineId);
