@@ -406,7 +406,7 @@ export default function Home() {
 
   if (loadingAuth) return <main className="auth-screen"><div className="auth-card">Loading secure workspace…</div></main>;
   if (!user) return <main className="auth-screen"><form className="auth-card" onSubmit={signIn}>
-    <div className="brand-lockup"><img className="brand-wordmark" src="/zythe-wordmark.svg" alt="Zythe" /><small>OPERATIONS ACCOUNTING</small></div>
+    <div className="brand-lockup"><div className="brand-assets"><img className="brand-icon" src="/vernius-icon.svg" alt="" /><img className="brand-wordmark" src="/vernius-wordmark.svg" alt="Vernius" /></div><small>OPERATIONS ACCOUNTING</small></div>
     <p className="eyebrow">SECURE WORKSPACE</p><h1>Sign in</h1>
     <label>Email address<input type="email" autoComplete="username" required value={email} onChange={e => setEmail(e.target.value)} /></label>
     <label>Password<input type="password" autoComplete="current-password" required value={password} onChange={e => setPassword(e.target.value)} /></label>
@@ -418,7 +418,7 @@ export default function Home() {
   const navItems = NAV.filter(x => x.id !== 'analytics' || features === null || features.productAnalytics);
   const title = navItems.find(x => x.id === page)?.label ?? 'Overview';
   return <div className="shell">
-    <aside className="sidebar"><div className="brand-lockup"><img className="brand-wordmark" src="/zythe-wordmark.svg" alt="Zythe" /><small>WORKSPACE</small></div>
+    <aside className="sidebar"><div className="brand-lockup"><div className="brand-assets"><img className="brand-icon" src="/vernius-icon.svg" alt="" /><img className="brand-wordmark" src="/vernius-wordmark.svg" alt="Vernius" /></div><small>WORKSPACE</small></div>
       <div className="workspace"><span className="workspace-mark">{dashboard?.organization?.name?.slice(0, 1) ?? 'O'}</span><span><b>{dashboard?.organization?.name ?? 'Your workspace'}</b><small>Organization workspace</small></span></div>
       <nav aria-label="Main navigation">{navItems.map(item => <button key={item.id} className={`nav-link ${page === item.id ? 'selected' : ''}`} onClick={() => navigate(item.id)} aria-current={page === item.id ? 'page' : undefined}><UiIcon name={item.icon} size={17} />{item.label}{item.id === 'review' && openIssues.length > 0 && <i>{openIssues.length}</i>}</button>)}</nav>
       <div className="sidebar-foot"><div className="profile"><span className="avatar">{user.email?.slice(0, 1).toUpperCase() ?? 'U'}</span><span className="profile-info"><b>{user.email}</b><small>Signed in</small></span><button className="icon-button" onClick={signOut} title="Sign out" aria-label="Sign out"><UiIcon name="signOut" /></button></div></div>
@@ -661,7 +661,7 @@ function InventoryPanel({ organizationId, accountId, currency, timezone, account
             evidenceRef, reason: reason.trim(), projectionStartAt: from, projectionEndAt: to }),
         });
         pending.current = null; setMode(null); setEvidence(null); setEvidenceRefInput(''); setName(''); setSku(''); setVariationName('Regular'); setDescription(''); setSalePrice(''); setUnitCost(''); setReason('');
-        setNotice(result.projectionQueued ? 'Item created in Square. Its approved unit cost and catalog link are saved in Zythe; a projection replay is queued.' : 'Item created in Square and its approved unit cost is saved in Zythe.');
+        setNotice(result.projectionQueued ? 'Item created in Square. Its approved unit cost and catalog link are saved in Vernius; a projection replay is queued.' : 'Item created in Square and its approved unit cost is saved in Vernius.');
         await refresh(); onSaved(); return;
       }
       if (mode === 'item') { const result = await api<{ itemId: string }>('/api/inventory/items', { method: 'POST', headers: { 'Idempotency-Key': key }, body: JSON.stringify({ organizationId, sku: sku.trim(), name: name.trim(), currency: transactionCurrency, evidenceRef, reason: reason.trim() }) }); pending.current = null; setMode(null); setEvidence(null); setEvidenceRefInput(''); setReason(''); setName(''); setSku(''); await refresh(); setItemId(result.itemId); return; }
@@ -984,7 +984,7 @@ function ProductSalesChart({ product, from, to, currency, issues }: { product: A
         {points.map((point, index) => {
           const value = point.revenueMinor ?? 0, valueY = yFor(value), barHeight = value === 0 ? 0 : Math.max(1, Math.abs(zeroY - valueY));
           const x = left + index * step + (step - barWidth) / 2;
-          return <rect key={point.period} x={x} y={Math.min(zeroY, valueY)} width={barWidth} height={barHeight} rx="1" fill={value < 0 ? '#e6a36b' : '#76ca94'}><title>{point.period}: {money(point.revenueMinor, currency)}</title></rect>;
+          return <rect key={point.period} x={x} y={Math.min(zeroY, valueY)} width={barWidth} height={barHeight} rx="1" fill={value < 0 ? '#B1B1B1' : '#B9B9B9'}><title>{point.period}: {money(point.revenueMinor, currency)}</title></rect>;
         })}
         {tickIndexes.map(index => <text key={points[index].period} x={left + index * step + step / 2} y={height - 12} textAnchor={index === 0 ? 'start' : index === points.length - 1 ? 'end' : 'middle'} className="item-sales-axis">{points[index].period}</text>)}
       </svg></div>
@@ -1231,7 +1231,7 @@ function Ledger({ events }: { events: AuditEvent[] }) {
     const columns = ['id', 'created_at', 'action', 'actor_kind', 'actor_user_id', 'entity_type', 'entity_id', 'source_refs', 'revision', 'details'];
     const quote = (value: unknown) => { let text = String(value ?? ''); if (/^[=+\-@\t\r]/.test(text)) text = `'${text}`; return `"${text.replaceAll('"', '""')}"`; };
     const rows = [columns.join(','), ...events.map(event => columns.map(key => quote(['details', 'source_refs'].includes(key) ? JSON.stringify((event as unknown as Record<string, unknown>)[key] ?? (key === 'details' ? {} : [])) : (event as unknown as Record<string, unknown>)[key])).join(','))];
-    const blob = new Blob([`\uFEFF${rows.join('\r\n')}`], { type: 'text/csv;charset=utf-8' }); const url = URL.createObjectURL(blob); const a = document.createElement('a'); a.href = url; a.download = 'zythe-audit.csv'; a.click(); window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+    const blob = new Blob([`\uFEFF${rows.join('\r\n')}`], { type: 'text/csv;charset=utf-8' }); const url = URL.createObjectURL(blob); const a = document.createElement('a'); a.href = url; a.download = 'vernius-audit.csv'; a.click(); window.setTimeout(() => URL.revokeObjectURL(url), 1000);
   }
   return <section className="panel table-panel"><div className="panel-heading"><div><h2>Audit history</h2></div><button className="secondary with-icon" disabled={!events.length} onClick={exportCsv}><UiIcon name="download" />Export</button></div>{events.length ? <div className="table-wrap"><table><thead><tr><th>Time</th><th>Event</th><th>Actor</th><th>Details</th><th>Reference</th></tr></thead><tbody>{events.map(e => <tr key={e.id}><td>{date(e.created_at)}</td><td>{e.action ?? e.event_type ?? 'Workspace event'}<small className="cell-sub">{e.entity_type ?? ''}</small></td><td>{e.actor_user_id ?? e.actor_id ?? e.actor_kind ?? 'System'}</td><td>{e.reason ?? JSON.stringify(e.details ?? e.payload ?? {})}</td><td>{e.entity_id ?? e.id}</td></tr>)}</tbody></table></div> : <div className="inline-empty">No audit events yet.</div>}</section>;
 }
