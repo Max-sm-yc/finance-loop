@@ -122,6 +122,15 @@ function normalizedCatalogFacts(objects) {
     .filter((fact, index, facts) => facts.findIndex(candidate => candidate.objectId === fact.objectId) === index);
 }
 
+function assertExpectedVersion(object, expectedVersion) {
+  if (expectedVersion === null || expectedVersion === undefined || expectedVersion === '') return;
+  if (String(object?.version ?? '') !== String(expectedVersion)) {
+    throw Object.assign(new Error('Square catalog object changed after this action was approved'), {
+      code: 'SQUARE_CATALOG_VERSION_CONFLICT', permanent: true,
+    });
+  }
+}
+
 async function retrieveCatalogObject(client, objectId) {
   const response = await client.request(`/v2/catalog/object/${encodeURIComponent(objectId)}?include_related_objects=true`);
   if (!response?.object?.id || response.object.is_deleted === true) {
@@ -208,7 +217,7 @@ export async function createSquareCatalogProduct({ client, idempotencyKey, name,
 }
 
 /** Update the item name and description without replacing its variation IDs. */
-export async function updateSquareCatalogItem({ client, idempotencyKey, itemId, name, description }) {
+export async function updateSquareCatalogItem({ client, idempotencyKey, itemId, name, description, expectedVersion }) {
   const current = await retrieveCatalogObject(client, itemId);
   const object = itemObjectWithChildren(current);
   const before = { name: object.item_data.name ?? '',
@@ -216,6 +225,7 @@ export async function updateSquareCatalogItem({ client, idempotencyKey, itemId, 
   if (before.name === name && before.description === (description || '')) {
     return { squareItemId: itemId, before, after: { name, description: description || '' }, facts: normalizedCatalogFacts(responseObjects({ catalog_object: current.object, related_objects: current.related_objects })) };
   }
+  assertExpectedVersion(current.object, expectedVersion);
   object.item_data.name = name;
   delete object.item_data.description_plaintext;
   delete object.item_data.description_html;
@@ -231,7 +241,7 @@ export async function updateSquareCatalogItem({ client, idempotencyKey, itemId, 
 
 /** Update variation fields while preserving Square's other variation settings. */
 export async function updateSquareCatalogVariation({ client, idempotencyKey, itemId, variationId,
-  variationName, sku, pricingType, priceMinor, currency }) {
+  variationName, sku, pricingType, priceMinor, currency, expectedVersion }) {
   const current = await retrieveCatalogObject(client, variationId);
   const variation = current.object;
   if (variation.type !== 'ITEM_VARIATION' || variation.item_variation_data?.item_id !== itemId) {
@@ -256,6 +266,7 @@ export async function updateSquareCatalogVariation({ client, idempotencyKey, ite
         currency: pricingType === 'FIXED_PRICING' ? currency : null },
       facts: normalizedCatalogFacts(responseObjects(current)) };
   }
+  assertExpectedVersion(variation, expectedVersion);
   const response = await upsertCatalogObject(client, idempotencyKey, {
     ...writableObject(variation), item_variation_data: data,
   });
@@ -282,7 +293,7 @@ export async function updateSquareCatalogVariation({ client, idempotencyKey, ite
 
 /** Add a variation without changing existing variation IDs or cost definitions. */
 export async function addSquareCatalogVariation({ client, idempotencyKey, itemId,
-  variationName, sku, pricingType, priceMinor, currency }) {
+  variationName, sku, pricingType, priceMinor, currency, expectedVersion }) {
   const current = await retrieveCatalogObject(client, itemId);
   if (current.object.type !== 'ITEM') throw Object.assign(new Error('Square catalog item was not found'), { code: 'SQUARE_CATALOG_OBJECT_UNAVAILABLE' });
   const object = itemObjectWithChildren(current);
@@ -305,6 +316,7 @@ export async function addSquareCatalogVariation({ client, idempotencyKey, itemId
     return { squareItemId: itemId, squareCatalogObjectId: existing.id, after,
       facts: normalizedCatalogFacts(responseObjects({ catalog_object: current.object, related_objects: current.related_objects })) };
   }
+  assertExpectedVersion(current.object, expectedVersion);
   const digest = createHash('sha256').update(idempotencyKey).digest('hex');
   const temporaryVariationId = temporaryId('variation', digest);
   const data = {
@@ -326,7 +338,7 @@ export async function addSquareCatalogVariation({ client, idempotencyKey, itemId
 }
 
 /** Archive or restore a Square item while retaining its original IDs. */
-export async function setSquareCatalogItemArchived({ client, idempotencyKey, itemId, archived }) {
+export async function setSquareCatalogItemArchived({ client, idempotencyKey, itemId, archived, expectedVersion }) {
   const current = await retrieveCatalogObject(client, itemId);
   const object = itemObjectWithChildren(current);
   const before = { name: object.item_data.name ?? '', archived: object.item_data.is_archived === true };
@@ -334,6 +346,7 @@ export async function setSquareCatalogItemArchived({ client, idempotencyKey, ite
     return { squareItemId: itemId, before, after: { name: before.name, archived },
       facts: normalizedCatalogFacts(responseObjects({ catalog_object: current.object, related_objects: current.related_objects })) };
   }
+  assertExpectedVersion(current.object, expectedVersion);
   object.item_data.is_archived = archived;
   const response = await upsertCatalogObject(client, idempotencyKey, object);
   const saved = response.catalog_object;

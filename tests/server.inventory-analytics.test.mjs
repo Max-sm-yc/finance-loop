@@ -13,6 +13,7 @@ function handlers({ snapshot, facts, role = 'owner', membership = true } = {}) {
     'recordItemDefinition', 'recordSaleLineCostOverride', 'recordRefundCostReview', 'createProposalAtomic', 'reserveModelBudget', 'recordModelUsage', 'getReplaySnapshot', 'saveProjectionRun', 'asUser']
     .map(name => [name, async () => ({})]));
   Object.assign(db, { getMembership: async () => membership ? { role } : null,
+    hasOrganizationPermission: async () => true,
     getOrganizationFeatureFlags: async () => ({ inventoryTracking: true, productAnalytics: true }),
     listInventoryMovements: async () => [], getInventorySnapshot: async () => snapshot,
     listProductAnalyticsFacts: async () => facts,

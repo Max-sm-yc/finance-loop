@@ -30,7 +30,7 @@ test('inventory feature and snapshot reads use the caller JWT and preserve a nul
     items: [], movements: [], lines: []
   });
   assert.equal(seen[0].url.includes('/rest/v1/organization_feature_flags?'), true);
-  assert.equal(seen[1].url, 'https://tenant.supabase.test/rest/v1/rpc/get_inventory_snapshot');
+  assert.equal(seen[1].url, 'https://tenant.supabase.test/rest/v1/rpc/get_inventory_snapshot_authorized');
   assert.deepEqual(seen[1].body, {
     p_organization_id: organizationId, p_start_at: '2026-09-01T00:00:00Z',
     p_end_at: '2026-10-01T00:00:00Z', p_currency: 'USD'
@@ -125,4 +125,35 @@ test('standalone supply registration uses the caller JWT and lists without a Squ
   });
   assert.ok(seen.every(request => request.headers.get('authorization') === `Bearer ${accessToken}`));
   assert.ok(seen.every(request => !request.headers.get('authorization').includes(secretKey)));
+});
+
+test('Square count reads use the caller JWT while worker count targets and writes use only the server key', async () => {
+  const seen = [];
+  const adapters = createSupabaseAdapters({
+    url: 'https://tenant.supabase.test', publishableKey: 'publishable', secretKey,
+    fetchImpl: async (url, init) => {
+      const request = { url: String(url), headers: new Headers(init.headers), body: init.body ? JSON.parse(init.body) : undefined };
+      seen.push(request);
+      if (request.url.endsWith('/rpc/get_square_inventory_targets_system')) return json({ catalogObjectIds: ['variation-1'], locationIds: ['location-1'] });
+      if (request.url.endsWith('/rpc/upsert_square_inventory_counts')) return json({ inserted: 1, changed: 1, unmappedCount: 0, conflictCount: 0, unmappedRefs: [] });
+      if (request.url.endsWith('/rpc/get_square_inventory_counts')) return json([{ variationId: 'domain-variation-1', quantity: 4 }]);
+      throw new Error(`Unexpected request ${request.url}`);
+    }
+  });
+  assert.deepEqual(await adapters.db.getSquareInventoryTargetsSystem({ organizationId }), {
+    catalogObjectIds: ['variation-1'], locationIds: ['location-1']
+  });
+  const count = { catalogObjectId: 'variation-1', catalogObjectType: 'ITEM_VARIATION', locationId: 'location-1',
+    state: 'IN_STOCK', quantity: 4, calculatedAt: '2026-10-01T12:00:00Z', sourceVersion: 'version-1', sourceHash: 'a'.repeat(64) };
+  assert.deepEqual(await adapters.db.upsertSquareInventoryCounts({ organizationId, counts: [count] }), {
+    inserted: 1, changed: 1, unmappedCount: 0, conflictCount: 0, unmappedRefs: []
+  });
+  assert.deepEqual(await adapters.db.getSquareInventoryCounts({ organizationId, accessToken }), [{ variationId: 'domain-variation-1', quantity: 4 }]);
+  assert.deepEqual(seen[0].body, { p_organization_id: organizationId });
+  assert.deepEqual(seen[1].body, { p_organization_id: organizationId, p_counts: [count] });
+  assert.deepEqual(seen[2].body, { p_organization_id: organizationId });
+  assert.equal(seen[0].headers.get('apikey'), secretKey);
+  assert.equal(seen[1].headers.get('apikey'), secretKey);
+  assert.equal(seen[2].headers.get('apikey'), 'publishable');
+  assert.equal(seen[2].headers.get('authorization'), `Bearer ${accessToken}`);
 });

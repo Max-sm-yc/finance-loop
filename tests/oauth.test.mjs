@@ -4,8 +4,9 @@ import { createSquareOAuthHandlers } from '../src/square/index.mjs';
 
 const organizationId = '11111111-1111-4111-8111-111111111111';
 const config = { squareClientId: 'square-client', squareClientSecret: 'server-secret', squareRedirectUri: 'https://app.test/api/square/oauth/callback', squareBaseUrl: 'https://connect.squareup.com' };
-const scopes = ['ORDERS_READ', 'PAYMENTS_READ', 'ITEMS_READ', 'PAYOUTS_READ', 'MERCHANT_PROFILE_READ', 'GIFTCARDS_READ'];
+const scopes = ['ORDERS_READ', 'PAYMENTS_READ', 'ITEMS_READ', 'INVENTORY_READ', 'PAYOUTS_READ', 'MERCHANT_PROFILE_READ', 'GIFTCARDS_READ'];
 const catalogWriteScopes = [...scopes, 'ITEMS_WRITE'];
+const inventoryWriteScopes = [...scopes, 'INVENTORY_WRITE'];
 
 function setup({ role = 'owner', expired = false, tokenScopes = scopes } = {}) {
   const pending = new Map(); const persisted = []; const calls = [];
@@ -80,4 +81,21 @@ test('catalog write permission is requested only for an owner-authorized catalog
   const readOnly = setup();
   const readResponse = await readOnly.handlers.start(readOnly.startRequest());
   assert.equal(new URL((await readResponse.json()).authorizationUrl).searchParams.get('scope'), scopes.join(' '));
+});
+
+test('inventory read is part of the sync grant and inventory write is opt-in', async () => {
+  const readOnly = setup();
+  const startedRead = await readOnly.handlers.start(readOnly.startRequest());
+  const { authorizationUrl: readUrl } = await startedRead.json();
+  assert.equal(new URL(readUrl).searchParams.get('scope'), scopes.join(' '));
+
+  const writer = setup({ tokenScopes: inventoryWriteScopes });
+  const startedWrite = await writer.handlers.start(writer.startRequest({ organizationId, inventoryWrite: true }));
+  assert.equal(startedWrite.status, 200);
+  const { authorizationUrl } = await startedWrite.json();
+  const state = new URL(authorizationUrl).searchParams.get('state');
+  assert.equal(new URL(authorizationUrl).searchParams.get('scope'), inventoryWriteScopes.join(' '));
+  const callback = await writer.handlers.callback(new Request(`https://app.test/api/square/oauth/callback?code=authorization-code&state=${encodeURIComponent(state)}`));
+  assert.equal(callback.status, 200);
+  assert.deepEqual(writer.persisted[0].scopes, inventoryWriteScopes);
 });

@@ -2,13 +2,16 @@ import { createHash } from 'node:crypto';
 import { replayAccounting } from '../engine/index.mjs';
 import { backfillSquare, normalizeOrder, normalizePayment, normalizeRefund, normalizeCatalog, normalizePayout, normalizePayoutEntry, normalizeGiftCardActivity } from '../square/sync.mjs';
 import { refreshAccessToken } from '../square/client.mjs';
+import { addSquareCatalogVariation, createSquareCatalogProduct, setSquareCatalogItemArchived,
+  updateSquareCatalogItem, updateSquareCatalogVariation } from '../square/catalog.mjs';
+import { normalizeInventoryCount, retrieveSquareInventoryCounts } from '../square/inventory.mjs';
 import { diagnoseIssue } from '../agent/diagnosis.mjs';
 import { extractPurchaseReceipt, PURCHASE_RECEIPT_MODEL } from '../agent/purchase-receipt.mjs';
 import { buildReceiptInventoryChoices, JevInventoryMatchError, matchReceiptLinesWithJev } from '../agent/jev-inventory-match.mjs';
 import { extractDocumentText } from './purchase-receipt-document.mjs';
 
-const JOBS = new Set(['square.webhook', 'square.sync', 'projection.replay', 'issue.investigate', 'receipt.process']);
-const EVENT_KIND = new Map([['order', 'order'], ['payment', 'payment'], ['refund', 'refund'], ['catalog', 'catalog'], ['payout', 'payout']]);
+const JOBS = new Set(['square.webhook', 'square.sync', 'projection.replay', 'issue.investigate', 'receipt.process', 'approved_action.execute']);
+const EVENT_KIND = new Map([['order', 'order'], ['payment', 'payment'], ['refund', 'refund'], ['catalog', 'catalog'], ['payout', 'payout'], ['inventory', 'inventory']]);
 const defaultSleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
 function requireInterface(dependencies) {
@@ -60,9 +63,11 @@ function eventObject(payload) {
   const candidates = [root[key], root.order, root.payment, root.refund, root.catalog_object, root.payout, root.gift_card_activity, payload?.data];
   return candidates.find(x => x && typeof x === 'object' && (x.id || x.object_id)) ?? null;
 }
-function eventId(payload) { return eventObject(payload)?.id ?? eventObject(payload)?.object_id ?? payload?.data?.id ?? null; }
+function eventId(payload) { return eventObject(payload)?.id ?? eventObject(payload)?.object_id ?? payload?.data?.id ?? payload?.event_id ?? null; }
 function eventResource(payload) {
   const type = payload?.type ?? '';
+  if (type === 'inventory.count.updated') return 'inventory';
+  if (type.startsWith('catalog.version.')) return null;
   if (type.startsWith('gift_card.activity.')) return 'gift_card_activity';
   return EVENT_KIND.get(type.split('.')[0]) ?? null;
 }
@@ -124,7 +129,8 @@ export function createWorker(dependencies) {
     if (!facts.length) return { changed: false, revision: null };
     const persistable = facts.filter(fact => fact?.objectId && fact.version !== null && fact.version !== undefined && String(fact.version) !== '');
     const result = persistable.length
-      ? await db.upsertSquareFacts({ organizationId, facts: persistable, cause, enforceMonotonicVersion: true })
+      ? await db.upsertSquareFacts({ organizationId, facts: persistable, cause, enforceMonotonicVersion: true,
+        deferFinancialEvents: options.deferFinancialEvents === true })
       : { changed: false, revision: null };
     if (!result || typeof result.changed !== 'boolean') throw new Error('upsertSquareFacts must return {changed, revision}');
     const problems = facts.flatMap(fact => {
@@ -147,6 +153,9 @@ export function createWorker(dependencies) {
     });
     const sourceRefs = [...new Set(problems.map(problem => problem.objectId))];
     if (problems.length) {
+      if (options.deferFinancialEvents === true && typeof db.materializeFinancialEvents === 'function') {
+        await db.materializeFinancialEvents({ organizationId });
+      }
       await db.recordSourceHealth({ organizationId, resource: 'square', status: 'incomplete', lastSuccessfulSyncAt: null, gap: { code: 'NORMALIZATION_MISSING_MONEY_OR_IDENTITY', problems }, sourceRevision: result.revision, checkedAt: now().toISOString() });
       const unsupported = problems.some(problem => problem.fields.includes('unsupported_gift_card_activity_type'));
       await db.upsertSourceIssue({ organizationId, code: unsupported ? 'UNSUPPORTED_ACTIVITY' : 'SOURCE_GAP', state: 'awaiting_human', revision: result.revision, details: { code: unsupported ? 'UNSUPPORTED_ACTIVITY' : 'NORMALIZATION_MISSING_MONEY_OR_IDENTITY', problems }, sourceRefs });
@@ -229,6 +238,17 @@ export function createWorker(dependencies) {
   async function fetchAuthoritative(client, payload) {
     const resource = eventResource(payload); const id = eventId(payload);
     if (!resource || !id) return { resource: resource ?? 'square', id, unsupported: true };
+    if (resource === 'inventory') {
+      const notifications = payload?.data?.object?.inventory_counts;
+      if (!Array.isArray(notifications) || notifications.length < 1 || notifications.length > 100) return { resource, id, unsupported: true };
+      const catalogObjectIds = [...new Set(notifications.map(count => count?.catalog_object_id).filter(value => typeof value === 'string' && value))];
+      const locationIds = [...new Set(notifications.map(count => count?.location_id).filter(value => typeof value === 'string' && value))];
+      if (!catalogObjectIds.length || !locationIds.length) return { resource, id, unsupported: true };
+      const facts = [];
+      await retrieveSquareInventoryCounts({ client, catalogObjectIds, locationIds, maxPages, sleep, random,
+        persist: async counts => facts.push(...counts) });
+      return { resource, id, facts };
+    }
     if (resource === 'gift_card_activity') {
       const notified = eventObject(payload);
       const giftCardId = notified?.gift_card_id ?? null;
@@ -287,6 +307,20 @@ export function createWorker(dependencies) {
       await recordGap(job.organizationId, authoritative.resource, 'AUTHORITATIVE_OBJECT_MISSING', { notificationId, objectId: authoritative.id });
       throw new Error('Authoritative Square object was not normalized');
     }
+    if (authoritative.resource === 'inventory') {
+      if (typeof db.upsertSquareInventoryCounts !== 'function') throw Object.assign(new Error('Square inventory persistence is unavailable'), { permanent: true });
+      const stored = await db.upsertSquareInventoryCounts({ organizationId: job.organizationId, counts: authoritative.facts });
+      if (stored?.unmappedCount || stored?.conflictCount) {
+        const code = stored.unmappedCount ? 'INVENTORY_COUNT_UNMAPPED_SOURCE' : 'INVENTORY_COUNT_CONFLICT';
+        await recordGap(job.organizationId, 'inventory', code, { notificationId, sourceRefs: stored.unmappedRefs ?? [] });
+        return { notificationId, outcome: 'inventory_sync_gap', code };
+      }
+      await db.recordSourceHealth({ organizationId: job.organizationId, resource: 'inventory', status: 'fresh',
+        lastSuccessfulSyncAt: now().toISOString(), processedNotificationId: notificationId,
+        syncResult: { count: authoritative.facts.length, changed: stored?.changed ?? 0 }, checkedAt: now().toISOString() });
+      await updateFreshnessIssue(job.organizationId);
+      return { notificationId, changed: stored?.changed ?? 0, count: authoritative.facts.length };
+    }
     // Each fetch is authoritative: reordered/duplicate event payloads cannot roll
     // the ledger backwards. The durable upsert adapter must reject older versions.
     const occurredAt = authoritative.facts.map(fact => fact.occurredAt).find(value => typeof value === 'string') ?? notification.payload.created_at;
@@ -298,9 +332,48 @@ export function createWorker(dependencies) {
     return { notificationId, changed: result.changed, revision: result.revision };
   }
 
+  async function syncSquareLocations(client, organizationId) {
+    if (typeof db.upsertSquareLocations !== 'function') return { status: 'skipped', count: 0 };
+    let cursor = null; let pages = 0; const seen = new Set(); const locations = [];
+    try {
+      do {
+        if (++pages > Math.min(maxPages, 100)) throw Object.assign(new Error('Square location page limit exceeded'), { permanent: true });
+        const query = new URLSearchParams({ limit: '100' });
+        if (cursor) query.set('cursor', cursor);
+        const page = await withRetry(() => client.request(`/v2/locations?${query.toString()}`), { retries: 4, sleep, random });
+        if (!Array.isArray(page?.locations)) throw Object.assign(new Error('Square locations response is invalid'), { permanent: true });
+        for (const location of page.locations) {
+          if (!location?.id || !location?.name) continue;
+          locations.push({ id: String(location.id), name: String(location.name).slice(0, 200),
+            timezone: typeof location.timezone === 'string' ? location.timezone : null,
+            status: String(location.status ?? 'ACTIVE'), version: location.version == null ? null : String(location.version),
+            updatedAt: typeof location.updated_at === 'string' ? location.updated_at : null,
+            address: location.address && typeof location.address === 'object' ? location.address : {},
+          });
+        }
+        cursor = typeof page.cursor === 'string' && page.cursor ? page.cursor : null;
+        if (cursor && seen.has(cursor)) throw Object.assign(new Error('Square repeated a location cursor'), { permanent: true });
+        if (cursor) seen.add(cursor);
+      } while (cursor);
+      const stored = await db.upsertSquareLocations({ organizationId, locations });
+      await db.recordSourceHealth({ organizationId, resource: 'locations', status: 'fresh', lastSuccessfulSyncAt: now().toISOString(),
+        sourceRevision: null, checkedAt: now().toISOString(), syncResult: { count: stored?.count ?? locations.length } });
+      return { status: 'fresh', count: stored?.count ?? locations.length };
+    } catch (error) {
+      const status = Number.isInteger(error?.status) ? error.status : null;
+      const gap = { code: 'SQUARE_LOCATIONS_SYNC_FAILED', providerStatus: status };
+      await db.recordSourceHealth({ organizationId, resource: 'locations', status: 'incomplete', lastSuccessfulSyncAt: null,
+        gap, checkedAt: now().toISOString() });
+      await db.upsertSourceIssue({ organizationId, code: 'SOURCE_GAP', state: 'awaiting_human', revision: null,
+        details: { resource: 'locations', ...gap }, sourceRefs: [] });
+      return { status: 'incomplete', count: locations.length, gap };
+    }
+  }
+
   async function handleSync(job) {
     const { startAt, endAt, locationIds = [] } = job.payload ?? {};
     const client = await getClient(job.organizationId);
+    const locationSync = await syncSquareLocations(client, job.organizationId);
     let sourceRevision = null;
     const paymentFacts = new Map();
     const payoutEntryFacts = new Map();
@@ -313,11 +386,42 @@ export function createWorker(dependencies) {
       // fee. Defer projection until payouts have been fetched so a linked
       // CHARGE payout entry can provide the settled fee amount.
       const stored = await writeFacts(job.organizationId, facts, `sync:${job.id}`, { startAt, endAt }, {
-        deferPaymentFees: true, deferProjection: true,
+        deferPaymentFees: true, deferProjection: true, deferFinancialEvents: true,
       });
       if (stored.revision !== null) sourceRevision = stored.revision;
       if (stored.incomplete) throw new Error('Square normalization has incomplete financial facts');
     } });
+    try {
+      if (typeof db.getSquareInventoryTargetsSystem !== 'function' || typeof db.upsertSquareInventoryCounts !== 'function') {
+        throw Object.assign(new Error('Square inventory persistence is unavailable'), { permanent: true, code: 'INVENTORY_SYNC_UNAVAILABLE' });
+      }
+      const targets = await db.getSquareInventoryTargetsSystem({ organizationId: job.organizationId });
+      const inventory = await retrieveSquareInventoryCounts({ client, catalogObjectIds: targets?.catalogObjectIds ?? [],
+        locationIds: targets?.locationIds ?? [], maxPages, sleep, random,
+        persist: async counts => {
+          const stored = await db.upsertSquareInventoryCounts({ organizationId: job.organizationId, counts });
+          if (stored?.unmappedCount) throw Object.assign(new Error('Square returned counts without canonical mappings'), { code: 'INVENTORY_COUNT_UNMAPPED_SOURCE' });
+          if (stored?.conflictCount) throw Object.assign(new Error('Square inventory count versions conflict'), { code: 'INVENTORY_COUNT_CONFLICT' });
+        } });
+      result.resources.inventory = { status: 'fresh', completedAt: now().toISOString(), count: inventory.count, pages: inventory.pages };
+    } catch (error) {
+      const providerStatus = Number.isInteger(error?.status) ? error.status : null;
+      const code = typeof error?.code === 'string' && /^[A-Z0-9_.-]{1,100}$/.test(error.code)
+        ? error.code : providerStatus === 403 ? 'PERMISSION_LOST' : 'INVENTORY_BACKFILL_INCOMPLETE';
+      const gap = { resource: 'inventory', code, ...(providerStatus === null ? {} : { providerStatus }) };
+      result.gaps.push(gap);
+      result.resources.inventory = { status: 'incomplete', error: code };
+      result.freshness = 'incomplete';
+      result.lastSuccessfulSyncAt = null;
+    }
+    if (locationSync.status === 'incomplete') {
+      result.gaps.push({ resource: 'locations', ...locationSync.gap });
+      result.resources.locations = { status: 'incomplete', error: locationSync.gap?.code ?? 'SQUARE_LOCATIONS_SYNC_FAILED' };
+      result.freshness = 'incomplete';
+      result.lastSuccessfulSyncAt = null;
+    } else if (locationSync.status === 'fresh') {
+      result.resources.locations = { status: 'fresh', completedAt: now().toISOString(), count: locationSync.count };
+    }
 
     const payoutFeesByPayment = new Map();
     for (const entry of payoutEntryFacts.values()) {
@@ -341,7 +445,7 @@ export function createWorker(dependencies) {
       }
     }
     if (feeEnrichedPayments.length) {
-      const stored = await writeFacts(job.organizationId, feeEnrichedPayments, `sync:${job.id}:payout-fees`, { startAt, endAt }, { deferProjection: true });
+      const stored = await writeFacts(job.organizationId, feeEnrichedPayments, `sync:${job.id}:payout-fees`, { startAt, endAt }, { deferProjection: true, deferFinancialEvents: true });
       if (stored.revision !== null) sourceRevision = stored.revision;
       if (stored.incomplete) throw new Error('Square payout fee normalization is incomplete');
     }
@@ -358,6 +462,9 @@ export function createWorker(dependencies) {
       await db.recordSourceHealth({ organizationId: job.organizationId, resource: 'square', status: 'incomplete', lastSuccessfulSyncAt: null, gap, sourceRevision, checkedAt: now().toISOString() });
       await db.upsertSourceIssue({ organizationId: job.organizationId, code: 'SOURCE_GAP', state: 'awaiting_human', revision: sourceRevision, details: gap, sourceRefs: unresolvedPaymentFees });
     }
+    if (typeof db.materializeFinancialEvents === 'function') {
+      await db.materializeFinancialEvents({ organizationId: job.organizationId });
+    }
     result.sourceRevision = sourceRevision;
     if (!result.gaps.length && sourceRevision !== null) {
       await recomputeProjection(job.organizationId, sourceRevision, `sync:${job.id}`, { startAt, endAt });
@@ -365,6 +472,169 @@ export function createWorker(dependencies) {
     await recordSyncResult(job.organizationId, result);
     if (result.gaps.length) throw Object.assign(new Error('Square backfill incomplete'), { retryableGap: true });
     return result;
+  }
+
+  async function handleApprovedAction(job) {
+    const envelope = job.payload ?? {};
+    const proposalId = envelope.proposalId;
+    const payloadSha256 = envelope.payloadSha256;
+    if (typeof proposalId !== 'string' || typeof payloadSha256 !== 'string' || !/^[0-9a-f]{64}$/.test(payloadSha256)) {
+      throw Object.assign(new Error('Invalid approved action job'), { permanent: true, code: 'APPROVED_ACTION_INVALID' });
+    }
+    if (typeof db.beginActionExecution !== 'function' || typeof db.finishActionExecution !== 'function') {
+      throw Object.assign(new Error('Approved action persistence is unavailable'), { permanent: true, code: 'APPROVED_ACTION_UNAVAILABLE' });
+    }
+    const attempt = Number.isSafeInteger(job.attempts) && job.attempts > 0 ? Math.min(job.attempts, 12) : 1;
+    const execution = await db.beginActionExecution({ organizationId: job.organizationId, proposalId,
+      payloadSha256, attempt });
+    if (execution?.status !== 'executing') return { proposalId, status: execution?.status ?? 'unavailable', attempt };
+    if (execution.payloadSha256 !== payloadSha256 || execution.actionType !== envelope.actionType
+        || hash(execution.payload) !== hash(envelope.payload)) {
+      await db.finishActionExecution({ organizationId: job.organizationId, proposalId, attempt,
+        status: 'failed', outcomeCode: 'APPROVED_PAYLOAD_MISMATCH', resultSummary: {} });
+      return { proposalId, status: 'failed', code: 'APPROVED_PAYLOAD_MISMATCH' };
+    }
+
+    const payload = execution.payload;
+    const expectedVersion = execution.expectedSourceVersion ?? payload.expectedSquareVersion ?? null;
+    if (payload.expectedSquareVersion != null && String(payload.expectedSquareVersion) !== String(expectedVersion)) {
+      await db.finishActionExecution({ organizationId: job.organizationId, proposalId, attempt,
+        status: 'conflicted', outcomeCode: 'SOURCE_VERSION_CONFLICT', resultSummary: {} });
+      return { proposalId, status: 'conflicted', code: 'SOURCE_VERSION_CONFLICT' };
+    }
+    const digest = createHash('sha256').update(`${proposalId}:${payloadSha256}`).digest('hex').slice(0, 45);
+    let summary;
+    try {
+      const client = await getClient(job.organizationId);
+      let result;
+      if (execution.actionType === 'square.inventory.count.set') {
+        if (typeof payload.squareVariationId !== 'string' || typeof payload.squareLocationId !== 'string'
+            || payload.state !== 'IN_STOCK' || !Number.isFinite(payload.quantity) || payload.quantity < 0
+            || payload.quantity > 1_000_000_000_000 || Math.abs(payload.quantity * 100_000 - Math.round(payload.quantity * 100_000)) > 1e-7
+            || typeof proposalId !== 'string' || !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(proposalId)) {
+          throw Object.assign(new Error('Invalid approved inventory count'), { permanent: true, code: 'APPROVED_ACTION_INVALID' });
+        }
+        const currentCounts = [];
+        await retrieveSquareInventoryCounts({ client, catalogObjectIds: [payload.squareVariationId],
+          locationIds: [payload.squareLocationId], maxPages, sleep, random,
+          persist: async counts => currentCounts.push(...counts) });
+        const current = currentCounts.filter(count => count.catalogObjectId === payload.squareVariationId
+          && count.locationId === payload.squareLocationId && count.state === 'IN_STOCK')
+          .sort((left, right) => Date.parse(right.calculatedAt) - Date.parse(left.calculatedAt))[0] ?? null;
+        if ((current?.sourceVersion ?? null) !== (expectedVersion ?? null)) {
+          throw Object.assign(new Error('Square inventory changed after this count was approved'), {
+            permanent: true, code: 'SQUARE_INVENTORY_VERSION_CONFLICT',
+          });
+        }
+        const occurredAt = typeof execution.approvedAt === 'string' ? new Date(execution.approvedAt) : null;
+        const executionTime = now().getTime();
+        if (!occurredAt || !Number.isFinite(occurredAt.getTime()) || executionTime - occurredAt.getTime() > 24 * 60 * 60_000
+            || occurredAt.getTime() > executionTime) {
+          throw Object.assign(new Error('Approved count is older than Square permits; submit a fresh proposal'), {
+            permanent: true, code: 'APPROVED_ACTION_EXPIRED',
+          });
+        }
+        const response = await client.request('/v2/inventory/changes/batch-create', {
+          method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ idempotency_key: proposalId, ignore_unchanged_counts: false, changes: [{
+            type: 'PHYSICAL_COUNT', physical_count: { reference_id: proposalId,
+              catalog_object_id: payload.squareVariationId, state: 'IN_STOCK', location_id: payload.squareLocationId,
+              quantity: String(payload.quantity), occurred_at: occurredAt.toISOString(),
+            },
+          }] }),
+        });
+        let savedCounts = Array.isArray(response?.counts) ? response.counts.map(normalizeInventoryCount) : [];
+        if (savedCounts.some(count => count === null)) throw Object.assign(new Error('Square returned an invalid count after the approved write'), { permanent: true, code: 'SQUARE_INVENTORY_RESPONSE_INVALID' });
+        if (!savedCounts.length) {
+          savedCounts = [];
+          await retrieveSquareInventoryCounts({ client, catalogObjectIds: [payload.squareVariationId],
+            locationIds: [payload.squareLocationId], maxPages, sleep, random,
+            persist: async counts => savedCounts.push(...counts) });
+        }
+        const after = savedCounts.filter(count => count.catalogObjectId === payload.squareVariationId
+          && count.locationId === payload.squareLocationId && count.state === 'IN_STOCK')
+          .sort((left, right) => Date.parse(right.calculatedAt) - Date.parse(left.calculatedAt))[0] ?? null;
+        if (!after || after.quantity !== payload.quantity) throw Object.assign(new Error('Square did not confirm the approved inventory quantity'), { permanent: true, code: 'SQUARE_INVENTORY_WRITE_UNCONFIRMED' });
+        const stored = await db.upsertSquareInventoryCounts({ organizationId: job.organizationId, counts: savedCounts });
+        if (stored?.unmappedCount || stored?.conflictCount) await recordGap(job.organizationId, 'inventory',
+          stored.unmappedCount ? 'INVENTORY_COUNT_UNMAPPED_SOURCE' : 'INVENTORY_COUNT_CONFLICT',
+          { sourceRefs: stored.unmappedRefs ?? [payload.squareVariationId, payload.squareLocationId] });
+        result = { squareVariationId: payload.squareVariationId, squareLocationId: payload.squareLocationId,
+          beforeQuantity: current?.quantity ?? null, afterQuantity: after.quantity, sourceVersion: after.sourceVersion };
+      } else if (execution.actionType === 'square.catalog.item.update') {
+        if (typeof payload.squareItemId !== 'string' || typeof payload.name !== 'string' || typeof payload.description !== 'string') {
+          throw Object.assign(new Error('Invalid approved catalog item update'), { permanent: true, code: 'APPROVED_ACTION_INVALID' });
+        }
+        result = await updateSquareCatalogItem({ client, idempotencyKey: digest, itemId: payload.squareItemId,
+          name: payload.name, description: payload.description, expectedVersion });
+      } else if (execution.actionType === 'square.catalog.variation.update') {
+        if (typeof payload.squareItemId !== 'string' || typeof payload.squareVariationId !== 'string'
+            || typeof payload.variationName !== 'string' || !['FIXED_PRICING','VARIABLE_PRICING'].includes(payload.pricingType)
+            || (payload.pricingType === 'FIXED_PRICING' && (!Number.isSafeInteger(payload.priceMinor) || payload.priceMinor < 0 || !/^[A-Z]{3}$/.test(payload.currency ?? '')))) {
+          throw Object.assign(new Error('Invalid approved catalog variation update'), { permanent: true, code: 'APPROVED_ACTION_INVALID' });
+        }
+        result = await updateSquareCatalogVariation({ client, idempotencyKey: digest,
+          itemId: payload.squareItemId, variationId: payload.squareVariationId,
+          variationName: payload.variationName, sku: typeof payload.sku === 'string' ? payload.sku : '',
+          pricingType: payload.pricingType, priceMinor: payload.priceMinor, currency: payload.currency, expectedVersion });
+      } else if (execution.actionType === 'square.catalog.variation.add') {
+        if (typeof payload.squareItemId !== 'string' || typeof payload.variationName !== 'string'
+            || !['FIXED_PRICING','VARIABLE_PRICING'].includes(payload.pricingType)
+            || (payload.pricingType === 'FIXED_PRICING' && (!Number.isSafeInteger(payload.priceMinor) || payload.priceMinor < 0 || !/^[A-Z]{3}$/.test(payload.currency ?? '')))) {
+          throw Object.assign(new Error('Invalid approved catalog variation'), { permanent: true, code: 'APPROVED_ACTION_INVALID' });
+        }
+        result = await addSquareCatalogVariation({ client, idempotencyKey: digest, itemId: payload.squareItemId,
+          variationName: payload.variationName, sku: typeof payload.sku === 'string' ? payload.sku : '',
+          pricingType: payload.pricingType, priceMinor: payload.priceMinor, currency: payload.currency, expectedVersion });
+      } else if (execution.actionType === 'square.catalog.item.archive') {
+        if (typeof payload.squareItemId !== 'string' || typeof payload.archived !== 'boolean') {
+          throw Object.assign(new Error('Invalid approved catalog archive action'), { permanent: true, code: 'APPROVED_ACTION_INVALID' });
+        }
+        result = await setSquareCatalogItemArchived({ client, idempotencyKey: digest, itemId: payload.squareItemId,
+          archived: payload.archived, expectedVersion });
+      } else if (execution.actionType === 'square.catalog.item.create') {
+        if (typeof payload.name !== 'string' || !Array.isArray(payload.variations) || payload.variations.length < 1 || payload.variations.length > 250) {
+          throw Object.assign(new Error('Invalid approved catalog creation'), { permanent: true, code: 'APPROVED_ACTION_INVALID' });
+        }
+        result = await createSquareCatalogProduct({ client, idempotencyKey: digest, name: payload.name,
+          description: typeof payload.description === 'string' ? payload.description : '',
+          variations: payload.variations });
+      } else {
+        throw Object.assign(new Error('Unsupported approved action type'), { permanent: true, code: 'APPROVED_ACTION_UNSUPPORTED' });
+      }
+      if (Array.isArray(result?.facts) && result.facts.length) {
+        await db.upsertSquareFacts({ organizationId: job.organizationId, facts: result.facts,
+          cause: `approved-action:${proposalId}` });
+      }
+      summary = { actionType: execution.actionType, squareItemId: result.squareItemId ?? null,
+        squareCatalogObjectId: result.squareCatalogObjectId ?? null, squareVariationId: result.squareVariationId ?? null,
+        squareLocationId: result.squareLocationId ?? null, variationIds: result.variationIds ?? [],
+        before: result.before ?? result.beforeQuantity ?? null, after: result.after ?? result.afterQuantity ?? null,
+        sourceVersion: result.sourceVersion ?? null };
+      await db.finishActionExecution({ organizationId: job.organizationId, proposalId, attempt,
+        status: 'succeeded', outcomeCode: null, resultSummary: summary });
+      return { proposalId, status: 'succeeded', attempt, result: summary };
+    } catch (error) {
+      const code = typeof error?.code === 'string' && /^[A-Z0-9_.-]{1,100}$/.test(error.code)
+        ? error.code : 'APPROVED_ACTION_FAILED';
+      const conflict = code === 'SQUARE_CATALOG_VERSION_CONFLICT' || code === 'SQUARE_CATALOG_OBJECT_UNAVAILABLE'
+        || code === 'SQUARE_INVENTORY_VERSION_CONFLICT';
+      const permanent = error?.permanent === true || [400,401,403,404].includes(Number(error?.status))
+        || attempt >= retryLimit || attempt >= Number(job.maxAttempts ?? retryLimit);
+      if (conflict) {
+        await db.finishActionExecution({ organizationId: job.organizationId, proposalId, attempt,
+          status: 'conflicted', outcomeCode: code, resultSummary: {} });
+        return { proposalId, status: 'conflicted', attempt, code };
+      }
+      if (permanent) {
+        await db.finishActionExecution({ organizationId: job.organizationId, proposalId, attempt,
+          status: 'failed', outcomeCode: code, resultSummary: {} });
+        return { proposalId, status: 'failed', attempt, code };
+      }
+      await db.finishActionExecution({ organizationId: job.organizationId, proposalId, attempt,
+        status: 'retrying', outcomeCode: code, resultSummary: {} });
+      throw error;
+    }
   }
 
   async function handleReplay(job) {
@@ -378,6 +648,9 @@ export function createWorker(dependencies) {
         throw Object.assign(new Error('Invalid replay window'), { permanent: true });
       }
       window = { startAt: new Date(startAt).toISOString(), endAt: new Date(endAt).toISOString() };
+    }
+    if (typeof db.materializeFinancialEvents === 'function') {
+      await db.materializeFinancialEvents({ organizationId: job.organizationId });
     }
     const projection = await recomputeProjection(job.organizationId, revision, `job:${job.id}`, window);
     if (job.payload?.receiptId && projection?.projectionSaved !== true) {
@@ -505,6 +778,7 @@ export function createWorker(dependencies) {
     if (job.type === 'square.sync') return handleSync(job);
     if (job.type === 'projection.replay') return handleReplay(job);
     if (job.type === 'receipt.process') return handlePurchaseReceipt(job);
+    if (job.type === 'approved_action.execute') return handleApprovedAction(job);
     return handleInvestigation(job);
   }
 

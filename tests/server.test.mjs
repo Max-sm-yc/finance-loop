@@ -7,17 +7,22 @@ const org = '11111111-1111-4111-8111-111111111111';
 const account = '22222222-2222-4222-8222-222222222222';
 const user = '33333333-3333-4333-8333-333333333333';
 
-function setup({ role = 'operator', proposalFixture = false, proposalType = 'unknown_item', proposalPolicyVersion = 'policy-v1', fetchImpl, budgetAllowed = true, receiptAgentMaxOutputTokens = 900, inventoryFlag = false, analyticsFlag = false, inventoryServerFlag = false, analyticsServerFlag = false, squareLocations = [{ id: 'square-location-1' }], squareCatalog, syncCoverage, dashboardProjectionCurrent = true } = {}) {
+function setup({ role = 'operator', proposalFixture = false, proposalType = 'unknown_item', proposalPolicyVersion = 'policy-v1', fetchImpl, budgetAllowed = true, receiptAgentMaxOutputTokens = 900, inventoryFlag = false, analyticsFlag = false, inventoryServerFlag = false, analyticsServerFlag = false, squareLocations = [{ id: 'square-location-1' }], squareCatalog, syncCoverage, dashboardProjectionCurrent = true, permissionCheck = () => true } = {}) {
   const calls = [];
   const inboxIds = new Set();
   const db = {
     async getMembership(arg) { calls.push(['membership', arg]); return { role }; },
+    async hasOrganizationPermission(arg) { calls.push(['permission', arg]); return permissionCheck(arg); },
     async getDashboard(arg) { calls.push(['dashboard', arg]); return { income: { status: 'complete' }, freshness: 'fresh', projectionCurrent: dashboardProjectionCurrent }; },
     async listIssues(arg) { calls.push(['issues', arg]); return []; },
     async listManualMovements(arg) { calls.push(['movements', arg]); return []; },
     async listObservations(arg) { calls.push(['observations', arg]); return []; },
     async listAuditEvents(arg) { calls.push(['audit', arg]); return []; },
     async getSettings(arg) { calls.push(['settings', arg]); return {}; },
+    async getDomainCatalog(arg) { calls.push(['domain-catalog', arg]); return []; },
+    async createDomainCatalogItem(arg) { calls.push(['domain-catalog-create', arg]); return { itemId: 'domain-item-1', status: 'draft' }; },
+    async listDomainPurchaseOrders(arg) { calls.push(['domain-purchase-orders', arg]); return []; },
+    async createDomainPurchaseOrder(arg) { calls.push(['domain-purchase-order-create', arg]); return { purchaseOrderId: 'domain-po-1', status: 'draft' }; },
     async getOrganizationFeatureFlags(arg) { calls.push(['features', arg]); return { inventoryTracking: inventoryFlag, productAnalytics: analyticsFlag }; },
     async listInventoryMovements(arg) { calls.push(['inventory-list', arg]); return []; },
     async getInventorySnapshot(arg) { calls.push(['inventory-snapshot', arg]); return { from: arg.from, to: arg.to, currency: arg.currency, items: [], movements: [], lines: [] }; },
@@ -253,6 +258,142 @@ test('sync skips a fully covered period when source health is fresh', async () =
   assert.deepEqual(await read(response), { skipped: true, reason: 'PERIOD_CURRENT', startAt: body.startAt, endAt: body.endAt });
   assert.equal(calls.some(call => call[0] === 'square-locations'), false);
   assert.equal(calls.some(call => call[0] === 'sync'), false);
+});
+
+test('canonical draft catalog command validates payload, separates price permission, and passes the caller token plus idempotency key', async () => {
+  const { handlers, calls } = setup({ role: 'manager' });
+  const body = { organizationId: org, item: { name: '  Mug  ', description: ' Ceramic ', variations: [
+    { name: '  Blue  ', sku: ' MUG-BLUE ', barcode: '00123', priceMinor: 1299, currency: 'USD' },
+    { name: 'Gift amount', priceMinor: null, currency: null },
+  ] }, reason: 'Create a new product before Square publication' };
+  const response = await handlers.domainCatalogItem(post('/api/domain/catalog', body, { 'idempotency-key': 'draft:item:1' }));
+  assert.equal(response.status, 201);
+  assert.deepEqual(await read(response), { itemId: 'domain-item-1', status: 'draft' });
+  const call = calls.find(row => row[0] === 'domain-catalog-create')[1];
+  assert.equal(call.organizationId, org);
+  assert.equal(call.item.name, 'Mug');
+  assert.equal(call.item.variations[0].sku, 'MUG-BLUE');
+  assert.equal(call.item.variations[1].priceMinor, null);
+  assert.equal(call.reason, body.reason);
+  assert.equal(call.idempotencyKey, 'draft:item:1');
+  assert.equal(call.accessToken, 'valid.jwt.token');
+  assert.deepEqual(calls.filter(row => row[0] === 'permission').map(row => row[1].permission), ['catalog.write', 'catalog.price.write']);
+
+  const invalid = await handlers.domainCatalogItem(post('/api/domain/catalog', { ...body,
+    item: { name: 'Mug', variations: [{ name: 'Blue', priceMinor: 1299 }] } }, { 'idempotency-key': 'draft:item:bad' }));
+  assert.equal(invalid.status, 400);
+  assert.equal((await read(invalid)).code, 'INVALID_DRAFT_CATALOG_VARIATION');
+});
+
+test('canonical purchase orders are permission checked by location and use a protected list command', async () => {
+  const locationId = '55555555-5555-4555-8555-555555555555';
+  const enabled = setup({ role: 'manager' });
+  const body = { organizationId: org, reason: 'Prepare next month restock order', purchaseOrder: {
+    supplierId: '66666666-6666-4666-8666-666666666666', locationId, currency: 'USD',
+    expectedAt: '2026-11-01T00:00:00Z', lines: [{ variationId: '77777777-7777-4777-8777-777777777777', description: 'Mug blue', quantity: 12, unitCostMinor: 450 }],
+  } };
+  const created = await enabled.handlers.domainPurchaseOrders(post('/api/domain/purchase-orders', body, { 'idempotency-key': 'po:draft:1' }));
+  assert.equal(created.status, 201);
+  assert.deepEqual(await read(created), { purchaseOrderId: 'domain-po-1', status: 'draft' });
+  const createCall = enabled.calls.find(row => row[0] === 'domain-purchase-order-create')[1];
+  assert.equal(createCall.purchaseOrder.locationId, locationId);
+  assert.equal(createCall.purchaseOrder.lines[0].unitCostMinor, 450);
+  assert.equal(createCall.idempotencyKey, 'po:draft:1');
+  assert.ok(enabled.calls.some(row => row[0] === 'permission' && row[1].permission === 'purchases.write' && row[1].locationId === locationId));
+
+  const listed = await enabled.handlers.domainPurchaseOrders(new Request(`https://app.test/api/domain/purchase-orders?organizationId=${org}`, { headers: auth }));
+  assert.equal(listed.status, 200);
+  assert.deepEqual(await read(listed), { purchaseOrders: [] });
+  assert.ok(enabled.calls.some(row => row[0] === 'domain-purchase-orders' && row[1].accessToken === 'valid.jwt.token'));
+
+  const denied = setup({ role: 'manager', permissionCheck: arg => arg.permission !== 'purchases.write' });
+  const rejected = await denied.handlers.domainPurchaseOrders(post('/api/domain/purchase-orders', body, { 'idempotency-key': 'po:denied:1' }));
+  assert.equal(rejected.status, 403);
+  assert.equal(denied.calls.some(row => row[0] === 'domain-purchase-order-create'), false);
+
+  const invalid = await enabled.handlers.domainPurchaseOrders(post('/api/domain/purchase-orders', {
+    ...body, purchaseOrder: { ...body.purchaseOrder, lines: [{ description: 'Mug blue', quantity: 1.0000001 }] },
+  }, { 'idempotency-key': 'po:precision:1' }));
+  assert.equal(invalid.status, 400);
+  assert.equal((await read(invalid)).code, 'INVALID_PURCHASE_ORDER_LINE');
+});
+
+test('permission-gated reads fail closed when the organization grant is denied or unavailable', async () => {
+  const denied = setup();
+  denied.db.hasOrganizationPermission = async () => false;
+  const request = new Request(`https://app.test/api/dashboard?organizationId=${org}&from=2026-01-01T00:00:00Z&to=2026-02-01T00:00:00Z`, { headers: auth });
+  assert.equal((await denied.handlers.dashboard(request)).status, 403);
+  assert.equal(denied.calls.some(call => call[0] === 'dashboard'), false);
+  const unavailable = setup();
+  delete unavailable.db.hasOrganizationPermission;
+  assert.equal((await unavailable.handlers.dashboard(request)).status, 503);
+  assert.equal(unavailable.calls.some(call => call[0] === 'dashboard'), false);
+});
+
+test('catalog price changes are immutable approval proposals pinned to a mapped Square version', async () => {
+  const { handlers, calls } = setup({ role: 'manager' });
+  const payload = {
+    sourceMappingId: '66666666-6666-4666-8666-666666666666', squareItemId: 'square-item-1',
+    squareVariationId: 'square-variation-1', variationName: 'Regular', sku: 'TEA-1',
+    pricingType: 'FIXED_PRICING', priceMinor: 1299, currency: 'USD', expectedSquareVersion: '42',
+    proposalReason: 'Supplier and competitor pricing review supports this proposed shelf price.'
+  };
+  const supersedesProposalId = '77777777-7777-4777-8777-777777777777';
+  const response = await handlers.actionProposals(post('/api/actions', {
+    organizationId: org, actionType: 'square.catalog.variation.update', payload,
+    expectedSourceVersion: '42', amountMinor: 1299, currency: 'USD', evidenceRefs: [], supersedesProposalId
+  }, { 'idempotency-key': 'catalog-price:1' }));
+  assert.equal(response.status, 201);
+  const rpc = calls.find(call => call[0] === 'rpc');
+  assert.equal(rpc[1], 'propose_action');
+  assert.equal(rpc[2].p_expected_source_version, '42');
+  assert.equal(rpc[2].p_supersedes_proposal_id, supersedesProposalId);
+  assert.deepEqual(rpc[2].p_payload, payload);
+  assert.equal(calls.some(call => call[0] === 'square-catalog-manage'), false);
+  const stale = await handlers.actionProposals(post('/api/actions', {
+    organizationId: org, actionType: 'square.catalog.variation.update', payload,
+    expectedSourceVersion: '41', amountMinor: 1299, currency: 'USD', evidenceRefs: []
+  }, { 'idempotency-key': 'catalog-price:stale' }));
+  assert.equal(stale.status, 400);
+  assert.equal((await read(stale)).code, 'INVALID_SOURCE_VERSION');
+});
+
+test('Square inventory counts are returned through inventory permission checks and count changes enter approvals', async () => {
+  const app = setup({ role: 'manager' });
+  const locationId = '77777777-7777-4777-8777-777777777777';
+  const count = { variationId: 'domain-variation', itemName: 'Tea', variationName: 'Regular', locationId,
+    locationName: 'Main', state: 'IN_STOCK', quantity: null, calculatedAt: null, sourceVersion: null,
+    squareVariationId: 'square-variation', squareLocationId: 'square-location',
+    sourceMappingId: '88888888-8888-4888-8888-888888888888', locationMappingId: '99999999-9999-4999-8999-999999999999' };
+  app.db.getSquareInventoryCounts = async args => { app.calls.push(['square-inventory-counts', args]); return [count]; };
+  const counts = await app.handlers.squareInventoryCounts(new Request(`https://app.test/api/inventory/square-counts?organizationId=${org}`, { headers: auth }));
+  assert.equal(counts.status, 200);
+  assert.deepEqual((await read(counts)).counts, [count]);
+  assert.ok(app.calls.some(call => call[0] === 'permission' && call[1].permission === 'inventory.read' && call[1].locationId === locationId));
+
+  const payload = { sourceMappingId: count.sourceMappingId, locationMappingId: count.locationMappingId,
+    businessLocationId: locationId, squareVariationId: count.squareVariationId, squareLocationId: count.squareLocationId,
+    state: 'IN_STOCK', quantity: 8.5, expectedSquareVersion: null,
+    proposalReason: 'A physical count was completed by the store team.' };
+  const proposed = await app.handlers.actionProposals(post('/api/actions', {
+    organizationId: org, actionType: 'square.inventory.count.set', locationId,
+    payload, expectedSourceVersion: null, amountMinor: null, currency: null, evidenceRefs: []
+  }, { 'idempotency-key': 'inventory-count:1' }));
+  assert.equal(proposed.status, 201);
+  const rpc = app.calls.find(call => call[0] === 'rpc');
+  assert.equal(rpc[1], 'propose_action');
+  assert.equal(rpc[2].p_action_type, 'square.inventory.count.set');
+  assert.equal(rpc[2].p_expected_source_version, null);
+  assert.deepEqual(rpc[2].p_payload, payload);
+  assert.ok(app.calls.some(call => call[0] === 'permission' && call[1].permission === 'inventory.write' && call[1].locationId === locationId));
+
+  const denied = setup({ role: 'employee' });
+  denied.db.hasOrganizationPermission = async arg => arg.permission !== 'inventory.write';
+  assert.equal((await denied.handlers.actionProposals(post('/api/actions', {
+    organizationId: org, actionType: 'square.inventory.count.set', locationId,
+    payload, expectedSourceVersion: null, amountMinor: null, currency: null, evidenceRefs: []
+  }, { 'idempotency-key': 'inventory-count:denied' }))).status, 403);
+  assert.equal(denied.calls.some(call => call[0] === 'rpc'), false);
 });
 
 test('sync refreshes a whole covered period when its exact projection is missing', async () => {
@@ -509,4 +650,64 @@ test('oversized request bodies are rejected before JSON parsing', async () => {
   const res = await handlers.manualMovement(req);
   assert.equal(res.status, 413);
   assert.equal((await read(res)).code, 'BODY_TOO_LARGE');
+});
+
+test('approval policy API requires a currency for amount thresholds and passes the scoped rule to the RPC', async () => {
+  const { handlers, calls } = setup();
+  const base = { organizationId: org, actionType: 'square.inventory.count.set', locationId: account,
+    minAmountMinor: 1000, maxAmountMinor: 5000, requiredPermission: 'approvals.decide', requiredRole: 'manager',
+    requiredApprovalCount: 2, maxSingleApproverMinor: 2500 };
+  const invalid = await handlers.approvalPolicy(post('/api/roles/approval-policy', base));
+  assert.equal(invalid.status, 400);
+  assert.equal((await read(invalid)).code, 'INVALID_APPROVAL_POLICY');
+  const response = await handlers.approvalPolicy(post('/api/roles/approval-policy', { ...base, amountCurrency: 'USD' }));
+  assert.equal(response.status, 201);
+  const rpc = calls.find(call => call[0] === 'rpc' && call[1] === 'set_action_approval_policy');
+  assert.equal(rpc[2].p_amount_currency, 'USD');
+  assert.equal(rpc[2].p_location_id, account);
+  assert.equal(rpc[2].p_required_approval_count, 2);
+});
+
+test('audit search validates employee, operation, record, and bounded date filters', async () => {
+  const { handlers, calls } = setup();
+  const url = new URL(`https://app.test/api/audit?organizationId=${org}&limit=250&from=2026-01-01T00%3A00%3A00Z&to=2026-02-01T00%3A00%3A00Z&actorUserId=${user}&action=set_permission&entityType=organization_role&entityId=role-1`);
+  const response = await handlers.audit(new Request(url, { headers: auth }));
+  assert.equal(response.status, 200);
+  const auditCall = calls.find(call => call[0] === 'audit');
+  assert.equal(auditCall[1].actorUserId, user);
+  assert.equal(auditCall[1].action, 'set_permission');
+  assert.equal(auditCall[1].entityType, 'organization_role');
+  assert.equal(auditCall[1].entityId, 'role-1');
+  assert.equal(auditCall[1].limit, 250);
+  const invalid = await handlers.audit(new Request(`https://app.test/api/audit?organizationId=${org}&actorUserId=not-a-uuid`, { headers: auth }));
+  assert.equal(invalid.status, 400);
+});
+
+test('pending action cancellation passes an authenticated reason and idempotency key to Postgres', async () => {
+  const { handlers, calls } = setup();
+  const proposalId = '55555555-5555-4555-8555-555555555555';
+  const response = await handlers.actionCancellation(post(`/api/actions/${proposalId}/cancel`, {
+    organizationId: org, reason: 'The count needs a new source reading.'
+  }, { 'idempotency-key': 'cancel-action:1' }));
+  assert.equal(response.status, 200);
+  const rpc = calls.find(call => call[0] === 'rpc' && call[1] === 'cancel_action_proposal');
+  assert.equal(rpc[2].p_proposal_id, proposalId);
+  assert.equal(rpc[2].p_reason, 'The count needs a new source reading.');
+  assert.equal(rpc[2].p_idempotency_key, 'cancel-action:1');
+});
+
+test('Teams identity mappings require directory IDs and people-management authorization', async () => {
+  const { handlers, calls } = setup({ role: 'owner' });
+  const body = { organizationId: org, userId: user, tenantId: '66666666-6666-4666-8666-666666666666',
+    teamsUserId: '77777777-7777-4777-8777-777777777777', email: 'staff@example.test', active: true,
+    reason: 'Verified against the organization Teams directory.' };
+  const response = await handlers.teamsIdentity(post('/api/roles/teams-identity', body));
+  assert.equal(response.status, 201);
+  const rpc = calls.find(call => call[0] === 'rpc' && call[1] === 'set_teams_identity');
+  assert.equal(rpc[2].p_user_id, user);
+  assert.equal(rpc[2].p_tenant_id, body.tenantId);
+  assert.equal(rpc[2].p_teams_user_id, body.teamsUserId);
+  assert.equal(rpc[2].p_email, body.email);
+  const invalid = await handlers.teamsIdentity(post('/api/roles/teams-identity', { ...body, teamsUserId: 'user-controlled-name' }));
+  assert.equal(invalid.status, 400);
 });

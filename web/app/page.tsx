@@ -1,21 +1,23 @@
 'use client';
 import { useEffect, useId, useMemo, useRef, useState, type FormEvent, type ReactNode } from 'react';
 import { browserSupabase } from '@/lib/browser-supabase';
-import { api, type AuditEvent, type Dashboard, type Issue, type Movement } from '@/lib/api';
+import { api, type AuditEvent, type Dashboard, type FinancialEvent, type Issue, type Movement } from '@/lib/api';
 import PurchaseReceipts from './PurchaseReceipts';
 import UiIcon, { type IconName } from './UiIcon';
 
-type Page = 'overview' | 'income' | 'cash' | 'purchases' | 'review' | 'ledger' | 'settings' | 'analytics';
+type Page = 'overview' | 'income' | 'cash' | 'purchases' | 'review' | 'ledger' | 'financial' | 'settings' | 'analytics';
 type Features = { inventoryTracking: boolean; productAnalytics: boolean };
 type InventoryMovement = { id: string; item_id: string; item_name: string; quantity_delta: number; occurred_at: string; movement_type?: string; reason?: string };
 type InventorySnapshot = { asOf: string; status?: string; issues?: Array<{ code: string }>; sourceCoverage?: unknown; sourceHealth?: unknown[]; items?: Array<{ id: string; name: string; currency: string; sku?: string | null; square_catalog_object_id?: string | null; item_kind?: string }>; balances?: Array<{ itemDefinitionId: string; itemName: string; currency: string; quantity: number | null }> };
+type SquareInventoryCount = { variationId: string; itemName: string; variationName: string; sku?: string | null; locationId: string; locationName: string; state: string; quantity: number | null; calculatedAt: string | null; sourceVersion: string | null; squareVariationId: string; squareLocationId: string; sourceMappingId: string; locationMappingId: string };
 type PurchaseLineInput = { itemId: string; quantity: string; unitCost: string };
 type AnalyticsProduct = { productId: string; productName?: string | null; unitsSold: number; revenueMinor: number | null; costMinor: number | null; netMinor: number | null; grossMinor?: number | null; discountMinor?: number | null; refundsMinor?: number | null; revenueRank?: number | null; netRank?: number | null; revenueShareBps?: number | null; marginBps?: number | null; dailySales?: Array<{ period: string; revenueMinor: number | null }>; sourceRefs?: string[] };
-type AnalyticsCatalogItem = { id: string; squareItemId?: string | null; itemName: string; variationName?: string | null; description?: string | null; sku?: string | null; currency?: string | null; sellingPriceMinor: number | null; pricingType?: string | null; unitCostMinor: number | null; costEffectiveFrom?: string | null; archived?: boolean; itemKind: 'square' | 'supply' };
+type AnalyticsCatalogItem = { id: string; squareItemId?: string | null; sourceMappingId?: string | null; expectedSquareVersion?: string | null; itemSourceMappingId?: string | null; itemExpectedSquareVersion?: string | null; itemName: string; variationName?: string | null; description?: string | null; sku?: string | null; currency?: string | null; sellingPriceMinor: number | null; pricingType?: string | null; unitCostMinor: number | null; costEffectiveFrom?: string | null; archived?: boolean; itemKind: 'square' | 'supply' };
+type DomainDraftCatalogItem = { itemId: string; name: string; description: string; status: string; revision: number; variations: Array<{ id: string; name: string; sku: string | null; barcode: string | null; unitOfMeasure: string; priceMinor: number | null; currency: string | null; status: string }> };
 type AnalyticsSeries = { period: string; revenueMinor: number | null; costMinor: number | null; feesMinor: number | null; netMinor: number | null; unitsSold: number };
 type AnalyticsReport = { calculationVersion: string; status: string; currency: string | null; sourceRevision?: number | null; products: AnalyticsProduct[]; catalogItems?: AnalyticsCatalogItem[]; catalogStatus?: 'available' | 'unavailable'; totals: { revenueMinor: number | null; costMinor: number | null; netMinor: number | null; feesMinor: number | null; refundsMinor: number | null }; unallocated: { revenueMinor: number | null; refundsMinor: number | null; feesMinor: number | null; cogsReversalMinor?: number | null }; issues: Array<{ code: string; sourceRefs?: string[] }>; daily?: AnalyticsSeries[]; monthly?: AnalyticsSeries[] };
 type CatalogVariationDraft = { name: string; sku: string; pricingType: 'FIXED_PRICING' | 'VARIABLE_PRICING'; price: string; currency: string };
-type CatalogDialogMode = 'create' | 'edit_item' | 'edit_variation' | 'add_variation' | 'cost' | 'archive' | 'restore';
+type CatalogDialogMode = 'create' | 'draft_create' | 'edit_item' | 'edit_variation' | 'add_variation' | 'cost' | 'archive' | 'restore';
 const UUID_INPUT = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 type Organization = { id: string; name: string; base_currency?: string; timezone?: string; role?: string };
 type IssueEvidence = { id: string; type?: 'sale_line' | 'refund'; occurred_at?: string; currency?: string; quantity?: string | number; amount_minor?: string | number; gross_minor?: string | number; unit_price_minor?: string | number; discount_minor?: string | number; catalog_object_id?: string | null; item_name?: string | null; provider_object_id?: string; line_id?: string; refund_id?: string; order_id?: string; status?: string };
@@ -102,7 +104,7 @@ const NAV: Array<{ id: Page; label: string; icon: IconName }> = [
   { id: 'overview', label: 'Overview', icon: 'overview' }, { id: 'income', label: 'Sales', icon: 'sales' },
   { id: 'cash', label: 'Cash & inventory', icon: 'cash' }, { id: 'analytics', label: 'Analytics', icon: 'analytics' }, { id: 'review', label: 'Reviews', icon: 'review' },
   { id: 'purchases', label: 'Receipts', icon: 'receipt' },
-  { id: 'ledger', label: 'Activity', icon: 'activity' }, { id: 'settings', label: 'Settings', icon: 'settings' },
+  { id: 'financial', label: 'Financial ledger', icon: 'activity' }, { id: 'ledger', label: 'Activity', icon: 'activity' }, { id: 'settings', label: 'Settings', icon: 'settings' },
 ];
 const money = (minor?: number | null, currency = 'USD') => {
   if (minor == null) return '—';
@@ -435,8 +437,9 @@ export default function Home() {
           {visitedPages.has('purchases') && <div hidden={page !== 'purchases'}><PurchaseReceipts key={organizationId} organizationId={organizationId} role={organizations.find(org => org.id === organizationId)?.role ?? 'read_only'} accounts={dashboard.accounts ?? []} currency={currency} initialReceiptId={purchaseReceiptId} active={page === 'purchases'} onSaved={() => void load()} /></div>}
           {visitedPages.has('analytics') && features?.productAnalytics === true && <div hidden={page !== 'analytics'}><Analytics key={organizationId} organizationId={organizationId} from={zonedMidnight(from, reportTimezone)} to={zonedMidnight(nextDate(to), reportTimezone)} currency={currency} timezone={reportTimezone} refreshKey={dashboard.freshness?.lastSyncedAt ?? ''} role={organizations.find(org => org.id === organizationId)?.role ?? 'read_only'} /></div>}
           {visitedPages.has('review') && <div hidden={page !== 'review'}><Review key={organizationId} issues={openIssues} organizationId={organizationId} currency={currency} canSync={organizations.find(org => org.id === organizationId)?.role === 'owner'} syncPeriodLabel={periodLabel(from, to)} onSaved={() => void load()} /></div>}
-          {visitedPages.has('ledger') && <div hidden={page !== 'ledger'}><Ledger events={events} /></div>}
-          {visitedPages.has('settings') && <div hidden={page !== 'settings'}><Settings dashboard={dashboard} accountId={accountId} onAccount={setAccountId} /></div>}
+          {visitedPages.has('ledger') && <div hidden={page !== 'ledger'}><Ledger organizationId={organizationId} events={events} /></div>}
+          {visitedPages.has('financial') && <div hidden={page !== 'financial'}><FinancialLedger organizationId={organizationId} from={zonedMidnight(from, reportTimezone)} to={zonedMidnight(nextDate(to), reportTimezone)} /></div>}
+          {visitedPages.has('settings') && <div hidden={page !== 'settings'}><Settings organizationId={organizationId} userId={user.id} role={organizations.find(org => org.id === organizationId)?.role ?? 'read_only'} dashboard={dashboard} accountId={accountId} onAccount={setAccountId} /></div>}
           <footer className="projection-foot"><span>{dashboard.period?.from ?? from} – {dashboard.period?.to ?? to} · {currency}</span><details className="system-details"><summary>System details</summary><span>Calculation {dashboard.projectionVersion ?? 'version pending'} · {dashboard.income?.status === 'incomplete' ? 'Margin incomplete' : 'Operational reporting'}</span></details></footer>
         </>}
       </main>
@@ -594,6 +597,8 @@ function EvidenceLink({ organizationId, evidenceId }: { organizationId: string; 
 }
 function InventoryPanel({ organizationId, accountId, currency, timezone, accounts, from, to, canManageSquareCatalog, canAuthorizeSquareCatalog, onSaved }: { organizationId: string; accountId: string; currency: string; timezone: string; accounts: NonNullable<Dashboard['accounts']>; from: string; to: string; canManageSquareCatalog: boolean; canAuthorizeSquareCatalog: boolean; onSaved: () => void }) {
   const [rows, setRows] = useState<InventoryMovement[]>([]), [snapshot, setSnapshot] = useState<InventorySnapshot | null>(null), [loading, setLoading] = useState(false), [mode, setMode] = useState<'purchase' | 'correction' | 'opening' | 'item' | 'square-item' | null>(null);
+  const [squareCounts, setSquareCounts] = useState<SquareInventoryCount[]>([]), [squareLoading, setSquareLoading] = useState(false), [squareError, setSquareError] = useState('');
+  const [squareCountTarget, setSquareCountTarget] = useState<SquareInventoryCount | null>(null), [squareCountQuantity, setSquareCountQuantity] = useState(''), [squareCountReason, setSquareCountReason] = useState(''), [squareCountError, setSquareCountError] = useState(''), [squareCountNotice, setSquareCountNotice] = useState(''), [savingSquareCount, setSavingSquareCount] = useState(false);
   const [itemId, setItemId] = useState(''), [name, setName] = useState(''), [sku, setSku] = useState(''), [quantity, setQuantity] = useState('1'), [purchaseLines, setPurchaseLines] = useState<PurchaseLineInput[]>([{ itemId: '', quantity: '1', unitCost: '' }]), [amountPaid, setAmountPaid] = useState(''), [reason, setReason] = useState(''), [direction, setDirection] = useState<'add' | 'remove'>('add'), [occurredAt, setOccurredAt] = useState(localDateTimeNow);
   const [evidence, setEvidence] = useState<File | null>(null), [evidenceRefInput, setEvidenceRefInput] = useState(''), [error, setError] = useState(''), [notice, setNotice] = useState(''), [saving, setSaving] = useState(false), [authorizingSquare, setAuthorizingSquare] = useState(false);
   const [variationName, setVariationName] = useState('Regular'), [description, setDescription] = useState(''), [salePrice, setSalePrice] = useState(''), [unitCost, setUnitCost] = useState(''), [itemCurrency, setItemCurrency] = useState(accounts.find(x => x.id === accountId)?.currency ?? currency), [costEffectiveDate, setCostEffectiveDate] = useState(() => todayInTimezone(timezone));
@@ -604,6 +609,10 @@ function InventoryPanel({ organizationId, accountId, currency, timezone, account
     try { const query = new URLSearchParams({ organizationId, from, to, currency: accounts.find(x => x.id === accountId)?.currency ?? currency }); const result = await api<{ movements: InventoryMovement[]; snapshot: InventorySnapshot }>(`/api/inventory?${query}`); setRows(result.movements ?? []); setSnapshot(result.snapshot ?? null); }
     catch (err) { setError(err instanceof Error ? err.message : 'Inventory could not be loaded.'); }
     finally { setLoading(false); }
+    setSquareLoading(true); setSquareError('');
+    try { const result = await api<{ counts: SquareInventoryCount[] }>(`/api/inventory/square-counts?organizationId=${encodeURIComponent(organizationId)}`); setSquareCounts(result.counts ?? []); }
+    catch (err) { setSquareError(err instanceof Error ? err.message : 'Square inventory counts could not be loaded.'); }
+    finally { setSquareLoading(false); }
   }
   useEffect(() => { void refresh(); }, [organizationId, from, to, accountId]);
   const items: NonNullable<InventorySnapshot['items']> = snapshot?.items ?? [...new Map(rows.map(row => [row.item_id, { id: row.item_id, name: row.item_name, currency, item_kind: 'manual' }])).values()];
@@ -619,6 +628,41 @@ function InventoryPanel({ organizationId, accountId, currency, timezone, account
       setError(err instanceof Error ? err.message : 'Square authorization could not start.');
       setAuthorizingSquare(false);
     }
+  }
+  async function authorizeSquareInventory() {
+    if (!canAuthorizeSquareCatalog) return;
+    setAuthorizingSquare(true); setSquareError('');
+    try {
+      const result = await api<{ authorizationUrl: string }>('/api/square/oauth/start', {
+        method: 'POST', body: JSON.stringify({ organizationId, catalogWrite: true, inventoryWrite: true }),
+      });
+      window.location.assign(result.authorizationUrl);
+    } catch (err) {
+      setSquareError(err instanceof Error ? err.message : 'Square inventory authorization could not start.');
+      setAuthorizingSquare(false);
+    }
+  }
+  async function submitSquareCount(event: FormEvent) {
+    event.preventDefault(); setSquareCountError(''); setSquareCountNotice('');
+    const target = squareCountTarget, quantityValue = Number(squareCountQuantity), reasonValue = squareCountReason.trim();
+    if (!target || !Number.isFinite(quantityValue) || quantityValue < 0 || quantityValue > 1_000_000_000_000
+        || Math.abs(quantityValue * 100_000 - Math.round(quantityValue * 100_000)) > 1e-7 || reasonValue.length < 10) {
+      setSquareCountError('Enter a count with at most five decimal places and a reason of at least 10 characters.'); return;
+    }
+    setSavingSquareCount(true);
+    try {
+      await api('/api/actions', { method: 'POST', headers: { 'Idempotency-Key': crypto.randomUUID() }, body: JSON.stringify({
+        organizationId, actionType: 'square.inventory.count.set', locationId: target.locationId,
+        expectedSourceVersion: target.sourceVersion ?? null, amountMinor: null, currency: null, evidenceRefs: [],
+        payload: { sourceMappingId: target.sourceMappingId, locationMappingId: target.locationMappingId,
+          businessLocationId: target.locationId, squareVariationId: target.squareVariationId,
+          squareLocationId: target.squareLocationId, state: 'IN_STOCK', quantity: quantityValue,
+          expectedSquareVersion: target.sourceVersion ?? null, proposalReason: reasonValue },
+      }) });
+      setSquareCountTarget(null); setSquareCountReason(''); setSquareCountQuantity('');
+      setSquareCountNotice('Square physical count submitted for approval. Square changes after an approver accepts it.');
+    } catch (err) { setSquareCountError(err instanceof Error ? err.message : 'The Square inventory count could not be proposed.'); }
+    finally { setSavingSquareCount(false); }
   }
   async function save(e: FormEvent) {
     e.preventDefault(); setError('');
@@ -679,6 +723,11 @@ function InventoryPanel({ organizationId, accountId, currency, timezone, account
   }
   return <section className="panel table-panel inventory-panel"><div className="panel-heading"><div><h2>Inventory &amp; supply</h2></div><div className="form-actions inventory-actions"><button type="button" className="primary with-icon" onClick={() => { setMode('purchase'); setError(''); setPurchaseLines([{ itemId: items[0]?.id ?? '', quantity: '1', unitCost: '' }]); }}><UiIcon name="plus" />Purchase supplies</button><button type="button" className="secondary with-icon" onClick={() => { setMode('item'); setError(''); setName(''); setSku(''); setItemId(''); }}><UiIcon name="plus" />Add supply</button><details className="action-menu"><summary aria-label="More inventory actions" title="More actions"><UiIcon name="more" /></summary><div className="action-menu-popover">{canManageSquareCatalog && <button type="button" onClick={openSquareItemForm}>Add item to Square</button>}<button type="button" onClick={() => { setMode('opening'); setError(''); setItemId(items[0]?.id ?? ''); }}>Opening count</button><button type="button" onClick={() => { setMode('correction'); setError(''); setItemId(items[0]?.id ?? ''); }}>Adjust stock</button></div></details></div></div>
     {notice && <div className="notice" role="status">{notice}</div>}
+    <section className="panel stock-panel"><div className="panel-heading"><div><h3>Square inventory</h3><p>Square calculated counts by item variation, location, and stock state.</p></div><div className="form-actions"><button type="button" className="secondary" onClick={() => void refresh()} disabled={squareLoading}>Refresh</button>{canAuthorizeSquareCatalog && <button type="button" className="secondary" onClick={() => void authorizeSquareInventory()} disabled={authorizingSquare}>{authorizingSquare ? 'Opening Square…' : 'Authorize Square inventory'}</button>}</div></div>
+      {squareCountNotice && <div className="notice compact-notice" role="status">{squareCountNotice}</div>}{squareError && <p className="error" role="alert">{squareError}</p>}
+      {squareLoading ? <div className="inline-empty">Loading Square counts…</div> : squareCounts.length ? <div className="table-wrap"><table><thead><tr><th>Item</th><th>Variation</th><th>Location</th><th>State</th><th className="numeric">Quantity</th><th>Calculated</th><th></th></tr></thead><tbody>{squareCounts.map((count, index) => <tr key={`${count.variationId}:${count.locationId}:${count.state}:${index}`}><td>{count.itemName}</td><td>{count.variationName}{count.sku ? <small className="cell-sub">{count.sku}</small> : null}</td><td>{count.locationName}</td><td>{count.state.replaceAll('_', ' ').toLowerCase()}</td><td className="numeric">{count.quantity ?? 'Unknown'}</td><td>{count.calculatedAt ? date(count.calculatedAt) : 'No Square count yet'}</td><td>{count.state === 'IN_STOCK' && <button type="button" className="secondary" onClick={() => { setSquareCountTarget(count); setSquareCountQuantity(count.quantity === null ? '' : String(count.quantity)); setSquareCountReason(''); setSquareCountError(''); }}>Propose count</button>}</td></tr>)}</tbody></table></div> : !squareError && <div className="inline-empty">No Square inventory counts are available. Run a Square sync after granting inventory read access.</div>}
+      {squareCountTarget && <form className="entry-form" onSubmit={submitSquareCount}><div className="form-grid"><div className="notice compact-notice wide"><b>Propose a physical count for {squareCountTarget.itemName} · {squareCountTarget.variationName} at {squareCountTarget.locationName}.</b> Square changes only after an authorized approver accepts this exact count.</div><label>Counted quantity<input type="number" min="0" step="0.00001" required value={squareCountQuantity} onChange={event => setSquareCountQuantity(event.target.value)} /></label><label className="wide">Reason<textarea minLength={10} maxLength={1000} required value={squareCountReason} onChange={event => setSquareCountReason(event.target.value)} placeholder="Explain when and how this stock was physically counted." /></label></div>{squareCountError && <p className="error" role="alert">{squareCountError}</p>}<div className="form-actions"><button type="button" className="secondary" onClick={() => setSquareCountTarget(null)} disabled={savingSquareCount}>Cancel</button><button className="primary" disabled={savingSquareCount}>{savingSquareCount ? 'Submitting…' : 'Submit for approval'}</button></div></form>}
+    </section>
     {mode && <form className="entry-form" onSubmit={save}><div className="form-grid">
       {(mode === 'opening' || mode === 'correction') && <label>Inventory item<select required value={itemId} onChange={e => setItemId(e.target.value)}><option value="">Choose item</option>{items.map(item => <option key={item.id} value={item.id}>{item.name} · {item.currency}</option>)}</select></label>}
       {mode === 'item' && <><label>Item name<input required maxLength={200} value={name} onChange={e => setName(e.target.value)} /></label><label>SKU or stock code<input required maxLength={100} value={sku} onChange={e => setSku(e.target.value)} /></label><label>Currency<select value={accounts.find(x => x.id === accountId)?.currency ?? currency} onChange={() => {}} disabled><option>{accounts.find(x => x.id === accountId)?.currency ?? currency}</option></select></label><label className="wide">Reason<textarea minLength={10} maxLength={1000} required value={reason} onChange={e => setReason(e.target.value)} placeholder="Explain the source for this new supply item" /></label></>}
@@ -704,6 +753,7 @@ function InventoryPanel({ organizationId, accountId, currency, timezone, account
   </section>;
 }
 function Analytics({ organizationId, from, to, currency, timezone, refreshKey, role }: { organizationId: string; from: string; to: string; currency: string; timezone: string; refreshKey: string; role: string }) {
+  const [domainDraftItems, setDomainDraftItems] = useState<DomainDraftCatalogItem[]>([]);
   const [report, setReport] = useState<AnalyticsReport | null>(null), [error, setError] = useState(''), [loading, setLoading] = useState(false), [search, setSearch] = useState(''), [catalogSearch, setCatalogSearch] = useState(''), [sortBy, setSortBy] = useState<'revenue' | 'cost' | 'net' | 'units'>('revenue'), [seriesView, setSeriesView] = useState<'monthly' | 'daily'>('monthly'), [selectedProductId, setSelectedProductId] = useState('');
   const [catalogView, setCatalogView] = useState<'active' | 'archived' | 'all'>('active');
   const [catalogMode, setCatalogMode] = useState<CatalogDialogMode | null>(null);
@@ -719,7 +769,7 @@ function Analytics({ organizationId, from, to, currency, timezone, refreshKey, r
   const [catalogError, setCatalogError] = useState(''), [catalogNotice, setCatalogNotice] = useState('');
   const [catalogReconnectNeeded, setCatalogReconnectNeeded] = useState(false);
   const catalogPending = useRef<{ fingerprint: string; key: string; evidenceId?: string } | null>(null);
-  const canManageCatalog = role === 'owner';
+  const canManageCatalog = ['owner', 'administrator', 'manager'].includes(role);
   const canManageCosts = role === 'owner' || role === 'reviewer';
   useEffect(() => {
     let active = true; setLoading(true); setError(''); setReport(null); setSelectedProductId('');
@@ -729,10 +779,21 @@ function Analytics({ organizationId, from, to, currency, timezone, refreshKey, r
       .finally(() => { if (active) setLoading(false); });
     return () => { active = false; };
   }, [organizationId, from, to, currency, refreshKey]);
+  useEffect(() => {
+    let active = true;
+    api<{ items: DomainDraftCatalogItem[] }>(`/api/domain/catalog?organizationId=${encodeURIComponent(organizationId)}`)
+      .then(result => { if (active) setDomainDraftItems(result.items.filter(item => item.status === 'draft')); })
+      .catch(() => { if (active) setDomainDraftItems([]); });
+    return () => { active = false; };
+  }, [organizationId, refreshKey]);
   async function reloadCatalog() {
     const query = new URLSearchParams({ organizationId, from, to, currency });
     const result = await api<{ analytics: AnalyticsReport }>(`/api/analytics?${query}`);
     setReport(result.analytics);
+  }
+  async function reloadDomainCatalog() {
+    const result = await api<{ items: DomainDraftCatalogItem[] }>(`/api/domain/catalog?organizationId=${encodeURIComponent(organizationId)}`);
+    setDomainDraftItems(result.items.filter(item => item.status === 'draft'));
   }
   function openCatalogDialog(mode: CatalogDialogMode, item?: AnalyticsCatalogItem) {
     setCatalogMode(mode); setCatalogTarget(item ?? null); setCatalogError(''); setCatalogNotice(''); setCatalogReason(''); setCatalogReconnectNeeded(false);
@@ -781,8 +842,10 @@ function Analytics({ organizationId, from, to, currency, timezone, refreshKey, r
     const reason = catalogReason.trim();
     if (reason.length < 10) { setCatalogError('Explain the item change in at least 10 characters.'); return; }
     const target = catalogTarget;
-    let requestPath = '/api/square/catalog-items', method: 'POST' | 'PATCH' = 'PATCH', payload: Record<string, unknown>;
-    if (catalogMode === 'create') {
+    let requestPath = '/api/actions', method: 'POST' | 'PATCH' = 'POST', payload: Record<string, unknown>;
+    let actionType: string | null = null, expectedSourceVersion: string | null = null;
+    let proposalAmountMinor: number | null = null, proposalCurrency: string | null = null;
+    if (catalogMode === 'create' || catalogMode === 'draft_create') {
       if (!catalogName.trim() || catalogName.trim().length > 200 || catalogVariations.length < 1) { setCatalogError('Enter an item name and at least one variation.'); return; }
       const variations = [] as Array<Record<string, unknown>>;
       for (const variation of catalogVariations) {
@@ -792,26 +855,45 @@ function Analytics({ organizationId, from, to, currency, timezone, refreshKey, r
           setCatalogError('Each variation needs a name and a valid fixed price, or variable pricing.'); return;
         }
         variations.push({ name: variation.name.trim(), sku: variation.sku.trim(), pricingType: variation.pricingType,
-          priceMinor: fixedPrice, currency: variation.currency });
+          ...(variation.pricingType === 'FIXED_PRICING' ? { priceMinor: fixedPrice, currency: variation.currency } : {}) });
       }
-      payload = { organizationId, name: catalogName.trim(), description: catalogDescription.trim(), variations, reason };
-      method = 'POST';
+      if (catalogMode === 'draft_create') {
+        requestPath = '/api/domain/catalog';
+        payload = { name: catalogName.trim(), description: catalogDescription.trim(), categoryId: null,
+          variations: variations.map(variation => ({ name: variation.name, sku: variation.sku,
+            priceMinor: variation.pricingType === 'FIXED_PRICING' ? variation.priceMinor : null,
+            currency: variation.pricingType === 'FIXED_PRICING' ? variation.currency : null })) };
+      } else {
+        actionType = 'square.catalog.item.create';
+        payload = { name: catalogName.trim(), description: catalogDescription.trim(), variations, proposalReason: reason };
+      }
     } else if (!target?.squareItemId) {
       setCatalogError('This item is missing its Square link. Reopen the catalogue and try again.'); return;
     } else if (catalogMode === 'edit_item') {
       if (!catalogName.trim() || catalogName.trim().length > 200 || catalogDescription.length > 4096) { setCatalogError('Enter a valid item name and description.'); return; }
-      payload = { organizationId, action: 'update_item', squareItemId: target.squareItemId,
-        name: catalogName.trim(), description: catalogDescription.trim(), reason };
+      if (!target.itemSourceMappingId || !target.itemExpectedSquareVersion) { setCatalogError('Square source version is unavailable. Sync the catalog and retry.'); return; }
+      actionType = 'square.catalog.item.update'; expectedSourceVersion = target.itemExpectedSquareVersion;
+      payload = { sourceMappingId: target.itemSourceMappingId, squareItemId: target.squareItemId,
+        name: catalogName.trim(), description: catalogDescription.trim(), expectedSquareVersion: expectedSourceVersion, proposalReason: reason };
     } else if (catalogMode === 'edit_variation' || catalogMode === 'add_variation') {
       const fixedPrice = catalogPricingType === 'FIXED_PRICING' ? parseMinor(catalogPrice, catalogCurrency) : null;
       if (!catalogVariationName.trim() || catalogVariationName.trim().length > 200 || catalogSku.trim().length > 100
           || (catalogPricingType === 'FIXED_PRICING' && (fixedPrice === null || fixedPrice < 0))) {
         setCatalogError('Enter a variation name and a valid fixed price, or select variable pricing.'); return;
       }
-      payload = { organizationId, action: catalogMode === 'add_variation' ? 'add_variation' : 'update_variation',
-        squareItemId: target.squareItemId, ...(catalogMode === 'edit_variation' ? { squareCatalogObjectId: target.id } : {}),
+      const sourceMappingId = catalogMode === 'add_variation' ? target.itemSourceMappingId : target.sourceMappingId;
+      const sourceVersion = catalogMode === 'add_variation' ? target.itemExpectedSquareVersion : target.expectedSquareVersion;
+      if (!sourceMappingId || !sourceVersion) { setCatalogError('Square source version is unavailable. Sync the catalog and retry.'); return; }
+      actionType = catalogMode === 'add_variation' ? 'square.catalog.variation.add' : 'square.catalog.variation.update';
+      expectedSourceVersion = sourceVersion;
+      payload = { sourceMappingId, squareItemId: target.squareItemId,
+        ...(catalogMode === 'edit_variation' ? { squareVariationId: target.id } : {}),
         variationName: catalogVariationName.trim(), sku: catalogSku.trim(), pricingType: catalogPricingType,
-        priceMinor: fixedPrice, currency: catalogCurrency, reason };
+        ...(catalogPricingType === 'FIXED_PRICING' ? { priceMinor: fixedPrice, currency: catalogCurrency } : {}),
+        expectedSquareVersion: sourceVersion, proposalReason: reason };
+      if (catalogMode === 'edit_variation' && catalogPricingType === 'FIXED_PRICING') {
+        proposalAmountMinor = fixedPrice; proposalCurrency = catalogCurrency;
+      }
     } else if (catalogMode === 'cost') {
       const unitCostMinor = parseMinor(catalogCost, target.currency ?? currency);
       const effectiveFrom = /^\d{4}-\d\d-\d\d$/.test(catalogCostDate) ? zonedMidnight(catalogCostDate, timezone) : '';
@@ -824,7 +906,10 @@ function Analytics({ organizationId, from, to, currency, timezone, refreshKey, r
         updates: [{ catalogObjectId: target.id, name: target.itemName, unitCostMinor,
           currency: target.currency ?? currency, effectiveFrom }] };
     } else {
-      payload = { organizationId, action: catalogMode, squareItemId: target.squareItemId, reason };
+      if (!target.itemSourceMappingId || !target.itemExpectedSquareVersion) { setCatalogError('Square source version is unavailable. Sync the catalog and retry.'); return; }
+      actionType = 'square.catalog.item.archive'; expectedSourceVersion = target.itemExpectedSquareVersion;
+      payload = { sourceMappingId: target.itemSourceMappingId, squareItemId: target.squareItemId,
+        archived: catalogMode === 'archive', expectedSquareVersion: expectedSourceVersion, proposalReason: reason };
     }
     const evidenceKey = catalogEvidence ? `${catalogEvidence.name}:${catalogEvidence.size}:${catalogEvidence.lastModified}` : catalogEvidenceRef.trim();
     const fingerprint = JSON.stringify([catalogMode, payload, evidenceKey]);
@@ -843,23 +928,37 @@ function Analytics({ organizationId, from, to, currency, timezone, refreshKey, r
         }
         (payload as { evidenceRef: string }).evidenceRef = catalogPending.current.evidenceId!;
       }
+      const requestBody = catalogMode === 'draft_create' ? { organizationId, item: payload, reason }
+        : actionType ? { organizationId, actionType, payload, expectedSourceVersion,
+          amountMinor: proposalAmountMinor, currency: proposalCurrency, evidenceRefs: [] } : payload;
       const result = await api<{ projectionQueued?: boolean }>(requestPath, {
-        method, headers: { 'Idempotency-Key': catalogPending.current.key }, body: JSON.stringify(payload),
+        method, headers: { 'Idempotency-Key': catalogPending.current.key }, body: JSON.stringify(requestBody),
       });
       catalogPending.current = null; setCatalogMode(null); setCatalogTarget(null); setCatalogEvidence(null);
       const notices: Record<CatalogDialogMode, string> = {
-        create: 'Item and variations were added to the Square catalogue. Add an evidence-backed cost when you have supplier records.',
-        edit_item: 'Item details were updated in Square.', edit_variation: 'Variation details were updated in Square.',
-        add_variation: 'Variation was added to Square.', cost: result.projectionQueued ? 'Approved cost saved. A historical projection replay is queued.' : 'Approved cost saved.',
-        archive: 'Item archived. Its historical sales and item IDs remain available.', restore: 'Item restored to the active catalogue.',
+        create: 'Catalog action submitted for approval. Square is unchanged until an approver accepts it.',
+        draft_create: 'Vernius draft saved with an internal ID. Square is unchanged.',
+        edit_item: 'Catalog action submitted for approval. Square is unchanged until an approver accepts it.',
+        edit_variation: 'Catalog action submitted for approval. Square is unchanged until an approver accepts it.',
+        add_variation: 'Catalog action submitted for approval. Square is unchanged until an approver accepts it.',
+        cost: result.projectionQueued ? 'Approved cost saved. A historical projection replay is queued.' : 'Approved cost saved.',
+        archive: 'Catalog action submitted for approval. Square is unchanged until an approver accepts it.',
+        restore: 'Catalog action submitted for approval. Square is unchanged until an approver accepts it.',
       };
       setCatalogNotice(notices[catalogMode]);
-      try { await reloadCatalog(); }
-      catch { setCatalogError('The change was saved, but item details could not update. Reopen the catalogue to verify it.'); }
+      if (catalogMode === 'draft_create') void reloadDomainCatalog().catch(() => {});
+      if (catalogMode === 'cost') {
+        try { await reloadCatalog(); }
+        catch { setCatalogError('The change was saved, but item details could not update. Reopen the catalogue to verify it.'); }
+      }
     } catch (err) {
       const code = err instanceof Error ? err.message : '';
       setCatalogReconnectNeeded(['SQUARE_NOT_CONNECTED','SQUARE_RECONNECT_REQUIRED','SQUARE_CATALOG_WRITE_PERMISSION_REQUIRED'].includes(code));
       const messages: Record<string, string> = {
+        FORBIDDEN: 'Your role does not allow this catalog change.',
+        INVALID_DRAFT_CATALOG_ITEM: 'Check the item name and its variation details.',
+        INVALID_DRAFT_CATALOG_VARIATION: 'Each variation needs a name and either a valid price with currency or variable pricing.',
+        IDEMPOTENCY_CONFLICT: 'This request key was already used for a different catalog change. Close the form and submit it again.',
         SQUARE_NOT_CONNECTED: 'Connect Square before changing the catalogue.',
         SQUARE_RECONNECT_REQUIRED: 'Square authorization needs renewal. Reconnect it to continue.',
         SQUARE_CATALOG_WRITE_PERMISSION_REQUIRED: 'Square item write access is needed. Reauthorize Square to grant it.',
@@ -883,8 +982,8 @@ function Analytics({ organizationId, from, to, currency, timezone, refreshKey, r
     const href = URL.createObjectURL(new Blob([csv], { type: 'text/csv;charset=utf-8' })); const link = document.createElement('a'); link.href = href; link.download = `product-analytics-${from.slice(0,10)}-${to.slice(0,10)}.csv`; link.click(); URL.revokeObjectURL(href);
   }
   return <><FoldablePanel title="Performance snapshot" className="analytics-snapshot"><section className="metric-grid"><Card label="Product revenue" value={money(report?.totals?.revenueMinor, currency)} hint="After known discounts and refunds" /><Card label="Product cost" value={money(report?.totals?.costMinor, currency)} hint={report?.totals?.costMinor == null ? 'Cost evidence incomplete' : 'Approved acquisition costs'} tone={report?.totals?.costMinor == null ? 'warn-text' : ''} /><Card label="Square processing fees" value={money(report?.totals?.feesMinor, currency)} hint={report?.totals?.feesMinor == null ? 'Fee data incomplete' : feeHealthIncomplete ? 'Known fees; source health incomplete' : 'After product margins'} tone={report?.totals?.feesMinor == null ? 'warn-text' : feeHealthIncomplete ? 'warn-text' : ''} /><Card label="Net after fees" value={money(report?.totals?.netMinor, currency)} hint={feeHealthIncomplete && report?.totals?.netMinor != null ? 'Available fees only; source health incomplete' : 'Revenue − COGS − fees'} tone={feeHealthIncomplete ? 'warn-text' : report?.totals?.netMinor == null ? 'warn-text' : ''} /></section></FoldablePanel>
-    <FoldablePanel title="Item catalog and pricing" description="Square items and evidence-backed costs. Historical sales keep their item IDs." className="table-panel" actions={<span className="pill neutral">{report?.catalogStatus === 'unavailable' ? 'Unavailable' : activeCatalogCount + ' active · ' + archivedCatalogCount + ' archived'}</span>}>
-      <div className="catalog-toolbar"><div className="catalog-tabs" role="group" aria-label="Catalogue status filter"><button type="button" className={catalogView === 'active' ? 'catalog-tab selected' : 'catalog-tab'} aria-pressed={catalogView === 'active'} onClick={() => setCatalogView('active')}>Active <span>{activeCatalogCount}</span></button><button type="button" className={catalogView === 'archived' ? 'catalog-tab selected' : 'catalog-tab'} aria-pressed={catalogView === 'archived'} onClick={() => setCatalogView('archived')}>Archived <span>{archivedCatalogCount}</span></button><button type="button" className={catalogView === 'all' ? 'catalog-tab selected' : 'catalog-tab'} aria-pressed={catalogView === 'all'} onClick={() => setCatalogView('all')}>All <span>{allCatalogItems.length}</span></button></div><label>Find item<input type="search" value={catalogSearch} onChange={e => setCatalogSearch(e.target.value)} placeholder="Name, variation, SKU, or ID" /></label>{canManageCatalog && <button type="button" className="primary with-icon" onClick={() => openCatalogDialog('create')}><UiIcon name="plus" />Add item</button>}</div>
+    <FoldablePanel title="Item catalog and pricing" description="Square item changes go through approval. Evidence-backed costs remain a separate finance decision." className="table-panel" actions={<span className="pill neutral">{report?.catalogStatus === 'unavailable' ? 'Unavailable' : activeCatalogCount + ' active · ' + archivedCatalogCount + ' archived'}</span>}>
+      <div className="catalog-toolbar"><div className="catalog-tabs" role="group" aria-label="Catalogue status filter"><button type="button" className={catalogView === 'active' ? 'catalog-tab selected' : 'catalog-tab'} aria-pressed={catalogView === 'active'} onClick={() => setCatalogView('active')}>Active <span>{activeCatalogCount}</span></button><button type="button" className={catalogView === 'archived' ? 'catalog-tab selected' : 'catalog-tab'} aria-pressed={catalogView === 'archived'} onClick={() => setCatalogView('archived')}>Archived <span>{archivedCatalogCount}</span></button><button type="button" className={catalogView === 'all' ? 'catalog-tab selected' : 'catalog-tab'} aria-pressed={catalogView === 'all'} onClick={() => setCatalogView('all')}>All <span>{allCatalogItems.length}</span></button></div><label>Find item<input type="search" value={catalogSearch} onChange={e => setCatalogSearch(e.target.value)} placeholder="Name, variation, SKU, or ID" /></label>{canManageCatalog && <><button type="button" className="secondary with-icon" onClick={() => openCatalogDialog('draft_create')}><UiIcon name="plus" />Save Vernius draft</button><button type="button" className="primary with-icon" onClick={() => openCatalogDialog('create')}><UiIcon name="plus" />Add item to Square</button></>}</div>
       {catalogNotice && <div className="notice" role="status">{catalogNotice}</div>}{catalogError && !catalogMode && <div className="notice error-box" role="alert">{catalogError}</div>}
       {catalogReconnectNeeded && canManageCatalog && <button type="button" className="secondary" onClick={() => void authorizeSquareCatalog()} disabled={catalogSaving}>Connect or reauthorize Square</button>}
       {loading ? <div className="inline-empty">Loading item catalog…</div> : report?.catalogStatus === 'unavailable' ? <div className="inline-empty">Item catalog pricing could not be loaded. Product performance data is still available.</div> : visibleCatalogItems.length ? <div className="table-wrap"><table className="catalog-table"><thead><tr><th>Item</th><th>SKU</th>{showCatalogCurrency && <th>Currency</th>}<th className="numeric">Selling price</th><th className="numeric">Approved unit cost</th><th aria-label="Actions"></th></tr></thead><tbody>{visibleCatalogItems.map((item, index) => {
@@ -892,17 +991,18 @@ function Analytics({ organizationId, from, to, currency, timezone, refreshKey, r
           && !visibleCatalogItems.slice(0, index).some(previous => previous.squareItemId === item.squareItemId);
         return <tr key={`${item.itemKind}:${item.id}:${item.currency ?? ''}`}><td>{item.itemName}{item.archived && <span className="pill neutral catalog-state">Archived</span>}<small className="cell-sub">{item.variationName ? item.variationName : item.itemKind === 'supply' ? 'Supply item' : 'Square item'}</small></td><td>{item.sku ?? '—'}</td>{showCatalogCurrency && <td>{item.currency ?? '—'}</td>}<td className="numeric">{item.itemKind === 'supply' ? '—' : item.sellingPriceMinor == null ? item.pricingType === 'VARIABLE_PRICING' ? 'Variable' : '—' : money(item.sellingPriceMinor, item.currency ?? currency)}</td><td className="numeric">{item.itemKind === 'supply' ? '—' : item.unitCostMinor == null ? <span className="cost-unavailable">Cost unavailable</span> : <>{money(item.unitCostMinor, item.currency ?? currency)}{item.costEffectiveFrom && <small className="cell-sub">Effective {item.costEffectiveFrom.slice(0, 10)}</small>}</>}</td><td><details className="action-menu catalog-row-menu"><summary aria-label={`Actions for ${item.itemName}`} title="More actions"><UiIcon name="more" /></summary><div className="action-menu-popover">{item.itemKind === 'square' && canManageCatalog && <>{firstForItem && <><button type="button" onClick={() => openCatalogDialog('edit_item', item)}>Edit item</button><button type="button" onClick={() => openCatalogDialog('add_variation', item)}>Add variation</button><button type="button" onClick={() => openCatalogDialog(item.archived ? 'restore' : 'archive', item)}>{item.archived ? 'Restore item' : 'Archive item'}</button></>}<button type="button" onClick={() => openCatalogDialog('edit_variation', item)}>Edit variation</button></>}{item.itemKind === 'square' && canManageCosts && <button type="button" onClick={() => openCatalogDialog('cost', item)}>{item.unitCostMinor == null ? 'Add cost' : 'Update cost'}</button>}{item.itemKind === 'supply' && <span className="menu-note">Managed in inventory</span>}</div></details></td></tr>;
       })}</tbody></table></div> : !error ? <div className="inline-empty">{allCatalogItems.length ? 'No items match this filter.' : 'No synced Square items or registered supplies are available.'}</div> : null}
+      {domainDraftItems.length > 0 && <section className="stock-panel"><div className="panel-heading"><div><h3>Vernius drafts</h3><p>Internal catalog records that have not been linked to a Square item.</p></div><span className="pill neutral">{domainDraftItems.length} draft{domainDraftItems.length === 1 ? '' : 's'}</span></div><div className="table-wrap"><table><thead><tr><th>Draft item</th><th>Variations</th><th>Internal ID</th><th>Status</th></tr></thead><tbody>{domainDraftItems.map(item => <tr key={item.itemId}><td>{item.name}<small className="cell-sub">{item.description || 'No description'}</small></td><td>{item.variations.map(variation => `${variation.name}${variation.sku ? ` · ${variation.sku}` : ''}`).join(', ')}</td><td><code>{item.itemId}</code></td><td><span className="pill neutral">Draft</span></td></tr>)}</tbody></table></div></section>}
     </FoldablePanel>
-    {catalogMode && <div className="dialog-backdrop" role="presentation"><section className="dialog catalog-dialog" role="dialog" aria-modal="true" aria-labelledby="catalog-dialog-title"><button type="button" className="icon-button dialog-close" onClick={closeCatalogDialog} disabled={catalogSaving} aria-label="Close catalogue editor"><UiIcon name="close" /></button><h2 id="catalog-dialog-title">{{ create: 'Add catalogue item', edit_item: 'Edit item details', edit_variation: 'Edit variation', add_variation: 'Add variation', cost: 'Approve item cost', archive: 'Archive item', restore: 'Restore item' }[catalogMode]}</h2>
+    {catalogMode && <div className="dialog-backdrop" role="presentation"><section className="dialog catalog-dialog" role="dialog" aria-modal="true" aria-labelledby="catalog-dialog-title"><button type="button" className="icon-button dialog-close" onClick={closeCatalogDialog} disabled={catalogSaving} aria-label="Close catalogue editor"><UiIcon name="close" /></button><h2 id="catalog-dialog-title">{{ create: 'Add item to Square', draft_create: 'Save Vernius draft', edit_item: 'Edit item details', edit_variation: 'Edit variation', add_variation: 'Add variation', cost: 'Approve item cost', archive: 'Archive item', restore: 'Restore item' }[catalogMode]}</h2>
       <form className="entry-form" onSubmit={saveCatalogAction}>
-        {catalogMode === 'create' && <><label>Item name<input required maxLength={200} value={catalogName} onChange={event => setCatalogName(event.target.value)} /></label><label>Description (optional)<textarea rows={3} maxLength={4096} value={catalogDescription} onChange={event => setCatalogDescription(event.target.value)} /></label><div className="catalog-variation-list"><div className="catalog-section-head"><b>Sale variations</b><button type="button" className="secondary with-icon" disabled={catalogVariations.length >= 250} onClick={() => setCatalogVariations(current => [...current, { name: '', sku: '', pricingType: 'FIXED_PRICING', price: '', currency }])}><UiIcon name="plus" />Add</button></div>{catalogVariations.map((variation, index) => <div className="catalog-variation-draft" key={index}><label>Variation name<input required maxLength={200} value={variation.name} onChange={event => setCatalogVariations(current => current.map((row, rowIndex) => rowIndex === index ? { ...row, name: event.target.value } : row))} /></label><label>SKU<input maxLength={100} value={variation.sku} onChange={event => setCatalogVariations(current => current.map((row, rowIndex) => rowIndex === index ? { ...row, sku: event.target.value } : row))} /></label><label>Pricing<select value={variation.pricingType} onChange={event => setCatalogVariations(current => current.map((row, rowIndex) => rowIndex === index ? { ...row, pricingType: event.target.value as CatalogVariationDraft['pricingType'] } : row))}><option value="FIXED_PRICING">Fixed price</option><option value="VARIABLE_PRICING">Variable amount</option></select></label>{variation.pricingType === 'FIXED_PRICING' ? <><label>Sale price<input type="number" min="0" step="any" required value={variation.price} onChange={event => setCatalogVariations(current => current.map((row, rowIndex) => rowIndex === index ? { ...row, price: event.target.value } : row))} /></label><label>Currency<select value={variation.currency} onChange={event => setCatalogVariations(current => current.map((row, rowIndex) => rowIndex === index ? { ...row, currency: event.target.value } : row))}>{Array.from(new Set([currency, variation.currency])).map(value => <option key={value} value={value}>{value}</option>)}</select></label></> : <p className="field-hint">Customer enters the amount at sale.</p>}{catalogVariations.length > 1 && <button type="button" className="icon-button reject-button" onClick={() => setCatalogVariations(current => current.filter((_, rowIndex) => rowIndex !== index))} aria-label={`Remove variation ${index + 1}`} title="Remove variation"><UiIcon name="trash" /></button>}</div>)}</div></>}
+        {(catalogMode === 'create' || catalogMode === 'draft_create') && <>{catalogMode === 'draft_create' && <p className="muted">This creates a Vernius-owned product record without changing Square.</p>}<label>Item name<input required maxLength={200} value={catalogName} onChange={event => setCatalogName(event.target.value)} /></label><label>Description (optional)<textarea rows={3} maxLength={4096} value={catalogDescription} onChange={event => setCatalogDescription(event.target.value)} /></label><div className="catalog-variation-list"><div className="catalog-section-head"><b>Sale variations</b><button type="button" className="secondary with-icon" disabled={catalogVariations.length >= 250} onClick={() => setCatalogVariations(current => [...current, { name: '', sku: '', pricingType: 'FIXED_PRICING', price: '', currency }])}><UiIcon name="plus" />Add</button></div>{catalogVariations.map((variation, index) => <div className="catalog-variation-draft" key={index}><label>Variation name<input required maxLength={200} value={variation.name} onChange={event => setCatalogVariations(current => current.map((row, rowIndex) => rowIndex === index ? { ...row, name: event.target.value } : row))} /></label><label>SKU<input maxLength={100} value={variation.sku} onChange={event => setCatalogVariations(current => current.map((row, rowIndex) => rowIndex === index ? { ...row, sku: event.target.value } : row))} /></label><label>Pricing<select value={variation.pricingType} onChange={event => setCatalogVariations(current => current.map((row, rowIndex) => rowIndex === index ? { ...row, pricingType: event.target.value as CatalogVariationDraft['pricingType'] } : row))}><option value="FIXED_PRICING">Fixed price</option><option value="VARIABLE_PRICING">Variable amount</option></select></label>{variation.pricingType === 'FIXED_PRICING' ? <><label>Sale price<input type="number" min="0" step="any" required value={variation.price} onChange={event => setCatalogVariations(current => current.map((row, rowIndex) => rowIndex === index ? { ...row, price: event.target.value } : row))} /></label><label>Currency<select value={variation.currency} onChange={event => setCatalogVariations(current => current.map((row, rowIndex) => rowIndex === index ? { ...row, currency: event.target.value } : row))}>{Array.from(new Set([currency, variation.currency])).map(value => <option key={value} value={value}>{value}</option>)}</select></label></> : <p className="field-hint">Customer enters the amount at sale.</p>}{catalogVariations.length > 1 && <button type="button" className="icon-button reject-button" onClick={() => setCatalogVariations(current => current.filter((_, rowIndex) => rowIndex !== index))} aria-label={`Remove variation ${index + 1}`} title="Remove variation"><UiIcon name="trash" /></button>}</div>)}</div></>}
         {catalogMode === 'edit_item' && <><label>Item name<input required maxLength={200} value={catalogName} onChange={event => setCatalogName(event.target.value)} /></label><label>Description (optional)<textarea rows={4} maxLength={4096} value={catalogDescription} onChange={event => setCatalogDescription(event.target.value)} /></label></>}
         {(catalogMode === 'edit_variation' || catalogMode === 'add_variation') && <><label>Variation name<input required maxLength={200} value={catalogVariationName} onChange={event => setCatalogVariationName(event.target.value)} /></label><label>SKU<input maxLength={100} value={catalogSku} onChange={event => setCatalogSku(event.target.value)} /></label><label>Pricing<select value={catalogPricingType} onChange={event => setCatalogPricingType(event.target.value as typeof catalogPricingType)}><option value="FIXED_PRICING">Fixed price</option><option value="VARIABLE_PRICING">Variable amount</option></select></label>{catalogPricingType === 'FIXED_PRICING' ? <><label>Sale price ({catalogCurrency})<input type="number" min="0" step="any" required value={catalogPrice} onChange={event => setCatalogPrice(event.target.value)} /></label><label>Currency<select value={catalogCurrency} onChange={event => setCatalogCurrency(event.target.value)}>{Array.from(new Set([currency, catalogCurrency])).map(value => <option key={value} value={value}>{value}</option>)}</select></label></> : <p className="field-hint">The customer enters the amount when this variation is sold.</p>}</>}
         {catalogMode === 'cost' && <><p className="muted">Use supplier evidence and unit acquisition cost. Historical COGS updates from the effective date.</p><label>Approved unit acquisition cost ({catalogTarget?.currency ?? currency})<input type="number" min="0" step="any" required value={catalogCost} onChange={event => setCatalogCost(event.target.value)} /></label><label>Effective date ({timezone})<input type="date" required value={catalogCostDate} onChange={event => setCatalogCostDate(event.target.value)} /></label><label>Supplier evidence file<input type="file" accept="application/pdf,image/jpeg,image/png" onChange={event => setCatalogEvidence(event.target.files?.[0] ?? null)} /></label><label>Or existing evidence ID<input value={catalogEvidenceRef} onChange={event => setCatalogEvidenceRef(event.target.value)} maxLength={36} placeholder="Evidence UUID" /></label></>}
         {(catalogMode === 'archive' || catalogMode === 'restore') && <p className="muted">{catalogMode === 'archive' ? 'Archives all variations; historical sales keep their item IDs.' : 'Restores this item and its variations.'}</p>}
         <label>Reason<textarea required minLength={10} maxLength={1000} value={catalogReason} onChange={event => setCatalogReason(event.target.value)} placeholder="Why are you changing this item?" /></label>
         {catalogError && <p className="error" role="alert">{catalogError}</p>}{catalogReconnectNeeded && canManageCatalog && <button type="button" className="secondary" onClick={() => void authorizeSquareCatalog()} disabled={catalogSaving}>Connect or reauthorize Square</button>}
-        <div className="form-actions"><button type="button" className="secondary" onClick={closeCatalogDialog} disabled={catalogSaving}>Cancel</button><button type="submit" className="primary with-icon" disabled={catalogSaving}><UiIcon name={catalogMode === 'archive' ? 'archive' : catalogMode === 'restore' ? 'refresh' : 'check'} />{catalogSaving ? 'Saving…' : catalogMode === 'cost' ? 'Approve cost' : catalogMode === 'archive' ? 'Archive' : catalogMode === 'restore' ? 'Restore' : catalogMode === 'create' ? 'Create in Square' : 'Save'}</button></div>
+        <div className="form-actions"><button type="button" className="secondary" onClick={closeCatalogDialog} disabled={catalogSaving}>Cancel</button><button type="submit" className="primary with-icon" disabled={catalogSaving}><UiIcon name={catalogMode === 'archive' ? 'archive' : catalogMode === 'restore' ? 'refresh' : 'check'} />{catalogSaving ? 'Submitting…' : catalogMode === 'cost' ? 'Approve cost' : catalogMode === 'draft_create' ? 'Save draft' : 'Submit for approval'}</button></div>
       </form></section></div>}
     <FoldablePanel title="Product performance before fees" description="Select a product to see its sales trend." className="table-panel" actions={<div className="form-actions"><span className={report?.status === 'complete' ? 'pill good' : report?.status === 'failed' ? 'pill warn' : 'pill neutral'}>{report?.status ?? (loading ? 'Loading' : 'Unavailable')}</span><button className="secondary with-icon" onClick={exportCsv} disabled={!report}><UiIcon name="download" />Export</button></div>}>
       {loading && <div className="inline-empty">Calculating product results…</div>}{error && <div className="notice error-box" role="alert">{error}</div>}{report?.currency == null && report?.status === 'failed' && <div className="notice error-box" role="alert">Mixed or invalid source currencies prevented a single-currency report.</div>}
@@ -1226,13 +1326,260 @@ function Review({ issues, organizationId, currency, canSync, syncPeriodLabel, on
     </div>}
   </>;
 }
-function Ledger({ events }: { events: AuditEvent[] }) {
+function Ledger({ organizationId, events }: { organizationId: string; events: AuditEvent[] }) {
+  const [visibleEvents, setVisibleEvents] = useState(events), [actorUserId, setActorUserId] = useState(''), [action, setAction] = useState('');
+  const [entityId, setEntityId] = useState(''), [fromDate, setFromDate] = useState(''), [toDate, setToDate] = useState('');
+  const [searchError, setSearchError] = useState(''), [searching, setSearching] = useState(false);
+  useEffect(() => { setVisibleEvents(events); }, [events]);
+  async function searchAudit(event: FormEvent) {
+    event.preventDefault(); setSearching(true); setSearchError('');
+    const query = new URLSearchParams({ organizationId, limit: '500' });
+    if (actorUserId.trim()) query.set('actorUserId', actorUserId.trim());
+    if (action.trim()) query.set('action', action.trim());
+    if (entityId.trim()) query.set('entityId', entityId.trim());
+    if (fromDate) query.set('from', new Date(`${fromDate}T00:00:00.000Z`).toISOString());
+    if (toDate) query.set('to', new Date(Date.parse(`${toDate}T00:00:00.000Z`) + 86400000).toISOString());
+    try { const result = await api<{ events: AuditEvent[] }>(`/api/audit?${query}`); setVisibleEvents(result.events ?? []); }
+    catch (error) { setSearchError(error instanceof Error ? error.message : 'Audit history could not be searched.'); }
+    finally { setSearching(false); }
+  }
+  function resetSearch() { setActorUserId(''); setAction(''); setEntityId(''); setFromDate(''); setToDate(''); setVisibleEvents(events); setSearchError(''); }
   function exportCsv() {
     const columns = ['id', 'created_at', 'action', 'actor_kind', 'actor_user_id', 'entity_type', 'entity_id', 'source_refs', 'revision', 'details'];
     const quote = (value: unknown) => { let text = String(value ?? ''); if (/^[=+\-@\t\r]/.test(text)) text = `'${text}`; return `"${text.replaceAll('"', '""')}"`; };
-    const rows = [columns.join(','), ...events.map(event => columns.map(key => quote(['details', 'source_refs'].includes(key) ? JSON.stringify((event as unknown as Record<string, unknown>)[key] ?? (key === 'details' ? {} : [])) : (event as unknown as Record<string, unknown>)[key])).join(','))];
+    const rows = [columns.join(','), ...visibleEvents.map(event => columns.map(key => quote(['details', 'source_refs'].includes(key) ? JSON.stringify((event as unknown as Record<string, unknown>)[key] ?? (key === 'details' ? {} : [])) : (event as unknown as Record<string, unknown>)[key])).join(','))];
     const blob = new Blob([`\uFEFF${rows.join('\r\n')}`], { type: 'text/csv;charset=utf-8' }); const url = URL.createObjectURL(blob); const a = document.createElement('a'); a.href = url; a.download = 'vernius-audit.csv'; a.click(); window.setTimeout(() => URL.revokeObjectURL(url), 1000);
   }
-  return <section className="panel table-panel"><div className="panel-heading"><div><h2>Audit history</h2></div><button className="secondary with-icon" disabled={!events.length} onClick={exportCsv}><UiIcon name="download" />Export</button></div>{events.length ? <div className="table-wrap"><table><thead><tr><th>Time</th><th>Event</th><th>Actor</th><th>Details</th><th>Reference</th></tr></thead><tbody>{events.map(e => <tr key={e.id}><td>{date(e.created_at)}</td><td>{e.action ?? e.event_type ?? 'Workspace event'}<small className="cell-sub">{e.entity_type ?? ''}</small></td><td>{e.actor_user_id ?? e.actor_id ?? e.actor_kind ?? 'System'}</td><td>{e.reason ?? JSON.stringify(e.details ?? e.payload ?? {})}</td><td>{e.entity_id ?? e.id}</td></tr>)}</tbody></table></div> : <div className="inline-empty">No audit events yet.</div>}</section>;
+  return <section className="panel table-panel"><div className="panel-heading"><div><h2>Audit history</h2><p>Search by employee, operation, record, and date.</p></div><button className="secondary with-icon" disabled={!visibleEvents.length} onClick={exportCsv}><UiIcon name="download" />Export</button></div><form className="form-grid" onSubmit={searchAudit}><label>Employee user ID<input value={actorUserId} onChange={event => setActorUserId(event.target.value)} /></label><label>Operation<input value={action} onChange={event => setAction(event.target.value)} placeholder="e.g. set_permission" /></label><label>Product or record ID<input value={entityId} onChange={event => setEntityId(event.target.value)} /></label><label>From<input type="date" value={fromDate} onChange={event => setFromDate(event.target.value)} /></label><label>Through<input type="date" value={toDate} onChange={event => setToDate(event.target.value)} /></label><div className="button-row"><button className="secondary" disabled={searching}>{searching ? 'Searching…' : 'Search history'}</button><button type="button" className="text-button" onClick={resetSearch}>Reset</button></div></form>{searchError && <p className="error" role="alert">{searchError}</p>}{visibleEvents.length ? <div className="table-wrap"><table><thead><tr><th>Time</th><th>Event</th><th>Actor</th><th>Details</th><th>Reference</th></tr></thead><tbody>{visibleEvents.map(e => <tr key={e.id}><td>{date(e.created_at)}</td><td>{e.action ?? e.event_type ?? 'Workspace event'}<small className="cell-sub">{e.entity_type ?? ''}</small></td><td>{e.actor_user_id ?? e.actor_id ?? e.actor_kind ?? 'System'}</td><td>{e.reason ?? JSON.stringify(e.details ?? e.payload ?? {})}</td><td>{e.entity_id ?? e.id}</td></tr>)}</tbody></table></div> : <div className="inline-empty">No matching audit events. Adjust your filters and search again.</div>}</section>;
 }
-function Settings({ dashboard: d, accountId, onAccount }: { dashboard: Dashboard; accountId: string; onAccount: (v: string) => void }) { return <div className="settings-grid"><section className="panel settings-card"><div className="panel-heading"><div><h2>Workspace</h2></div></div><div className="setting-row"><span>Organization</span><b>{d.organization?.name ?? 'Not provided'}</b></div><div className="setting-row"><span>Reporting timezone</span><b>{d.organization?.timezone ?? 'Not configured'}</b></div><div className="setting-row"><span>Projection version</span><b>{d.projectionVersion ?? 'Not reported'}</b></div><div className="setting-row"><span>Reporting currency</span><b>{d.period?.currency ?? d.income?.currency ?? 'Not specified'}</b></div></section><section className="panel settings-card"><div className="panel-heading"><div><h2>Accounts</h2></div></div>{d.accounts?.length ? <label>Selected account<select value={accountId} onChange={e => onAccount(e.target.value)}>{d.accounts.map(a => <option key={a.id} value={a.id}>{a.name} · {a.kind ?? 'account'} · {a.currency}</option>)}</select></label> : <div className="inline-empty">No accounts available.</div>}<div className="notice compact-notice">Admins manage opening balances, tolerance, mappings, and roles.</div></section></div>; }
+function FinancialLedger({ organizationId, from, to }: { organizationId: string; from: string; to: string }) {
+  const [events, setEvents] = useState<FinancialEvent[]>([]), [loading, setLoading] = useState(true), [error, setError] = useState('');
+  useEffect(() => {
+    let active = true;
+    setLoading(true); setError('');
+    const query = new URLSearchParams({ organizationId, from, to });
+    api<{ events: FinancialEvent[] }>(`/api/financial-events?${query}`)
+      .then(result => { if (active) setEvents(result.events ?? []); })
+      .catch(reason => { if (active) setError(reason instanceof Error ? reason.message : 'Financial events could not be loaded.'); })
+      .finally(() => { if (active) setLoading(false); });
+    return () => { active = false; };
+  }, [organizationId, from, to]);
+  return <section className="panel table-panel"><div className="panel-heading"><div><h2>Financial events</h2><p>Source-linked sales, refunds, discounts, taxes, fees, and settlement entries.</p></div><span className="muted">{events.length} events</span></div>
+    {loading ? <div className="inline-empty">Loading financial events…</div> : error ? <div className="notice error-box" role="alert">{error}</div> : events.length ? <div className="table-wrap"><table><thead><tr><th>Time</th><th>Event</th><th>Description</th><th>Amount</th><th>Source</th></tr></thead><tbody>{events.map(event => <tr key={event.id}>
+      <td>{date(event.occurredAt)}</td><td>{event.eventType.replaceAll('_', ' ')}<small className="cell-sub">{event.status}</small></td>
+      <td>{event.description}{event.lines?.length ? <small className="cell-sub">{event.lines.map(line => `${line.description || 'Line'} × ${line.quantity ?? '—'}`).join(', ')}</small> : null}</td>
+      <td className={event.status === 'incomplete' ? 'muted' : ''}>{event.amountMinor == null ? 'Amount missing' : money(event.amountMinor, event.currency)}</td>
+      <td><small>{event.sourceProvider ?? 'Vernius'} · {event.sourceType ?? 'manual'}</small><details className="proposal-details"><summary>Evidence</summary><pre>{JSON.stringify({ sourceId: event.sourceId, sourceVersion: event.sourceVersion, supersedesEventId: event.supersedesEventId, details: event.details }, null, 2)}</pre></details></td>
+    </tr>)}</tbody></table></div> : <div className="inline-empty">No financial events in this period. Sync Square or record an operational transaction to populate the ledger.</div>}
+  </section>;
+}
+
+type ActionProposalRow = { id: string; action_type: string; status: string; payload: Record<string, unknown>; payload_sha256: string; expected_source_version?: string | null; location_id?: string | null; amount_minor?: number | null; currency?: string | null; proposed_by: string; created_at: string; expires_at: string; evidence_refs?: string[]; decisions?: Array<{ decision: string; reason: string; decided_by: string | null; decided_by_kind?: string; created_at: string }>; executions?: Array<{ attempt: number; status: string; outcome_code?: string | null }> };
+type PowerAutomateApprovalIntegration = { id: string; name: string; mappingId: string; userId: string; email: string | null; tenantId: string; teamsUserId: string; createdAt: string; revokedAt: string | null };
+type RoleSettingsData = { memberships: Array<{ user_id: string; role: string; custom_role_id?: string | null; location_scope_mode: string }>; organization_custom_roles: Array<{ id: string; name: string; description?: string }>; organization_role_permission_overrides: Array<{ role_key: string; permission_key: string; allowed: boolean }>; membership_location_scopes: Array<{ user_id: string; location_id: string }>; business_locations: Array<{ id: string; name: string; status: string }>; external_identity_mappings: Array<{ id: string; user_id: string; provider: string; tenant_id: string; external_user_id: string; external_email?: string | null; status: string }>; action_approval_policies: Array<{ id: string; action_type: string; location_id: string | null; amount_currency: string | null; min_amount_minor: number | null; max_amount_minor: number | null; required_role: string; required_approval_count: number; required_permission: string; max_single_approver_minor: number | null; enabled: boolean }> };
+function Settings({ organizationId, userId, role, dashboard: d, accountId, onAccount }: { organizationId: string; userId: string; role: string; dashboard: Dashboard; accountId: string; onAccount: (v: string) => void }) {
+  const [proposals, setProposals] = useState<ActionProposalRow[]>([]), [proposalError, setProposalError] = useState(''), [proposalLoading, setProposalLoading] = useState(true);
+  const [roles, setRoles] = useState<RoleSettingsData | null>(null), [roleError, setRoleError] = useState(''), [roleLoading, setRoleLoading] = useState(false);
+  const [reasonByProposal, setReasonByProposal] = useState<Record<string, string>>({}), [busyProposal, setBusyProposal] = useState('');
+  const [revisionProposalId, setRevisionProposalId] = useState(''), [revisionPayload, setRevisionPayload] = useState(''), [revisionReason, setRevisionReason] = useState('');
+  const [roleByUser, setRoleByUser] = useState<Record<string, string>>({}), [customRoleByUser, setCustomRoleByUser] = useState<Record<string, string>>({}), [busyUser, setBusyUser] = useState('');
+  const [scopeByUser, setScopeByUser] = useState<Record<string, { mode: string; locationIds: string[] }>>({});
+  const [customRoleName, setCustomRoleName] = useState(''), [customRolePermissions, setCustomRolePermissions] = useState('catalog.read, issues.read'), [customRoleBusy, setCustomRoleBusy] = useState(false), [roleSuccess, setRoleSuccess] = useState('');
+  const [permissionRole, setPermissionRole] = useState('employee'), [permissionKey, setPermissionKey] = useState('catalog.read'), [permissionAllowed, setPermissionAllowed] = useState(true), [permissionBusy, setPermissionBusy] = useState(false);
+  const [policyActionType, setPolicyActionType] = useState('square.inventory.count.set'), [policyLocationId, setPolicyLocationId] = useState('');
+  const [policyMinAmount, setPolicyMinAmount] = useState(''), [policyMaxAmount, setPolicyMaxAmount] = useState(''), [policyMaxSingle, setPolicyMaxSingle] = useState('');
+  const [policyCurrency, setPolicyCurrency] = useState(d.period?.currency ?? 'USD');
+  const [policyRole, setPolicyRole] = useState('manager'), [policyPermission, setPolicyPermission] = useState('approvals.decide'), [policyApprovalCount, setPolicyApprovalCount] = useState('1'), [policyBusy, setPolicyBusy] = useState(false);
+  const [teamsUserId, setTeamsUserId] = useState(''), [teamsTenantId, setTeamsTenantId] = useState(''), [teamsExternalUserId, setTeamsExternalUserId] = useState(''), [teamsEmail, setTeamsEmail] = useState('');
+  const [teamsReason, setTeamsReason] = useState(''), [teamsOperation, setTeamsOperation] = useState('link'), [teamsBusy, setTeamsBusy] = useState(false);
+  const [approvalIntegrations, setApprovalIntegrations] = useState<PowerAutomateApprovalIntegration[]>([]);
+  const [approvalIntegrationName, setApprovalIntegrationName] = useState('Teams approvals');
+  const [approvalMappingId, setApprovalMappingId] = useState(''), [approvalIntegrationBusy, setApprovalIntegrationBusy] = useState(false);
+  const [createdApprovalToken, setCreatedApprovalToken] = useState('');
+  const canManagePeople = role === 'owner' || role === 'administrator';
+  const eligibleApprovalMappings = roles?.external_identity_mappings.filter(identity => identity.status === 'active'
+    && identity.external_email && !approvalIntegrations.some(integration => integration.mappingId === identity.id && !integration.revokedAt)) ?? [];
+  async function reloadProposals() {
+    setProposalLoading(true); setProposalError('');
+    try { const result = await api<{ proposals: ActionProposalRow[] }>(`/api/actions?${new URLSearchParams({ organizationId })}`); setProposals(result.proposals ?? []); }
+    catch (error) { setProposalError(error instanceof Error ? error.message : 'Approval requests could not be loaded.'); }
+    finally { setProposalLoading(false); }
+  }
+  async function reloadRoles() {
+    if (!canManagePeople) return;
+    setRoleLoading(true); setRoleError('');
+    try {
+      const result = await api<{ roles: RoleSettingsData }>(`/api/roles?${new URLSearchParams({ organizationId })}`);
+      setRoles(result.roles);
+      if (role === 'owner') {
+        try {
+          const integrations = await api<{ integrations: PowerAutomateApprovalIntegration[] }>(`/api/approval-integrations?${new URLSearchParams({ organizationId })}`);
+          setApprovalIntegrations(integrations.integrations ?? []);
+        } catch (error) { setRoleError(error instanceof Error ? error.message : 'Power Automate integrations could not be loaded.'); }
+      }
+    }
+    catch (error) { setRoleError(error instanceof Error ? error.message : 'Role settings could not be loaded.'); }
+    finally { setRoleLoading(false); }
+  }
+  useEffect(() => { void reloadProposals(); void reloadRoles(); }, [organizationId, canManagePeople]);
+  async function decide(proposal: ActionProposalRow, decision: 'approved' | 'rejected') {
+    const reason = (reasonByProposal[proposal.id] ?? '').trim();
+    if (reason.length < 10) { setProposalError('Enter an approval or rejection reason of at least 10 characters.'); return; }
+    setBusyProposal(proposal.id); setProposalError('');
+    try {
+      await api(`/api/actions/${encodeURIComponent(proposal.id)}/decision`, { method: 'POST', headers: { 'Idempotency-Key': window.crypto.randomUUID() }, body: JSON.stringify({ organizationId, decision, reason, expectedPayloadSha256: proposal.payload_sha256 }) });
+      await reloadProposals();
+    } catch (error) { setProposalError(error instanceof Error ? error.message : 'The approval decision could not be saved.'); }
+    finally { setBusyProposal(''); }
+  }
+  async function cancelProposal(proposal: ActionProposalRow) {
+    const reason = (reasonByProposal[proposal.id] ?? '').trim();
+    if (reason.length < 10) { setProposalError('Enter a cancellation reason of at least 10 characters.'); return; }
+    setBusyProposal(proposal.id); setProposalError('');
+    try {
+      await api(`/api/actions/${encodeURIComponent(proposal.id)}/cancel`, { method: 'POST', headers: { 'Idempotency-Key': window.crypto.randomUUID() }, body: JSON.stringify({ organizationId, reason }) });
+      await reloadProposals();
+    } catch (error) { setProposalError(error instanceof Error ? error.message : 'The action proposal could not be cancelled.'); }
+    finally { setBusyProposal(''); }
+  }
+  function startRevision(proposal: ActionProposalRow) {
+    setRevisionProposalId(proposal.id); setRevisionPayload(JSON.stringify(proposal.payload, null, 2)); setRevisionReason(''); setProposalError('');
+  }
+  async function submitRevision(event: FormEvent, proposal: ActionProposalRow) {
+    event.preventDefault(); setProposalError('');
+    const reason = revisionReason.trim();
+    if (reason.length < 10) { setProposalError('Enter a reason of at least 10 characters for the revised proposal.'); return; }
+    let payload: Record<string, unknown>;
+    try {
+      const parsed: unknown = JSON.parse(revisionPayload);
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('The proposal payload must be a JSON object.');
+      payload = { ...(parsed as Record<string, unknown>), proposalReason: reason };
+    } catch (error) { setProposalError(error instanceof Error ? error.message : 'Enter a valid JSON object.'); return; }
+    setBusyProposal(proposal.id);
+    try {
+      const changedPrice = payload.priceMinor;
+      const amountMinor = Number.isSafeInteger(changedPrice) ? changedPrice as number : proposal.amount_minor ?? null;
+      const currency = typeof payload.currency === 'string' ? payload.currency : proposal.currency ?? null;
+      await api('/api/actions', { method: 'POST', headers: { 'Idempotency-Key': window.crypto.randomUUID() }, body: JSON.stringify({
+        organizationId, actionType: proposal.action_type, payload, expectedSourceVersion: proposal.expected_source_version ?? null,
+        locationId: proposal.location_id ?? null, amountMinor, currency, evidenceRefs: proposal.evidence_refs ?? [], supersedesProposalId: proposal.id,
+      }) });
+      setRevisionProposalId(''); setRevisionPayload(''); setRevisionReason(''); await reloadProposals();
+    } catch (error) { setProposalError(error instanceof Error ? error.message : 'The revised proposal could not be submitted.'); }
+    finally { setBusyProposal(''); }
+  }
+  async function updateRole(member: RoleSettingsData['memberships'][number]) {
+    const nextRole = roleByUser[member.user_id] ?? member.role;
+    const scope = scopeByUser[member.user_id] ?? { mode: member.location_scope_mode, locationIds: roles?.membership_location_scopes.filter(row => row.user_id === member.user_id).map(row => row.location_id) ?? [] };
+    const customRoleId = customRoleByUser[member.user_id] ?? member.custom_role_id ?? null;
+    if (nextRole === 'custom' && (!customRoleId || !roles?.organization_custom_roles.some(custom => custom.id === customRoleId))) { setRoleError('Choose an existing custom role before assigning it.'); return; }
+    if (scope.mode === 'selected' && !scope.locationIds.length) { setRoleError('Select at least one location for a location-scoped role.'); return; }
+    const currentLocations = roles?.membership_location_scopes.filter(row => row.user_id === member.user_id).map(row => row.location_id) ?? [];
+    if (nextRole === member.role && nextRole !== 'custom' && scope.mode === member.location_scope_mode && scope.locationIds.slice().sort().join(',') === currentLocations.slice().sort().join(',')) return;
+    setBusyUser(member.user_id); setRoleError(''); setRoleSuccess('');
+    try {
+      await api('/api/roles/membership', { method: 'PATCH', body: JSON.stringify({ organizationId, userId: member.user_id, role: nextRole, customRoleId: nextRole === 'custom' ? customRoleId : null, locationScopeMode: scope.mode, locationIds: scope.mode === 'selected' ? scope.locationIds : [] }) });
+      setRoleSuccess('Workspace role updated and recorded in audit history.'); await reloadRoles();
+    } catch (error) { setRoleError(error instanceof Error ? error.message : 'The role could not be updated.'); }
+    finally { setBusyUser(''); }
+  }
+  async function createCustomRole(event: FormEvent) {
+    event.preventDefault(); setCustomRoleBusy(true); setRoleError(''); setRoleSuccess('');
+    try {
+      const permissions = [...new Set(customRolePermissions.split(',').map(item => item.trim()).filter(Boolean))];
+      await api('/api/roles/custom', { method: 'POST', body: JSON.stringify({ organizationId, name: customRoleName, permissions }) });
+      setCustomRoleName(''); setRoleSuccess('Custom role created.'); await reloadRoles();
+    } catch (error) { setRoleError(error instanceof Error ? error.message : 'The custom role could not be created.'); }
+    finally { setCustomRoleBusy(false); }
+  }
+  async function savePermission(event: FormEvent) {
+    event.preventDefault(); setPermissionBusy(true); setRoleError(''); setRoleSuccess('');
+    try {
+      await api('/api/roles/permission', { method: 'PATCH', body: JSON.stringify({ organizationId, role: permissionRole, permission: permissionKey, allowed: permissionAllowed }) });
+      setRoleSuccess('Role permission override saved and recorded in audit history.'); await reloadRoles();
+    } catch (error) { setRoleError(error instanceof Error ? error.message : 'The permission override could not be saved.'); }
+    finally { setPermissionBusy(false); }
+  }
+  async function saveApprovalPolicy(event: FormEvent) {
+    event.preventDefault(); setPolicyBusy(true); setRoleError(''); setRoleSuccess('');
+    const toMinor = (value: string) => value.trim() === '' ? null : Number(value);
+    const minAmountMinor = toMinor(policyMinAmount), maxAmountMinor = toMinor(policyMaxAmount), maxSingleApproverMinor = toMinor(policyMaxSingle);
+    const hasAmountThreshold = [minAmountMinor, maxAmountMinor, maxSingleApproverMinor].some(value => value !== null);
+    if ([minAmountMinor, maxAmountMinor, maxSingleApproverMinor].some(value => value !== null && (!Number.isSafeInteger(value) || value < 0))) {
+      setRoleError('Approval thresholds must be non-negative integer minor units.'); setPolicyBusy(false); return;
+    }
+    if (hasAmountThreshold && !/^[A-Z]{3}$/.test(policyCurrency.trim().toUpperCase())) {
+      setRoleError('Enter a three-letter currency when setting an amount threshold.'); setPolicyBusy(false); return;
+    }
+    try {
+      await api('/api/roles/approval-policy', { method: 'POST', body: JSON.stringify({ organizationId, actionType: policyActionType,
+        locationId: policyLocationId || null, amountCurrency: hasAmountThreshold ? policyCurrency.trim().toUpperCase() : null,
+        minAmountMinor, maxAmountMinor, maxSingleApproverMinor,
+        requiredPermission: policyPermission, requiredRole: policyRole, requiredApprovalCount: Number(policyApprovalCount) }) });
+      setRoleSuccess('Approval policy saved and recorded in audit history.'); await reloadRoles();
+    } catch (error) { setRoleError(error instanceof Error ? error.message : 'The approval policy could not be saved.'); }
+    finally { setPolicyBusy(false); }
+  }
+  async function saveTeamsIdentity(event: FormEvent) {
+    event.preventDefault(); setTeamsBusy(true); setRoleError(''); setRoleSuccess('');
+    try {
+      const result = await api<{ status: string }>('/api/roles/teams-identity', { method: 'POST', body: JSON.stringify({ organizationId,
+        userId: teamsUserId, tenantId: teamsTenantId.trim(), teamsUserId: teamsExternalUserId.trim(), email: teamsEmail.trim() || null,
+        active: teamsOperation === 'link', reason: teamsReason.trim() }) });
+      setRoleSuccess(`Teams identity ${result.status === 'active' ? 'linked' : 'unlinked'} and recorded in audit history.`);
+      await reloadRoles();
+    } catch (error) { setRoleError(error instanceof Error ? error.message : 'The Teams identity mapping could not be saved.'); }
+    finally { setTeamsBusy(false); }
+  }
+  async function createPowerAutomateApprovalIntegration(event: FormEvent) {
+    event.preventDefault(); setApprovalIntegrationBusy(true); setRoleError(''); setRoleSuccess(''); setCreatedApprovalToken('');
+    try {
+      const result = await api<{ id: string; token: string }>('/api/approval-integrations', { method: 'POST', body: JSON.stringify({
+        organizationId, mappingId: approvalMappingId, name: approvalIntegrationName.trim(),
+      }) });
+      setCreatedApprovalToken(result.token);
+      setApprovalIntegrationName('Teams approvals');
+      setRoleSuccess('Power Automate approval integration created. Copy its token now; it is shown only once.');
+      await reloadRoles();
+    } catch (error) { setRoleError(error instanceof Error ? error.message : 'The Power Automate integration could not be created.'); }
+    finally { setApprovalIntegrationBusy(false); }
+  }
+  async function revokePowerAutomateApprovalIntegration(integration: PowerAutomateApprovalIntegration) {
+    setApprovalIntegrationBusy(true); setRoleError(''); setRoleSuccess('');
+    try {
+      await api(`/api/approval-integrations/${integration.id}`, { method: 'DELETE', body: JSON.stringify({ organizationId }) });
+      setRoleSuccess(`Power Automate access for ${integration.email ?? integration.name} was revoked.`);
+      await reloadRoles();
+    } catch (error) { setRoleError(error instanceof Error ? error.message : 'The Power Automate integration could not be revoked.'); }
+    finally { setApprovalIntegrationBusy(false); }
+  }
+  return <div className="settings-grid">
+    <section className="panel settings-card"><div className="panel-heading"><div><h2>Workspace</h2></div></div><div className="setting-row"><span>Organization</span><b>{d.organization?.name ?? 'Not provided'}</b></div><div className="setting-row"><span>Reporting timezone</span><b>{d.organization?.timezone ?? 'Not configured'}</b></div><div className="setting-row"><span>Projection version</span><b>{d.projectionVersion ?? 'Not reported'}</b></div><div className="setting-row"><span>Reporting currency</span><b>{d.period?.currency ?? d.income?.currency ?? 'Not specified'}</b></div></section>
+    <section className="panel settings-card"><div className="panel-heading"><div><h2>Accounts</h2></div></div>{d.accounts?.length ? <label>Selected account<select value={accountId} onChange={e => onAccount(e.target.value)}>{d.accounts.map(a => <option key={a.id} value={a.id}>{a.name} · {a.kind ?? 'account'} · {a.currency}</option>)}</select></label> : <div className="inline-empty">No accounts available.</div>}<div className="notice compact-notice">Role assignments, approvals, and financial changes are recorded in audit history.</div></section>
+    <section className="panel table-panel"><div className="panel-heading"><div><h2>Action approvals</h2><p>Review the exact approved payload and leave a reason with each decision.</p></div><button className="secondary" onClick={() => void reloadProposals()} disabled={proposalLoading}>Refresh</button></div>
+      {proposalError && <p className="error" role="alert">{proposalError}</p>}{proposalLoading ? <div className="inline-empty">Loading approvals…</div> : proposals.length ? <div className="stack-list">{proposals.map(proposal => <article className="panel settings-card" key={proposal.id}><div className="setting-row"><span>{proposal.action_type}</span><b>{proposal.status.replaceAll('_', ' ')}</b></div><small className="muted">Proposed {date(proposal.created_at)} · by {proposal.proposed_by}</small><details className="proposal-details"><summary>Approved payload · {proposal.payload_sha256.slice(0, 12)}</summary><pre>{JSON.stringify({ payload: proposal.payload, evidenceRefs: proposal.evidence_refs ?? [], expiresAt: proposal.expires_at, decisions: proposal.decisions ?? [], executions: proposal.executions ?? [] }, null, 2)}</pre></details>
+        {proposal.status === 'pending_approval' && <><label>Decision or cancellation reason<textarea minLength={10} maxLength={1000} value={reasonByProposal[proposal.id] ?? ''} onChange={event => setReasonByProposal(previous => ({ ...previous, [proposal.id]: event.target.value }))} /></label><div className="button-row"><button className="primary" disabled={busyProposal === proposal.id} onClick={() => void decide(proposal, 'approved')}>{busyProposal === proposal.id ? 'Saving…' : 'Approve'}</button><button className="secondary" disabled={busyProposal === proposal.id} onClick={() => void decide(proposal, 'rejected')}>Reject</button>{proposal.proposed_by === userId && <><button className="text-button" disabled={busyProposal === proposal.id} onClick={() => void cancelProposal(proposal)}>Cancel proposal</button><button type="button" className="text-button" onClick={() => startRevision(proposal)}>Revise proposal</button></>}</div>
+        {revisionProposalId === proposal.id && proposal.proposed_by === userId && <form className="entry-form" onSubmit={event => void submitRevision(event, proposal)}><label>Revised action payload (JSON)<textarea rows={10} value={revisionPayload} onChange={event => setRevisionPayload(event.target.value)} required /></label><label>Revision reason<textarea minLength={10} maxLength={1000} value={revisionReason} onChange={event => setRevisionReason(event.target.value)} required /></label><p className="muted">Submitting creates a new proposal with a new hash, cancels the old pending proposal, and requires approval again.</p><div className="button-row"><button className="primary" disabled={busyProposal === proposal.id}>{busyProposal === proposal.id ? 'Submitting…' : 'Submit revised proposal'}</button><button type="button" className="secondary" onClick={() => setRevisionProposalId('')}>Close</button></div></form>}</>}
+      </article>)}</div> : <div className="inline-empty">No action proposals are available to this role.</div>}
+    </section>
+    {canManagePeople && <section className="panel table-panel"><div className="panel-heading"><div><h2>People and permissions</h2><p>Assign workspace roles and see the active approval requirements.</p></div><button className="secondary" onClick={() => void reloadRoles()} disabled={roleLoading}>Refresh</button></div>
+      {roleError && <p className="error" role="alert">{roleError}</p>}{roleSuccess && <p className="notice" role="status">{roleSuccess}</p>}{roleLoading ? <div className="inline-empty">Loading role settings…</div> : roles ? <>
+        {roles.memberships.map(member => { const scope = scopeByUser[member.user_id] ?? { mode: member.location_scope_mode, locationIds: roles.membership_location_scopes.filter(row => row.user_id === member.user_id).map(row => row.location_id) }; return <div className="settings-card" key={member.user_id}><div className="setting-row"><span>{member.user_id}<small className="cell-sub">{scope.mode === 'selected' ? 'Selected locations' : 'All locations'}</small></span><div className="button-row"><select aria-label={`Role for ${member.user_id}`} value={roleByUser[member.user_id] ?? member.role} onChange={event => setRoleByUser(previous => ({ ...previous, [member.user_id]: event.target.value }))}>{['administrator','manager','employee','operator','reviewer','read_only','custom',...(role === 'owner' ? ['owner'] : [])].map(value => <option key={value} value={value} disabled={value === 'custom' && roles.organization_custom_roles.length === 0}>{value.replaceAll('_', ' ')}</option>)}</select>{(roleByUser[member.user_id] ?? member.role) === 'custom' && <select aria-label={`Custom role for ${member.user_id}`} value={customRoleByUser[member.user_id] ?? member.custom_role_id ?? ''} onChange={event => setCustomRoleByUser(previous => ({ ...previous, [member.user_id]: event.target.value }))}><option value="">Choose custom role</option>{roles.organization_custom_roles.map(custom => <option key={custom.id} value={custom.id}>{custom.name}</option>)}</select>}<button className="secondary" disabled={busyUser === member.user_id} onClick={() => void updateRole(member)}>{busyUser === member.user_id ? 'Saving…' : 'Save'}</button></div></div><div className="button-row"><label>Location access<select value={scope.mode} onChange={event => setScopeByUser(previous => ({ ...previous, [member.user_id]: { ...scope, mode: event.target.value } }))}><option value="all">All locations</option><option value="selected">Selected locations</option></select></label>{scope.mode === 'selected' && roles.business_locations.filter(location => location.status === 'active').map(location => <label className="compact" key={location.id}><input type="checkbox" checked={scope.locationIds.includes(location.id)} onChange={event => setScopeByUser(previous => ({ ...previous, [member.user_id]: { ...scope, locationIds: event.target.checked ? [...scope.locationIds, location.id] : scope.locationIds.filter(id => id !== location.id) } }))} />{location.name}</label>)}</div></div>; })}
+        <h3>Custom roles</h3>{roles.organization_custom_roles.length ? <ul>{roles.organization_custom_roles.map(custom => <li key={custom.id}>{custom.name}{custom.description ? ` · ${custom.description}` : ''}</li>)}</ul> : <p className="muted">No custom roles yet.</p>}
+        <form onSubmit={createCustomRole}><label>Custom role name<input value={customRoleName} onChange={event => setCustomRoleName(event.target.value)} maxLength={80} required /></label><label>Permissions, comma-separated<input value={customRolePermissions} onChange={event => setCustomRolePermissions(event.target.value)} placeholder="catalog.read, issues.read" required /></label><button className="secondary" disabled={customRoleBusy}>{customRoleBusy ? 'Saving…' : 'Create custom role'}</button></form>
+        <h3>Teams identity links</h3><p className="muted">These administrator-attested directory mappings identify the reviewer for Power Automate approval cards. No Azure Bot registration is used.</p>{roles.external_identity_mappings.filter(identity => identity.status === 'active').map(identity => <div className="setting-row" key={identity.id}><span>{identity.user_id}<small className="cell-sub">{identity.tenant_id} · {identity.external_user_id}{identity.external_email ? ` · ${identity.external_email}` : ''}</small></span><b>Linked</b></div>)}
+        <form onSubmit={saveTeamsIdentity}><label>Action<select value={teamsOperation} onChange={event => setTeamsOperation(event.target.value)}><option value="link">Link or update</option><option value="unlink">Unlink</option></select></label><label>Vernius member<select required value={teamsUserId} onChange={event => setTeamsUserId(event.target.value)}><option value="">Choose member</option>{roles.memberships.map(member => <option key={member.user_id} value={member.user_id}>{member.user_id}</option>)}</select></label><label>Microsoft tenant ID<input required value={teamsTenantId} onChange={event => setTeamsTenantId(event.target.value)} /></label><label>Teams user object ID<input required value={teamsExternalUserId} onChange={event => setTeamsExternalUserId(event.target.value)} /></label>{teamsOperation === 'link' && <label>Directory email (required for Power Automate cards)<input type="email" maxLength={320} required value={teamsEmail} onChange={event => setTeamsEmail(event.target.value)} /></label>}<label>Reason<textarea minLength={10} maxLength={1000} required value={teamsReason} onChange={event => setTeamsReason(event.target.value)} /></label><button className="secondary" disabled={teamsBusy}>{teamsBusy ? 'Saving…' : teamsOperation === 'link' ? 'Save Teams identity' : 'Unlink Teams identity'}</button></form>
+        {role === 'owner' && <><h3>Power Automate approvals</h3><p className="muted">Create one integration for each reviewer. The token is displayed once; put it in the flow's Authorization header, enable Secure Inputs/Outputs, and restrict flow editors. The flow sends cards in a personal Teams chat and returns the decision to the app.</p>
+          {approvalIntegrations.map(integration => <div className="setting-row" key={integration.id}><span>{integration.name}<small className="cell-sub">{integration.email ?? 'No directory email'} · created {date(integration.createdAt)}</small></span>{integration.revokedAt ? <b>Revoked</b> : <button className="text-button" disabled={approvalIntegrationBusy} onClick={() => void revokePowerAutomateApprovalIntegration(integration)}>Revoke</button>}</div>)}
+          <form onSubmit={event => void createPowerAutomateApprovalIntegration(event)}><label>Reviewer identity<select required value={approvalMappingId} onChange={event => setApprovalMappingId(event.target.value)}><option value="">Choose a linked Teams reviewer</option>{eligibleApprovalMappings.map(identity => <option key={identity.id} value={identity.id}>{identity.external_email} · {identity.user_id}</option>)}</select></label><label>Integration name<input maxLength={100} required value={approvalIntegrationName} onChange={event => setApprovalIntegrationName(event.target.value)} /></label><button className="secondary" disabled={approvalIntegrationBusy || !eligibleApprovalMappings.some(identity => identity.id === approvalMappingId)}>{approvalIntegrationBusy ? 'Saving…' : 'Create Power Automate integration'}</button></form>
+          {createdApprovalToken && <div className="notice"><p>Copy this token into Power Automate now. Vernius stores only its hash, so it cannot be shown again.</p><pre>{createdApprovalToken}</pre><button className="text-button" onClick={() => setCreatedApprovalToken('')}>Hide token</button></div>}
+          <p className="muted">Setup instructions: <code>docs/POWER_AUTOMATE_APPROVALS_SETUP.md</code>. Microsoft 365 and Power Automate are still required; Azure Bot resources and bot credentials are not.</p>
+        </>}
+        <h3>Role permission override</h3><form onSubmit={savePermission}><label>Role<select value={permissionRole} onChange={event => setPermissionRole(event.target.value)}>{['administrator','manager','employee','operator','reviewer','read_only'].map(value => <option key={value} value={value}>{value.replaceAll('_', ' ')}</option>)}</select></label><label>Permission<select value={permissionKey} onChange={event => setPermissionKey(event.target.value)}>{['catalog.read','catalog.write','catalog.price.write','inventory.read','inventory.write','finance.metrics.read','finance.cash.write','finance.cost.approve','finance.refund.review','issues.read','issues.propose','approvals.read','approvals.decide','actions.propose','audit.read','sync.read','employees.read','locations.read','suppliers.read','purchases.read','purchases.write'].map(value => <option key={value} value={value}>{value}</option>)}</select></label><label><input type="checkbox" checked={permissionAllowed} onChange={event => setPermissionAllowed(event.target.checked)} />Allow permission</label><button className="secondary" disabled={permissionBusy}>{permissionBusy ? 'Saving…' : 'Save override'}</button></form>
+        {roles.organization_role_permission_overrides.length > 0 && <details><summary>Existing overrides</summary><ul>{roles.organization_role_permission_overrides.map(item => <li key={`${item.role_key}:${item.permission_key}`}>{item.role_key} · {item.permission_key}: {item.allowed ? 'allowed' : 'denied'}</li>)}</ul></details>}
+        <h3>Approval policies</h3>{roles.action_approval_policies.length ? <ul>{roles.action_approval_policies.map(policy => <li key={policy.id}>{policy.action_type}{policy.location_id ? ` · ${roles.business_locations.find(location => location.id === policy.location_id)?.name ?? 'Location'}` : ' · all locations'}{policy.min_amount_minor !== null || policy.max_amount_minor !== null ? ` · ${policy.min_amount_minor ?? 'any'}–${policy.max_amount_minor ?? 'any'} ${policy.amount_currency ?? ''} minor units` : ''}: {policy.required_approval_count} approval(s), {policy.required_role} role, {policy.required_permission} permission{policy.max_single_approver_minor !== null ? ` · second approval above ${policy.max_single_approver_minor} ${policy.amount_currency ?? ''}` : ''}{policy.enabled ? '' : ' · disabled'}</li>)}</ul> : <p className="muted">Default owner approval applies until a policy is configured.</p>}
+        <form onSubmit={saveApprovalPolicy}><label>Action type<select value={policyActionType} onChange={event => setPolicyActionType(event.target.value)}>{['square.catalog.item.create','square.catalog.item.update','square.catalog.item.archive','square.catalog.variation.update','square.catalog.variation.add','square.inventory.count.set'].map(value => <option key={value} value={value}>{value}</option>)}</select></label><label>Location<select value={policyLocationId} onChange={event => setPolicyLocationId(event.target.value)}><option value="">All locations</option>{roles.business_locations.filter(location => location.status === 'active').map(location => <option key={location.id} value={location.id}>{location.name}</option>)}</select></label><label>Amount currency<input required={false} maxLength={3} value={policyCurrency} onChange={event => setPolicyCurrency(event.target.value.toUpperCase())} /></label><label>Minimum amount (minor units)<input type="number" min="0" step="1" value={policyMinAmount} onChange={event => setPolicyMinAmount(event.target.value)} /></label><label>Maximum amount (minor units)<input type="number" min="0" step="1" value={policyMaxAmount} onChange={event => setPolicyMaxAmount(event.target.value)} /></label><label>Required approver role<select value={policyRole} onChange={event => setPolicyRole(event.target.value)}>{['owner','administrator','manager','reviewer'].map(value => <option key={value} value={value}>{value}</option>)}</select></label><label>Required permission<select value={policyPermission} onChange={event => setPolicyPermission(event.target.value)}>{['approvals.decide','finance.cost.approve','catalog.price.write'].map(value => <option key={value} value={value}>{value}</option>)}</select></label><label>Approvals required<input type="number" min="1" max="5" step="1" value={policyApprovalCount} onChange={event => setPolicyApprovalCount(event.target.value)} required /></label><label>Second approver above (minor units)<input type="number" min="0" step="1" value={policyMaxSingle} onChange={event => setPolicyMaxSingle(event.target.value)} /></label><button className="secondary" disabled={policyBusy}>{policyBusy ? 'Saving…' : 'Save approval policy'}</button></form>
+      </> : null}
+    </section>}
+  </div>;
+}

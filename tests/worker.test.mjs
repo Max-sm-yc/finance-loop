@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createWorker } from '../src/worker/index.mjs';
+import { normalizeInventoryCount } from '../src/square/inventory.mjs';
 
 function harness({ payload, responses = {}, health = {}, now = new Date('2026-09-30T12:00:00Z'), request } = {}) {
   const events = []; const facts = new Map(); const issues = new Map(); const projectionRuns = new Set();
@@ -8,6 +9,8 @@ function harness({ payload, responses = {}, health = {}, now = new Date('2026-09
   const db = {
     async getSquareConnection() { return { accessToken: 'server-only' }; },
     async getWebhookNotification({ notificationId }) { return { notificationId, signatureVerified: true, payload: typeof payload === 'function' ? payload(notificationId) : payload }; },
+    async getSquareInventoryTargetsSystem() { return { catalogObjectIds: [], locationIds: [] }; },
+    async upsertSquareInventoryCounts() { return { inserted: 0, changed: 0, unmappedCount: 0, conflictCount: 0, unmappedRefs: [] }; },
     async upsertSquareFacts({ facts: batch, organizationId, enforceMonotonicVersion }) {
       assert.equal(enforceMonotonicVersion, true);
       let changed = false;
@@ -41,7 +44,7 @@ function harness({ payload, responses = {}, health = {}, now = new Date('2026-09
     async enqueueSquareSync(x) { events.push(['enqueue-sync', x]); }
   };
   const tokenVault = { async getDecrypted() { return { accessToken: 'server-only', refreshToken: 'server-refresh' }; } };
-  const worker = createWorker({ queue, db, tokenVault, config: { squareApiVersion: 'test', freshnessTargetMs: 60_000, maxJobAttempts: 3 }, makeSquareClient: () => ({ async request(path) { events.push(['fetch', path]); return request ? request(path) : responses[path]; } }), now: () => new Date(now), sleep: async () => {}, random: () => 0 });
+  const worker = createWorker({ queue, db, tokenVault, config: { squareApiVersion: 'test', freshnessTargetMs: 60_000, maxJobAttempts: 3 }, makeSquareClient: () => ({ async request(path, options) { events.push(['fetch', path, options]); return request ? request(path, options) : responses[path]; } }), now: () => new Date(now), sleep: async () => {}, random: () => 0 });
   return { worker, db, queue, events, facts, issues, projectionRuns };
 }
 
@@ -301,4 +304,92 @@ test('terminal job gap-write failure dead-letters instead of retrying beyond the
   assert.equal(dead.code, 'SOURCE_GAP_WRITE_FAILED');
   assert.match(dead.message, /status=503 code=PGRST202/);
   assert.equal(dead.message.includes('private response details'), false);
+});
+
+test('inventory webhook notifications are re-fetched from Square before the canonical count write', async () => {
+  const payload = webhook('evt-inventory', 'inventory.count.updated', { inventory_counts: [{
+    catalog_object_id: 'variation-1', catalog_object_type: 'ITEM_VARIATION', location_id: 'location-1',
+    state: 'IN_STOCK', quantity: '3', calculated_at: '2026-10-07T11:59:00Z',
+  }] });
+  const current = { catalog_object_id: 'variation-1', catalog_object_type: 'ITEM_VARIATION', location_id: 'location-1',
+    state: 'IN_STOCK', quantity: '4', calculated_at: '2026-10-07T12:00:00Z' };
+  const state = harness({ payload, now: new Date('2026-10-07T12:01:00Z'), request: async (path, options) => {
+    assert.equal(path, '/v2/inventory/counts/batch-retrieve');
+    assert.equal(JSON.parse(options.body).catalog_object_ids[0], 'variation-1');
+    assert.equal(JSON.parse(options.body).location_ids[0], 'location-1');
+    return { counts: [current] };
+  } });
+  state.db.upsertSquareInventoryCounts = async args => {
+    state.events.push(['inventory-count-upsert', args]); return { inserted: 1, changed: 1, unmappedCount: 0, conflictCount: 0 };
+  };
+  const result = await state.worker.processJob({ id: 'inventory-webhook', type: 'square.webhook', organizationId: org,
+    payload: { notificationId: 'evt-inventory' } });
+  assert.equal(result.count, 1);
+  assert.equal(result.changed, 1);
+  assert.equal(state.events.filter(event => event[0] === 'inventory-count-upsert').length, 1);
+  const synced = state.events.find(event => event[0] === 'inventory-count-upsert')[1].counts[0];
+  assert.equal(synced.quantity, 4);
+  assert.equal(state.events.some(event => event[0] === 'projection'), false);
+});
+
+test('approved Square physical counts recheck the source version and reuse a proposal UUID for Square idempotency', async () => {
+  const now = new Date('2026-10-07T12:00:00Z');
+  const before = { catalog_object_id: 'variation-1', catalog_object_type: 'ITEM_VARIATION', location_id: 'location-1',
+    state: 'IN_STOCK', quantity: '3', calculated_at: '2026-10-07T11:59:00Z' };
+  const after = { ...before, quantity: '8.5', calculated_at: '2026-10-07T12:00:00Z' };
+  const expectedSourceVersion = normalizeInventoryCount(before).sourceVersion;
+  const proposalId = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+  const payloadSha256 = 'a'.repeat(64);
+  const actionPayload = { sourceMappingId: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb',
+    locationMappingId: 'cccccccc-cccc-4ccc-8ccc-cccccccccccc', businessLocationId: 'dddddddd-dddd-4ddd-8ddd-dddddddddddd',
+    squareVariationId: 'variation-1', squareLocationId: 'location-1', state: 'IN_STOCK', quantity: 8.5,
+    expectedSquareVersion: expectedSourceVersion, proposalReason: 'A physical count was completed by the store team.' };
+  const requestBodies = [];
+  const state = harness({ now, request: async (path, options) => {
+    if (path === '/v2/inventory/counts/batch-retrieve') return { counts: [before] };
+    if (path === '/v2/inventory/changes/batch-create') {
+      requestBodies.push(JSON.parse(options.body));
+      return { counts: [after] };
+    }
+    throw new Error(`Unexpected Square path ${path}`);
+  } });
+  state.db.beginActionExecution = async () => ({ status: 'executing', actionType: 'square.inventory.count.set',
+    payload: actionPayload, payloadSha256, expectedSourceVersion, approvedAt: now.toISOString() });
+  state.db.finishActionExecution = async args => { state.events.push(['action-finish', args]); return true; };
+  state.db.upsertSquareInventoryCounts = async args => { state.events.push(['inventory-count-upsert', args]); return { inserted: 1, changed: 1 }; };
+  const outcome = await state.worker.processJob({ id: 'approved-inventory', type: 'approved_action.execute', organizationId: org,
+    payload: { proposalId, payloadSha256, actionType: 'square.inventory.count.set', payload: actionPayload } });
+  assert.equal(outcome.status, 'succeeded');
+  assert.equal(requestBodies.length, 1);
+  assert.equal(requestBodies[0].idempotency_key, proposalId);
+  assert.equal(requestBodies[0].changes[0].physical_count.quantity, '8.5');
+  assert.equal(requestBodies[0].changes[0].physical_count.occurred_at, now.toISOString());
+  assert.equal(state.events.find(event => event[0] === 'action-finish')[1].status, 'succeeded');
+});
+
+test('Square sync backfills inventory counts for mapped variations and locations', async () => {
+  const state = harness({ request: async (path, options) => {
+    if (path === '/v2/orders/search') return { orders: [] };
+    if (path.startsWith('/v2/payments?')) return { payments: [] };
+    if (path.startsWith('/v2/refunds?')) return { refunds: [] };
+    if (path.startsWith('/v2/catalog/list')) return { objects: [] };
+    if (path.startsWith('/v2/gift-cards/activities?')) return { gift_card_activities: [] };
+    if (path.startsWith('/v2/payouts?')) return { payouts: [] };
+    if (path === '/v2/inventory/counts/batch-retrieve') {
+      assert.deepEqual(JSON.parse(options.body).catalog_object_ids, ['variation-1']);
+      assert.deepEqual(JSON.parse(options.body).location_ids, ['location-1']);
+      return { counts: [{ catalog_object_id: 'variation-1', catalog_object_type: 'ITEM_VARIATION', location_id: 'location-1',
+        state: 'IN_STOCK', quantity: '6', calculated_at: '2026-10-07T11:00:00Z' }] };
+    }
+    throw new Error(`Unexpected Square path ${path}`);
+  } });
+  state.db.getSquareInventoryTargetsSystem = async () => ({ catalogObjectIds: ['variation-1'], locationIds: ['location-1'] });
+  state.db.upsertSquareInventoryCounts = async args => {
+    state.events.push(['inventory-count-upsert', args]); return { inserted: 1, changed: 1, unmappedCount: 0, conflictCount: 0 };
+  };
+  const result = await state.worker.processJob({ id: 'inventory-sync', type: 'square.sync', organizationId: org,
+    payload: { startAt: '2026-10-01T00:00:00Z', endAt: '2026-10-07T12:00:00Z' } });
+  assert.equal(result.resources.inventory.status, 'fresh');
+  assert.equal(result.resources.inventory.count, 1);
+  assert.equal(state.events.filter(event => event[0] === 'inventory-count-upsert').length, 1);
 });

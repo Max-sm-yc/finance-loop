@@ -83,7 +83,7 @@ export function normalizeOrder(o) {
   const id = idOf(o); if (!id) return [];
   const orderVersion = String(o.version ?? o.updated_at ?? o.created_at ?? '');
   const currency = o.total_money?.currency ?? o.line_items?.find(x => x.base_price_money?.currency)?.base_price_money.currency ?? null;
-  const facts = [{ kind: 'order', objectId: id, version: orderVersion, occurredAt: o.created_at ?? null, updatedAt: o.updated_at ?? null, status: o.state ?? null, currency, raw: o, totals: { totalMinor: minor(o.total_money), taxMinor: minor(o.total_tax_money), discountMinor: minor(o.total_discount_money), serviceChargeMinor: minor(o.total_service_charge_money) } }];
+  const facts = [{ kind: 'order', objectId: id, version: orderVersion, occurredAt: o.created_at ?? null, updatedAt: o.updated_at ?? null, locationId: o.location_id ?? null, status: o.state ?? null, currency, raw: o, totals: { totalMinor: minor(o.total_money), taxMinor: minor(o.total_tax_money), discountMinor: minor(o.total_discount_money), serviceChargeMinor: minor(o.total_service_charge_money) } }];
   for (const line of o.line_items ?? []) {
     const appliedDiscounts = Array.isArray(line.applied_discounts) ? line.applied_discounts : null;
     const discountMinor = minor(line.total_discount_money) ?? (appliedDiscounts && appliedDiscounts.every(discount => minor(discount.applied_money) !== null) ? appliedDiscounts.reduce((sum, discount) => sum + minor(discount.applied_money), 0) : null);
@@ -134,8 +134,10 @@ export function normalizeCatalog(obj) {
   return [{ kind: 'catalog', objectId: obj.id,
     version: sourceVersion ? `${sourceVersion}|normalization-3` : '',
     objectType: obj.type ?? null,
+    sourceUpdatedAt: obj.updated_at ?? null,
     name: obj.item_data?.name ?? variation?.name ?? obj.category_data?.name ?? null,
     description: obj.item_data?.description_plaintext ?? obj.item_data?.description ?? null,
+    categoryId: obj.item_data?.category_id ?? obj.category_data?.parent_category_id ?? null,
     itemId: variation?.item_id ?? null,
     sku: variation?.sku ?? null,
     priceMinor: variation ? minor(priceMoney) : null,
@@ -165,6 +167,7 @@ export function normalizePayoutEntry(e, payoutId) {
   return [{
     kind: 'payout_entry', objectId: e.id,
     version: `${String(e.effective_at ?? e.type ?? '')}|normalization-2`,
+    occurredAt: e.effective_at ?? null,
     payoutId: e.payout_id ?? payoutId ?? null, type: e.type ?? null,
     paymentId: e.payment_id ?? e.type_charge_details?.payment_id ?? e.type_refund_details?.payment_id ?? null,
     refundId: e.refund_id ?? e.type_refund_details?.refund_id ?? null,

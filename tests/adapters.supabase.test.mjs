@@ -53,6 +53,67 @@ test('RPC uses the caller JWT and SQL p_ argument names; no service key is expos
   assert.equal('serviceKey' in adapters, false);
 });
 
+test('Teams approval adapters call service-role-only RPCs with exact mapped identity and decision arguments', async () => {
+  const calls = [];
+  const adapters = createSupabaseAdapters({
+    url: 'https://tenant.supabase.test', publishableKey: 'publishable', secretKey: serviceKey,
+    fetchImpl: async (url, init) => {
+      calls.push({ url: String(url), headers: new Headers(init.headers), body: JSON.parse(init.body) });
+      return response(String(url).includes('list_teams_action_proposals') ? [] : { status: 'executing' });
+    },
+  });
+  await adapters.db.listTeamsActionProposals({ tenantId: '22222222-2222-4222-8222-222222222222', teamsUserId: '33333333-3333-4333-8333-333333333333', limit: 3 });
+  const decision = await adapters.db.decideActionFromTeams({
+    organizationId: org, proposalId: '55555555-5555-4555-8555-555555555555',
+    tenantId: '22222222-2222-4222-8222-222222222222', teamsUserId: '33333333-3333-4333-8333-333333333333',
+    decision: 'approved', reason: 'Reviewed against the approved quote.', payloadSha256: 'a'.repeat(64),
+    idempotencyKey: 'teams:' + 'b'.repeat(64), sourceMessageRef: 'msteams:activity-1',
+  });
+  assert.deepEqual(decision, { status: 'executing' });
+  assert.match(calls[0].url, /rpc\/list_teams_action_proposals$/);
+  assert.deepEqual(calls[0].body, { p_tenant_id: '22222222-2222-4222-8222-222222222222', p_teams_user_id: '33333333-3333-4333-8333-333333333333', p_limit: 3 });
+  assert.match(calls[1].url, /rpc\/decide_action_from_teams$/);
+  assert.deepEqual(calls[1].body, {
+    p_organization_id: org, p_proposal_id: '55555555-5555-4555-8555-555555555555',
+    p_tenant_id: '22222222-2222-4222-8222-222222222222', p_teams_user_id: '33333333-3333-4333-8333-333333333333',
+    p_decision: 'approved', p_reason: 'Reviewed against the approved quote.', p_expected_payload_sha256: 'a'.repeat(64),
+    p_idempotency_key: 'teams:' + 'b'.repeat(64), p_source_message_ref: 'msteams:activity-1',
+  });
+  for (const call of calls) {
+    assert.equal(call.headers.get('apikey'), serviceKey);
+    assert.equal(call.headers.get('authorization'), `Bearer ${serviceKey}`);
+  }
+  assert.equal(JSON.stringify(adapters).includes(serviceKey), false);
+});
+
+test('draft catalog and purchase-order commands use caller-scoped RPCs with exact payloads', async () => {
+  const calls = [];
+  const adapters = createSupabaseAdapters({
+    url: 'https://tenant.supabase.test', publishableKey: 'publishable', secretKey: serviceKey,
+    fetchImpl: async (url, init) => {
+      calls.push({ url: String(url), headers: new Headers(init.headers), body: JSON.parse(init.body) });
+      return response(calls.length === 2 ? [] : { id: 'created-id', status: 'draft' });
+    },
+  });
+  const item = { name: 'Mug', description: '', categoryId: null, variations: [{ name: 'Blue', sku: 'BLUE', barcode: null,
+    unitOfMeasure: 'each', priceMinor: 1299, currency: 'USD' }] };
+  const purchaseOrder = { supplierId: null, locationId: null, currency: 'USD', expectedAt: null,
+    lines: [{ variationId: null, description: 'Mug blue', quantity: 5, unitCostMinor: 400 }] };
+  const createdItem = await adapters.db.createDomainCatalogItem({ organizationId: org, item, reason: 'Create product draft.', idempotencyKey: 'domain:item:1', accessToken: userJwt });
+  const orders = await adapters.db.listDomainPurchaseOrders({ organizationId: org, accessToken: userJwt });
+  const createdOrder = await adapters.db.createDomainPurchaseOrder({ organizationId: org, purchaseOrder, reason: 'Prepare a supplier order.', idempotencyKey: 'domain:po:1', accessToken: userJwt });
+  assert.deepEqual(createdItem, { id: 'created-id', status: 'draft' });
+  assert.deepEqual(orders, []);
+  assert.deepEqual(createdOrder, { id: 'created-id', status: 'draft' });
+  assert.deepEqual(calls.map(call => call.url.split('/').at(-1)), [
+    'create_domain_catalog_item', 'list_domain_purchase_orders', 'create_domain_purchase_order',
+  ]);
+  assert.deepEqual(calls[0].body, { p_organization_id: org, p_item: item, p_reason: 'Create product draft.', p_idempotency_key: 'domain:item:1' });
+  assert.deepEqual(calls[1].body, { p_organization_id: org });
+  assert.deepEqual(calls[2].body, { p_organization_id: org, p_purchase_order: purchaseOrder, p_reason: 'Prepare a supplier order.', p_idempotency_key: 'domain:po:1' });
+  assert.ok(calls.every(call => call.headers.get('apikey') === 'publishable' && call.headers.get('authorization') === `Bearer ${userJwt}`));
+});
+
 test('Square sync coverage is read through the member JWT with a bounded window', async () => {
   let call;
   const coverage = { windows: [{ from: '2026-09-01T00:00:00Z', to: '2026-10-01T00:00:00Z' }], pendingWindows: [], sourceHealthFresh: true,
@@ -160,11 +221,11 @@ test('Supabase sb_secret keys are sent as apikey values, not Bearer tokens', asy
 });
 
 test('worker fact upserts use the service key, preserve version ordering, and omit Square raw payloads', async () => {
-  let call;
+  const calls = [];
   const adapters = createSupabaseAdapters({
     url: 'https://tenant.supabase.test', secretKey: 'sb_secret_worker',
     fetchImpl: async (url, init) => {
-      call = { url: String(url), headers: new Headers(init.headers), body: JSON.parse(init.body) };
+      calls.push({ url: String(url), headers: new Headers(init.headers), body: JSON.parse(init.body) });
       return response({ changed: true, revision: 7 });
     }
   });
@@ -176,6 +237,8 @@ test('worker fact upserts use the service key, preserve version ordering, and om
     ],
   });
   assert.deepEqual(result, { changed: true, revision: 7 });
+  assert.equal(calls.length, 2);
+  const call = calls.find(row => row.url.endsWith('/rpc/upsert_square_facts'));
   assert.match(call.url, /rpc\/upsert_square_facts$/);
   assert.equal(call.headers.get('apikey'), 'sb_secret_worker');
   assert.equal(call.headers.get('authorization'), null);
@@ -186,6 +249,7 @@ test('worker fact upserts use the service key, preserve version ordering, and om
   const cashCorrection = call.body.p_facts.find(row => row.objectId === 'cash-1');
   assert.match(cashCorrection.versionSort, /^t:\d{16}\|normalization-2$/);
   assert.ok(cashCorrection.versionSort > fact.versionSort, 'normalization correction sorts after its original Square version');
+  assert.match(calls[1].url, /rpc\/materialize_square_financial_events$/);
 });
 
 test('worker fact upserts split large Square pages below the database RPC limit', async () => {
@@ -193,11 +257,14 @@ test('worker fact upserts split large Square pages below the database RPC limit'
   let revision = 0;
   const adapters = createSupabaseAdapters({
     url: 'https://tenant.supabase.test', secretKey: 'sb_secret_worker',
-    fetchImpl: async (_url, init) => {
+    fetchImpl: async (url, init) => {
       const body = JSON.parse(init.body);
-      batches.push(body.p_facts);
-      revision += 1;
-      return response({ changed: true, revision });
+      if (String(url).endsWith('/rpc/upsert_square_facts')) {
+        batches.push(body.p_facts);
+        revision += 1;
+        return response({ changed: true, revision });
+      }
+      return response(0);
     }
   });
   const facts = Array.from({ length: 1001 }, (_, index) => ({
@@ -409,4 +476,37 @@ test('worker queue maps durable jobs and performs lease-owned ack/retry/dead-let
   assert.equal(calls[1].body.p_lease_token, 'fence-1');
   assert.equal(calls[2].body.p_lease_token, 'fence-1');
   assert.equal(calls[3].body.p_lease_token, 'fence-1');
+});
+
+test('audit search uses caller JWT and composes bounded date and identity filters', async () => {
+  const calls = [];
+  const adapters = createSupabaseAdapters({
+    url: 'https://tenant.supabase.test', publishableKey: 'publishable', secretKey: serviceKey,
+    fetchImpl: async (url, init) => { calls.push({ url: String(url), headers: new Headers(init.headers) }); return response([]); }
+  });
+  const from = '2026-01-01T00:00:00Z', to = '2026-02-01T00:00:00Z';
+  await adapters.db.listAuditEvents({ organizationId: org, limit: 250, from, to, actorUserId: 'user-1', action: 'set_permission',
+    entityType: 'organization_role', entityId: 'role-1', accessToken: userJwt });
+  const url = new URL(calls[0].url), params = url.searchParams;
+  assert.equal(url.pathname, '/rest/v1/audit_events');
+  assert.equal(params.get('and'), `(created_at.gte.${from},created_at.lt.${to})`);
+  assert.equal(params.get('actor_user_id'), 'eq.user-1');
+  assert.equal(params.get('action'), 'eq.set_permission');
+  assert.equal(params.get('entity_type'), 'eq.organization_role');
+  assert.equal(params.get('entity_id'), 'eq.role-1');
+  assert.equal(calls[0].headers.get('authorization'), `Bearer ${userJwt}`);
+  assert.equal(calls[0].headers.get('apikey'), 'publishable');
+});
+
+test('approval expiry sweep uses the server key and a tenant-scoped bounded batch', async () => {
+  const calls = [];
+  const adapters = createSupabaseAdapters({
+    url: 'https://tenant.supabase.test', publishableKey: 'publishable', secretKey: serviceKey,
+    fetchImpl: async (url, init) => { calls.push({ url: String(url), body: JSON.parse(init.body), headers: new Headers(init.headers) }); return response(3); }
+  });
+  const result = await adapters.db.expireActionProposalsSystem({ organizationId: org });
+  assert.equal(result, 3);
+  assert.equal(calls[0].url, 'https://tenant.supabase.test/rest/v1/rpc/expire_action_proposals_system');
+  assert.deepEqual(calls[0].body, { p_organization_id: org, p_limit: 500 });
+  assert.equal(calls[0].headers.get('authorization'), `Bearer ${serviceKey}`);
 });

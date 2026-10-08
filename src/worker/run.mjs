@@ -40,7 +40,7 @@ const worker = createWorker({
     squareClientId: required('SQUARE_CLIENT_ID'),
     squareClientSecret: required('SQUARE_CLIENT_SECRET'),
     accountingTimezone,
-    enabledJobTypes: ['square.webhook', 'square.sync', 'projection.replay', 'receipt.process'],
+    enabledJobTypes: ['square.webhook', 'square.sync', 'projection.replay', 'receipt.process', 'approved_action.execute'],
     openRouterApiKey: process.env.OPENROUTER_API_KEY?.trim() || '',
     openRouterModel: process.env.OPENROUTER_MODEL?.trim() || 'openai/gpt-6-luna',
     openRouterMaxOutputTokens: integer('PURCHASE_RECEIPT_MAX_OUTPUT_TOKENS', 1400, 100, 3000),
@@ -57,12 +57,18 @@ const worker = createWorker({
 const workerId = process.env.WORKER_ID?.trim() || `${hostname()}:${process.pid}:${randomUUID()}`;
 const pollMs = integer('WORKER_POLL_MS', 3000, 250, 60000);
 let stopping = false;
+let lastProposalExpirySweepAt = 0;
 for (const signal of ['SIGINT', 'SIGTERM']) process.on(signal, () => { stopping = true; });
 const log = (level, event, fields = {}) => process.stdout.write(`${JSON.stringify({ at: new Date().toISOString(), level, event, workerId, ...fields })}\n`);
 
-log('info', 'worker_started', { squareEnvironment, enabledJobTypes: ['square.webhook', 'square.sync', 'projection.replay', 'receipt.process'], receiptExtractionConfigured: Boolean(process.env.OPENROUTER_API_KEY?.trim()), receiptModelTimeoutMs: purchaseReceiptModelTimeoutMs });
+log('info', 'worker_started', { squareEnvironment, enabledJobTypes: ['square.webhook', 'square.sync', 'projection.replay', 'receipt.process', 'approved_action.execute'], receiptExtractionConfigured: Boolean(process.env.OPENROUTER_API_KEY?.trim()), receiptModelTimeoutMs: purchaseReceiptModelTimeoutMs });
 while (!stopping) {
   try {
+    if (Date.now() - lastProposalExpirySweepAt >= 60_000) {
+      lastProposalExpirySweepAt = Date.now();
+      const expired = await adapters.db.expireActionProposalsSystem();
+      if (Number.isInteger(expired) && expired > 0) log('info', 'approval_proposals_expired', { count: expired });
+    }
     const result = await worker.runOne({ workerId });
     if (result.status !== 'idle') log(result.status === 'completed' ? 'info' : 'warn', 'job_finished', {
       status: result.status, jobId: result.jobId, code: result.code,

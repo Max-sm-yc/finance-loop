@@ -2,7 +2,7 @@ import { randomBytes } from 'node:crypto';
 import { createAuthorizationUrl, exchangeAuthorizationCode } from './client.mjs';
 
 const JSON_HEADERS = { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' };
-const READ_SCOPES = Object.freeze(['ORDERS_READ', 'PAYMENTS_READ', 'ITEMS_READ', 'PAYOUTS_READ', 'MERCHANT_PROFILE_READ', 'GIFTCARDS_READ']);
+const READ_SCOPES = Object.freeze(['ORDERS_READ', 'PAYMENTS_READ', 'ITEMS_READ', 'INVENTORY_READ', 'PAYOUTS_READ', 'MERCHANT_PROFILE_READ', 'GIFTCARDS_READ']);
 const json = (status, body) => new Response(JSON.stringify(body), { status, headers: JSON_HEADERS });
 const fail = (status, code) => json(status, { error: code, code });
 class OAuthHandlerError extends Error { constructor(status, code) { super(code); this.status = status; this.code = code; } }
@@ -49,6 +49,7 @@ export function createSquareOAuthHandlers({ authenticateOwner, stateStore, token
   const readScopes = config.squareReadScopes ?? READ_SCOPES;
   if (!Array.isArray(readScopes) || readScopes.length === 0 || readScopes.some(scope => !READ_SCOPES.includes(scope)) || new Set(readScopes).size !== readScopes.length) throw new TypeError('squareReadScopes must contain only unique read-only Square scopes');
   const catalogWriteScopes = Object.freeze([...readScopes, 'ITEMS_WRITE']);
+  const inventoryWriteScopes = Object.freeze([...readScopes, 'INVENTORY_WRITE']);
   const baseUrl = config.squareBaseUrl ?? 'https://connect.squareup.com';
   const stateTtlMs = Number.isInteger(config.oauthStateTtlMs) ? Math.max(60_000, Math.min(config.oauthStateTtlMs, 15 * 60_000)) : 10 * 60_000;
 
@@ -81,12 +82,16 @@ export function createSquareOAuthHandlers({ authenticateOwner, stateStore, token
     let body;
     try { body = JSON.parse(raw); } catch { throw new OAuthHandlerError(400, 'INVALID_JSON'); }
     if (!body || typeof body !== 'object' || Array.isArray(body)
-        || Object.keys(body).some(key => !['organizationId', 'catalogWrite'].includes(key))
+        || Object.keys(body).some(key => !['organizationId', 'catalogWrite', 'inventoryWrite'].includes(key))
         || !Object.hasOwn(body, 'organizationId') || !UUID.test(body.organizationId ?? '')
-        || (body.catalogWrite !== undefined && typeof body.catalogWrite !== 'boolean')) throw new OAuthHandlerError(400, 'INVALID_INPUT');
+        || (body.catalogWrite !== undefined && typeof body.catalogWrite !== 'boolean')
+        || (body.inventoryWrite !== undefined && typeof body.inventoryWrite !== 'boolean')) throw new OAuthHandlerError(400, 'INVALID_INPUT');
     const actor = await authenticateOwner(request, body.organizationId);
     if (!actor?.userId || actor.organizationId !== body.organizationId || actor.role !== 'owner') throw new OAuthHandlerError(403, 'FORBIDDEN');
-    const scopes = body.catalogWrite === true ? catalogWriteScopes : readScopes;
+    const scopes = body.catalogWrite === true && body.inventoryWrite === true
+      ? [...readScopes, 'ITEMS_WRITE', 'INVENTORY_WRITE']
+      : body.catalogWrite === true ? catalogWriteScopes
+        : body.inventoryWrite === true ? inventoryWriteScopes : readScopes;
     const state = randomBytes(32).toString('base64url');
     const expiresAt = new Date(now().getTime() + stateTtlMs).toISOString();
     await stateStore.save({ state, organizationId: body.organizationId, userId: actor.userId, redirectUri: config.squareRedirectUri, expiresAt, scopes });
@@ -125,5 +130,5 @@ export function createSquareOAuthHandlers({ authenticateOwner, stateStore, token
     return json(200, { connected: true, organizationId: pending.organizationId, merchantId: tokenResponse.merchant_id, scopes: returnedScopes, expiresAt: tokenResponse.expires_at });
   });
 
-  return Object.freeze({ start, callback, readScopes, catalogWriteScopes });
+  return Object.freeze({ start, callback, readScopes, catalogWriteScopes, inventoryWriteScopes });
 }

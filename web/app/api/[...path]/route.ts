@@ -2,8 +2,7 @@ import { createHandlers } from '../../../../src/server/index.mjs';
 import { createSupabaseAdapters } from '../../../../src/adapters/supabase.mjs';
 import { replayAccounting } from '../../../../src/engine/index.mjs';
 import { createSquareOAuthHandlers } from '../../../../src/square/oauth.mjs';
-import { createSquareCatalogItem as upsertSquareCatalogItem, createSquareCatalogProduct as createSquareCatalogProductEntry,
-  updateSquareCatalogItem, updateSquareCatalogVariation, addSquareCatalogVariation, setSquareCatalogItemArchived } from '../../../../src/square/catalog.mjs';
+import { createSquareCatalogItem as upsertSquareCatalogItem } from '../../../../src/square/catalog.mjs';
 import { refreshAccessToken, SquareApiClient } from '../../../../src/square/client.mjs';
 
 export const runtime = 'nodejs';
@@ -215,34 +214,6 @@ async function withSquareCatalogWrite<T>(organizationId: string, adapters: Retur
   }
 }
 
-async function createSquareCatalogProductForOrganization(args: {
-  organizationId: string; idempotencyKey: string; name: string; description: string;
-  variations: Array<{ name: string; sku: string; pricingType: string; priceMinor: number | null; currency: string | null }>;
-}, adapters: ReturnType<typeof createSupabaseAdapters>) {
-  return withSquareCatalogWrite(args.organizationId, adapters, client => createSquareCatalogProductEntry({ client,
-    idempotencyKey: args.idempotencyKey, name: args.name, description: args.description, variations: args.variations }));
-}
-
-async function manageSquareCatalogItemForOrganization(args: {
-  organizationId: string; idempotencyKey: string; action: string; squareItemId: string;
-  squareCatalogObjectId?: string; name?: string; description?: string; variationName?: string;
-  sku?: string; pricingType?: string; priceMinor?: number | null; currency?: string;
-}, adapters: ReturnType<typeof createSupabaseAdapters>) {
-  return withSquareCatalogWrite(args.organizationId, adapters, async client => {
-    const variation = { client, idempotencyKey: args.idempotencyKey, itemId: args.squareItemId,
-      variationName: args.variationName ?? '', sku: args.sku ?? '', pricingType: args.pricingType ?? '',
-      priceMinor: args.priceMinor ?? null, currency: args.currency ?? '' };
-    if (args.action === 'update_item') return updateSquareCatalogItem({ client, idempotencyKey: args.idempotencyKey,
-      itemId: args.squareItemId, name: args.name ?? '', description: args.description ?? '' });
-    if (args.action === 'update_variation') return updateSquareCatalogVariation({ ...variation,
-      variationId: args.squareCatalogObjectId ?? '' });
-    if (args.action === 'add_variation') return addSquareCatalogVariation(variation);
-    if (args.action === 'archive' || args.action === 'restore') return setSquareCatalogItemArchived({ client,
-      idempotencyKey: args.idempotencyKey, itemId: args.squareItemId, archived: args.action === 'archive' });
-    throw codedError('SQUARE_CATALOG_WRITE_FAILED');
-  });
-}
-
 function handlers() {
   const squareEnvironment = process.env.SQUARE_ENVIRONMENT;
   const adapters = createSupabaseAdapters({
@@ -257,8 +228,6 @@ function handlers() {
     ...adapters,
     squareCatalog: {
       createItem: (args: Parameters<typeof createSquareCatalogItemForOrganization>[0]) => createSquareCatalogItemForOrganization(args, adapters),
-      createProduct: (args: Parameters<typeof createSquareCatalogProductForOrganization>[0]) => createSquareCatalogProductForOrganization(args, adapters),
-      manageItem: (args: Parameters<typeof manageSquareCatalogItemForOrganization>[0]) => manageSquareCatalogItemForOrganization(args, adapters),
     },
     listSquareLocations: ({ organizationId }: { organizationId: string }) => listActiveSquareLocations(organizationId, adapters),
     engine: { replayAccounting },
@@ -311,6 +280,14 @@ async function dispatch(request: Request) {
   }
   if (resource === 'dashboard' && method === 'GET') return route.dashboard(request);
   if (resource === 'purchase-receipt-integrations' && ['GET', 'POST', 'DELETE'].includes(method)) return route.receiptIntegration(request);
+  if (resource === 'approval-integrations' && ['GET', 'POST', 'DELETE'].includes(method)) return route.powerAutomateApprovalIntegration(request);
+  if (resource === 'integrations' && id === 'action-approvals') {
+    const proposalId = parts[3];
+    const approvalAction = parts[4];
+    if (proposalId === 'next' && !approvalAction && method === 'GET') return route.powerAutomateApprovalNext(request);
+    if (proposalId && approvalAction === 'decision' && method === 'POST') return route.powerAutomateApprovalDecision(request);
+    if (proposalId && approvalAction === 'release' && method === 'POST') return route.powerAutomateApprovalRelease(request);
+  }
   if (resource === 'purchase-receipts' && !id && method === 'GET') return route.purchaseReceipts(request);
   if (resource === 'purchase-receipts' && !id && method === 'POST') return route.purchaseReceipts(request);
   if (resource === 'purchase-receipts' && id === 'intake' && method === 'POST') return route.manualPurchaseReceiptIntake(request);
@@ -329,6 +306,19 @@ async function dispatch(request: Request) {
   if (resource === 'issues' && id && action === 'refund-review' && method === 'POST') return route.refundReview(request);
   if (resource === 'proposals' && !id && method === 'POST') return route.proposal(request);
   if (resource === 'proposals' && id && action === 'decision' && method === 'POST') return route.decision(request);
+  if (resource === 'actions' && !id && ['GET','POST'].includes(method)) return route.actionProposals(request);
+  if (resource === 'actions' && id && action === 'decision' && method === 'POST') return route.actionDecision(request);
+  if (resource === 'actions' && id && action === 'cancel' && method === 'POST') return route.actionCancellation(request);
+  if (resource === 'domain' && id === 'catalog' && method === 'GET') return route.domainCatalog(request);
+  if (resource === 'domain' && id === 'catalog' && method === 'POST') return route.domainCatalogItem(request);
+  if (resource === 'domain' && id === 'purchase-orders' && ['GET','POST'].includes(method)) return route.domainPurchaseOrders(request);
+  if (resource === 'financial-events' && !id && method === 'GET') return route.financialEvents(request);
+  if (resource === 'roles' && !id && method === 'GET') return route.roleSettings(request);
+  if (resource === 'roles' && id === 'custom' && method === 'POST') return route.customRole(request);
+  if (resource === 'roles' && id === 'membership' && method === 'PATCH') return route.membershipRole(request);
+  if (resource === 'roles' && id === 'permission' && method === 'PATCH') return route.rolePermission(request);
+  if (resource === 'roles' && id === 'teams-identity' && method === 'POST') return route.teamsIdentity(request);
+  if (resource === 'roles' && id === 'approval-policy' && method === 'POST') return route.approvalPolicy(request);
   if (resource === 'manual-movements' && method === 'GET') return route.manualMovements(request);
   if (resource === 'manual-movements' && method === 'POST') return route.manualMovement(request);
   if (resource === 'observations' && method === 'GET') return route.observations(request);
@@ -336,6 +326,7 @@ async function dispatch(request: Request) {
   if (resource === 'audit' && method === 'GET') return route.audit(request);
   if (resource === 'settings' && method === 'GET') return route.settings(request);
   if (resource === 'inventory' && !id && method === 'GET') return route.inventory(request);
+  if (resource === 'inventory' && id === 'square-counts' && method === 'GET') return route.squareInventoryCounts(request);
   if (resource === 'inventory' && id === 'purchases' && method === 'POST') return route.inventoryPurchase(request);
   if (resource === 'inventory' && id === 'receipt-drafts' && method === 'POST') return route.receiptDraft(request);
   if (resource === 'inventory' && id === 'receipt-costs' && method === 'POST') return route.receiptItemCosts(request);
@@ -343,8 +334,6 @@ async function dispatch(request: Request) {
   if (resource === 'inventory' && id === 'openings' && method === 'POST') return route.inventoryOpening(request);
   if (resource === 'inventory' && id === 'items' && method === 'POST') return route.inventoryItem(request);
   if (resource === 'inventory' && id === 'catalog-items' && method === 'POST') return route.squareCatalogItem(request);
-  if (resource === 'square' && id === 'catalog-items' && method === 'POST') return route.squareCatalogCreate(request);
-  if (resource === 'square' && id === 'catalog-items' && method === 'PATCH') return route.squareCatalogManage(request);
   if (resource === 'analytics' && method === 'GET') return route.analytics(request);
   if (resource === 'evidence' && !id && method === 'POST') return route.evidence(request);
   if (resource === 'evidence' && !id && method === 'GET') return route.evidenceUrl(request);

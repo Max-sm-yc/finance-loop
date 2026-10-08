@@ -408,6 +408,93 @@ export function createSupabaseAdapters({ url, publishableKey, secretKey, tokenEn
       if (error) throw error;
       return Array.isArray(data) ? data : [];
     },
+    async createPowerAutomateApprovalIntegration({ organizationId, mappingId, name, tokenSha256, accessToken }) {
+      const { data, error } = await userRest(accessToken).rpc('register_power_automate_approval_integration', {
+        p_organization_id: organizationId, p_mapping_id: mappingId, p_name: name, p_token_sha256: tokenSha256,
+      });
+      if (error) throw error;
+      return typeof data === 'string' ? { id: data } : data;
+    },
+    async listPowerAutomateApprovalIntegrations({ organizationId, accessToken }) {
+      const { data, error } = await userRest(accessToken).rpc('list_power_automate_approval_integrations', {
+        p_organization_id: organizationId,
+      });
+      if (error) throw error;
+      return Array.isArray(data) ? data : [];
+    },
+    async revokePowerAutomateApprovalIntegration({ organizationId, integrationId, accessToken }) {
+      const { data, error } = await userRest(accessToken).rpc('revoke_power_automate_approval_integration', {
+        p_organization_id: organizationId, p_integration_id: integrationId,
+      });
+      if (error) throw error;
+      return data;
+    },
+    async authorizePowerAutomateApprovalIntegration({ tokenSha256 }) {
+      const { data, error } = await serviceRest().rpc('authorize_power_automate_approval_integration', {
+        p_token_sha256: tokenSha256,
+      });
+      if (error) throw error;
+      const value = Array.isArray(data) ? data[0] : data;
+      return value ? {
+        organizationId: value.organizationId ?? value.organization_id,
+        integrationId: value.integrationId ?? value.integration_id,
+        mappingId: value.mappingId ?? value.mapping_id,
+        reviewerUserId: value.reviewerUserId ?? value.reviewer_user_id,
+        tenantId: value.tenantId ?? value.tenant_id,
+        teamsUserId: value.teamsUserId ?? value.teams_user_id,
+        email: value.email,
+      } : null;
+    },
+    async claimPowerAutomateActionProposal({ integrationId }) {
+      const { data, error } = await serviceRest().rpc('claim_power_automate_action_proposal', {
+        p_integration_id: integrationId,
+      });
+      if (error) throw error;
+      const value = Array.isArray(data) ? data[0] : data;
+      if (!value) return null;
+      const proposal = value.proposal ?? value.action_proposal ?? null;
+      const expectedResponder = value.expectedResponder ?? value.expected_responder ?? {};
+      return {
+        recipientEmail: value.recipientEmail ?? value.recipient_email,
+        expectedResponder: {
+          tenantId: expectedResponder.tenantId ?? expectedResponder.tenant_id,
+          teamsUserId: expectedResponder.teamsUserId ?? expectedResponder.teams_user_id,
+        },
+        proposal: proposal ? {
+          id: proposal.id,
+          organizationId: proposal.organizationId ?? proposal.organization_id,
+          organizationName: proposal.organizationName ?? proposal.organization_name,
+          actionType: proposal.actionType ?? proposal.action_type,
+          status: proposal.status,
+          payload: proposal.payload,
+          payloadSha256: proposal.payloadSha256 ?? proposal.payload_sha256,
+          locationId: proposal.locationId ?? proposal.location_id ?? null,
+          amountMinor: proposal.amountMinor ?? proposal.amount_minor ?? null,
+          currency: proposal.currency ?? null,
+          evidenceRefs: proposal.evidenceRefs ?? proposal.evidence_refs ?? [],
+          createdAt: proposal.createdAt ?? proposal.created_at,
+          expiresAt: proposal.expiresAt ?? proposal.expires_at,
+        } : null,
+      };
+    },
+    async releasePowerAutomateActionProposal({ integrationId, proposalId }) {
+      const { data, error } = await serviceRest().rpc('release_power_automate_action_proposal', {
+        p_integration_id: integrationId, p_proposal_id: proposalId,
+      });
+      if (error) throw error;
+      return data === true;
+    },
+    async decideActionFromPowerAutomate({ integrationId, organizationId, proposalId, responderTenantId, responderTeamsUserId,
+      decision, reason, payloadSha256, idempotencyKey, sourceMessageRef }) {
+      const { data, error } = await serviceRest().rpc('decide_action_from_power_automate', {
+        p_integration_id: integrationId, p_organization_id: organizationId, p_proposal_id: proposalId,
+        p_responder_tenant_id: responderTenantId, p_responder_teams_user_id: responderTeamsUserId,
+        p_decision: decision, p_reason: reason, p_expected_payload_sha256: payloadSha256,
+        p_idempotency_key: idempotencyKey, p_source_message_ref: sourceMessageRef,
+      });
+      if (error) throw error;
+      return data;
+    },
     async authorizePurchaseReceiptIntegration({ tokenSha256 }) {
       const { data, error } = await serviceRest().rpc('authorize_purchase_receipt_integration', { p_token_sha256: tokenSha256 });
       if (error) throw error;
@@ -613,7 +700,7 @@ export function createSupabaseAdapters({ url, publishableKey, secretKey, tokenEn
       if (error) throw error;
       return data;
     },
-    async upsertSquareFacts({ organizationId, facts, cause }) {
+    async upsertSquareFacts({ organizationId, facts, cause, deferFinancialEvents = false }) {
       const normalized = facts.map(fact => {
         const { raw: _rawSquareObject, ...safeFact } = fact;
         return { kind: fact.kind, objectId: fact.objectId, version: String(fact.version), versionSort: squareVersionSort(fact.version), fact: safeFact };
@@ -631,7 +718,56 @@ export function createSupabaseAdapters({ url, publishableKey, secretKey, tokenEn
         changed ||= data?.changed === true;
         if (Number.isSafeInteger(data?.revision)) revision = data.revision;
       }
+      const catalogFacts = facts.filter(fact => fact?.kind === 'catalog').map(({ raw: _rawSquareObject, ...fact }) => fact);
+      if (catalogFacts.length) {
+        const { error } = await serviceRest().rpc('upsert_square_catalog_entities', {
+          p_organization_id: organizationId, p_facts: catalogFacts,
+        });
+        if (error) throw error;
+      }
+      if (normalized.length && deferFinancialEvents !== true) {
+        const { error } = await serviceRest().rpc('materialize_square_financial_events', {
+          p_organization_id: organizationId,
+        });
+        if (error) throw error;
+      }
       return { changed, revision };
+    },
+    async upsertSquareLocations({ organizationId, locations }) {
+      const { data, error } = await serviceRest().rpc('upsert_square_locations', {
+        p_organization_id: organizationId, p_locations: locations,
+      });
+      if (error) throw error;
+      const { error: materializeError } = await serviceRest().rpc('materialize_square_financial_events', {
+        p_organization_id: organizationId,
+      });
+      if (materializeError) throw materializeError;
+      return { count: Number.isSafeInteger(data) ? data : 0 };
+    },
+    async getSquareInventoryTargetsSystem({ organizationId }) {
+      const { data, error } = await serviceRest().rpc('get_square_inventory_targets_system', { p_organization_id: organizationId });
+      if (error) throw error;
+      return { catalogObjectIds: Array.isArray(data?.catalogObjectIds) ? data.catalogObjectIds : [],
+        locationIds: Array.isArray(data?.locationIds) ? data.locationIds : [] };
+    },
+    async upsertSquareInventoryCounts({ organizationId, counts }) {
+      if (!Array.isArray(counts) || counts.length > 1000) throw new TypeError('Square inventory counts must be a batch of at most 1000');
+      const { data, error } = await serviceRest().rpc('upsert_square_inventory_counts', {
+        p_organization_id: organizationId, p_counts: counts,
+      });
+      if (error) throw error;
+      return { inserted: Number.isSafeInteger(data?.inserted) ? data.inserted : 0,
+        changed: Number.isSafeInteger(data?.changed) ? data.changed : 0,
+        unmappedCount: Number.isSafeInteger(data?.unmappedCount) ? data.unmappedCount : 0,
+        conflictCount: Number.isSafeInteger(data?.conflictCount) ? data.conflictCount : 0,
+        unmappedRefs: Array.isArray(data?.unmappedRefs) ? data.unmappedRefs : [] };
+    },
+    async materializeFinancialEvents({ organizationId }) {
+      const { data, error } = await serviceRest().rpc('materialize_square_financial_events', {
+        p_organization_id: organizationId,
+      });
+      if (error) throw error;
+      return Number.isSafeInteger(data) ? data : 0;
     },
     async recordSourceHealth(record) {
       const { data, error } = await serviceRest().rpc('record_square_worker_health', {
@@ -714,6 +850,114 @@ export function createSupabaseAdapters({ url, publishableKey, secretKey, tokenEn
       const rest = userRest(accessToken);
       const rows = await table(rest, 'memberships', new URLSearchParams({ select: 'role', organization_id: eq(organizationId), user_id: eq(userId), limit: '2' }));
       return one(rows, 'membership');
+    },
+    async hasOrganizationPermission({ organizationId, permission, locationId = null, accessToken }) {
+      const { data, error } = await userRest(accessToken).rpc('has_organization_permission', {
+        p_organization_id: organizationId, p_permission_key: permission, p_location_id: locationId,
+      });
+      if (error) throw error;
+      return data === true;
+    },
+    async getDomainCatalog({ organizationId, accessToken }) {
+      const { data, error } = await userRest(accessToken).rpc('get_domain_catalog', { p_organization_id: organizationId });
+      if (error) throw error;
+      return Array.isArray(data) ? data : [];
+    },
+    async createDomainCatalogItem({ organizationId, item, reason, idempotencyKey, accessToken }) {
+      const { data, error } = await userRest(accessToken).rpc('create_domain_catalog_item', {
+        p_organization_id: organizationId, p_item: item, p_reason: reason, p_idempotency_key: idempotencyKey,
+      });
+      if (error) throw error;
+      return data;
+    },
+    async listDomainPurchaseOrders({ organizationId, accessToken }) {
+      const { data, error } = await userRest(accessToken).rpc('list_domain_purchase_orders', { p_organization_id: organizationId });
+      if (error) throw error;
+      return Array.isArray(data) ? data : [];
+    },
+    async createDomainPurchaseOrder({ organizationId, purchaseOrder, reason, idempotencyKey, accessToken }) {
+      const { data, error } = await userRest(accessToken).rpc('create_domain_purchase_order', {
+        p_organization_id: organizationId, p_purchase_order: purchaseOrder, p_reason: reason, p_idempotency_key: idempotencyKey,
+      });
+      if (error) throw error;
+      return data;
+    },
+    async getSquareInventoryCounts({ organizationId, accessToken }) {
+      const { data, error } = await userRest(accessToken).rpc('get_square_inventory_counts', { p_organization_id: organizationId });
+      if (error) throw error;
+      return Array.isArray(data) ? data : [];
+    },
+    async listFinancialEvents({ organizationId, from, to, accessToken }) {
+      const { data, error } = await userRest(accessToken).rpc('list_financial_events', {
+        p_organization_id: organizationId, p_start_at: from, p_end_at: to,
+      });
+      if (error) throw error;
+      return Array.isArray(data) ? data : [];
+    },
+    async expireActionProposalsSystem({ organizationId = null } = {}) {
+      const { data, error } = await serviceRest().rpc('expire_action_proposals_system', {
+        p_organization_id: organizationId, p_limit: 500,
+      });
+      if (error) throw error;
+      return data;
+    },
+    async listTeamsActionProposals({ tenantId, teamsUserId, limit = 3 }) {
+      const { data, error } = await serviceRest().rpc('list_teams_action_proposals', {
+        p_tenant_id: tenantId, p_teams_user_id: teamsUserId, p_limit: limit,
+      });
+      if (error) throw error;
+      return Array.isArray(data) ? data : [];
+    },
+    async decideActionFromTeams({ organizationId, proposalId, tenantId, teamsUserId, decision, reason, payloadSha256, idempotencyKey, sourceMessageRef }) {
+      const { data, error } = await serviceRest().rpc('decide_action_from_teams', {
+        p_organization_id: organizationId, p_proposal_id: proposalId, p_tenant_id: tenantId,
+        p_teams_user_id: teamsUserId, p_decision: decision, p_reason: reason,
+        p_expected_payload_sha256: payloadSha256, p_idempotency_key: idempotencyKey,
+        p_source_message_ref: sourceMessageRef,
+      });
+      if (error) throw error;
+      return data;
+    },
+    async listActionProposals({ organizationId, accessToken, status }) {
+      const query = new URLSearchParams({
+        select: 'id,action_type,status,payload,payload_sha256,expected_source_version,location_id,amount_minor,currency,evidence_refs,proposed_by,proposed_by_kind,created_at,updated_at,expires_at',
+        organization_id: eq(organizationId), order: 'created_at.desc', limit: '200',
+      });
+      if (status) query.set('status', eq(status));
+      const proposals = await table(userRest(accessToken), 'action_proposals', query);
+      if (!proposals.length) return [];
+      const ids = proposals.map(row => row.id).filter(Boolean);
+      const decisionsQuery = new URLSearchParams({
+        select: 'proposal_id,decision,decided_by,decided_by_kind,reason,proposal_revision_hash,created_at',
+        organization_id: eq(organizationId), proposal_id: `in.(${ids.join(',')})`, order: 'created_at.asc', limit: '1000',
+      });
+      const executionsQuery = new URLSearchParams({
+        select: 'proposal_id,attempt,status,approved_payload_sha256,outcome_code,result_summary,started_at,completed_at,created_at',
+        organization_id: eq(organizationId), proposal_id: `in.(${ids.join(',')})`, order: 'attempt.asc', limit: '1000',
+      });
+      const [decisions, executions] = await Promise.all([
+        table(userRest(accessToken), 'action_approval_decisions', decisionsQuery),
+        table(userRest(accessToken), 'action_execution_records', executionsQuery),
+      ]);
+      return proposals.map(proposal => ({ ...proposal,
+        decisions: decisions.filter(row => row.proposal_id === proposal.id),
+        executions: executions.filter(row => row.proposal_id === proposal.id),
+      }));
+    },
+    async getOrganizationRoles({ organizationId, accessToken }) {
+      const rest = userRest(accessToken);
+      const queries = [
+        ['memberships', new URLSearchParams({ select: 'user_id,role,custom_role_id,location_scope_mode,created_at', organization_id: eq(organizationId), order: 'created_at.asc', limit: '500' })],
+        ['organization_custom_roles', new URLSearchParams({ select: 'id,name,description,created_at', organization_id: eq(organizationId), order: 'name.asc', limit: '100' })],
+        ['organization_role_permission_overrides', new URLSearchParams({ select: 'role_key,permission_key,allowed,changed_at', organization_id: eq(organizationId), order: 'role_key.asc,permission_key.asc', limit: '500' })],
+        ['custom_role_permissions', new URLSearchParams({ select: 'custom_role_id,permission_key,allowed,changed_at', organization_id: eq(organizationId), order: 'custom_role_id.asc,permission_key.asc', limit: '1000' })],
+        ['membership_location_scopes', new URLSearchParams({ select: 'user_id,location_id', organization_id: eq(organizationId), order: 'user_id.asc,location_id.asc', limit: '1000' })],
+        ['business_locations', new URLSearchParams({ select: 'id,name,status', organization_id: eq(organizationId), order: 'name.asc', limit: '500' })],
+        ['external_identity_mappings', new URLSearchParams({ select: 'id,user_id,provider,tenant_id,external_user_id,external_email,status,linked_at', organization_id: eq(organizationId), order: 'linked_at.desc', limit: '500' })],
+        ['action_approval_policies', new URLSearchParams({ select: 'id,action_type,location_id,amount_currency,min_amount_minor,max_amount_minor,required_permission,required_role,required_approval_count,max_single_approver_minor,enabled,changed_at', organization_id: eq(organizationId), order: 'action_type.asc,min_amount_minor.asc', limit: '500' })],
+      ];
+      const values = await Promise.all(queries.map(([name, query]) => table(rest, name, query)));
+      return Object.fromEntries(queries.map(([name], index) => [name, values[index]]));
     },
     async getDashboard({ organizationId, accountId, from, to, accessToken }) {
       const rest = userRest(accessToken);
@@ -815,7 +1059,7 @@ export function createSupabaseAdapters({ url, publishableKey, secretKey, tokenEn
       return { inventoryTracking: row?.inventory_tracking === true, productAnalytics: row?.product_analytics === true };
     },
     async listInventoryMovements({ organizationId, from, to, accessToken }) {
-      const query = new URLSearchParams({ select: '*', organization_id: eq(organizationId), order: 'occurred_at.desc,id.desc', limit: '1000' });
+      const query = new URLSearchParams({ select: 'id,organization_id,item_definition_id,inventory_item_id,item_name,square_catalog_object_id,movement_type,quantity_delta,currency,occurred_at,cash_movement_id,evidence_file_id,reason,idempotency_key,created_by,created_at', organization_id: eq(organizationId), order: 'occurred_at.desc,id.desc', limit: '1000' });
       if (from || to) {
         const filters = [from && `occurred_at.gte.${from}`, to && `occurred_at.lt.${to}`].filter(Boolean);
         query.set('and', `(${filters.join(',')})`);
@@ -823,8 +1067,8 @@ export function createSupabaseAdapters({ url, publishableKey, secretKey, tokenEn
       return table(userRest(accessToken), 'inventory_movements', query);
     },
     async getInventorySnapshot({ organizationId, from, to, currency, accessToken }) {
-      const { data, error } = await userRest(accessToken).rpc('get_inventory_snapshot', {
-        organization_id: organizationId, start_at: from, end_at: to, currency
+      const { data, error } = await userRest(accessToken).rpc('get_inventory_snapshot_authorized', {
+        p_organization_id: organizationId, p_start_at: from, p_end_at: to, p_currency: currency
       });
       if (error) throw error;
       return data ?? { from, to, currency, items: [], movements: [], lines: [] };
@@ -883,6 +1127,22 @@ export function createSupabaseAdapters({ url, publishableKey, secretKey, tokenEn
       });
       if (error) throw error;
       return data;
+    },
+    async beginActionExecution({ organizationId, proposalId, payloadSha256, attempt }) {
+      const { data, error } = await serviceRest().rpc('begin_action_execution', {
+        p_organization_id: organizationId, p_proposal_id: proposalId,
+        p_expected_payload_sha256: payloadSha256, p_attempt: attempt,
+      });
+      if (error) throw error;
+      return data;
+    },
+    async finishActionExecution({ organizationId, proposalId, attempt, status, outcomeCode, resultSummary }) {
+      const { data, error } = await serviceRest().rpc('finish_action_execution', {
+        p_organization_id: organizationId, p_proposal_id: proposalId, p_attempt: attempt,
+        p_status: status, p_outcome_code: outcomeCode ?? null, p_result_summary: resultSummary ?? {},
+      });
+      if (error) throw error;
+      return data === true;
     },
     async recordInventoryPurchase(args) {
       const { data, error } = await userRest(args.accessToken).rpc('record_inventory_purchase', {
@@ -955,15 +1215,15 @@ export function createSupabaseAdapters({ url, publishableKey, secretKey, tokenEn
       return { movementId: data };
     },
     async listProductAnalyticsFacts({ organizationId, from, to, accessToken }) {
-      const { data, error } = await userRest(accessToken).rpc('get_product_analytics_facts', {
-        organization_id: organizationId, start_at: from, end_at: to
+      const { data, error } = await userRest(accessToken).rpc('get_product_analytics_facts_authorized', {
+        p_organization_id: organizationId, p_start_at: from, p_end_at: to
       });
       if (error) throw error;
       return data ?? { from, to, facts: [], policy: {}, sourceHealth: [], openIssueCount: 0 };
     },
     async listProductCatalogItems({ organizationId, accessToken }) {
-      const { data, error } = await userRest(accessToken).rpc('get_product_catalog_items', {
-        organization_id: organizationId
+      const { data, error } = await userRest(accessToken).rpc('get_product_catalog_items_authorized', {
+        p_organization_id: organizationId
       });
       if (error) throw error;
       return Array.isArray(data) ? data : [];
@@ -973,8 +1233,15 @@ export function createSupabaseAdapters({ url, publishableKey, secretKey, tokenEn
       if (accountId) query.set('account_id', eq(accountId));
       return table(userRest(accessToken), 'balance_observations', query);
     },
-    async listAuditEvents({ organizationId, limit, accessToken }) {
+    async listAuditEvents({ organizationId, limit, from, to, actorUserId, action, entityType, entityId, accessToken }) {
       const query = new URLSearchParams({ select: '*', organization_id: eq(organizationId), order: 'created_at.desc', limit: String(limit) });
+      if (from && to) query.set('and', `(created_at.gte.${from},created_at.lt.${to})`);
+      else if (from) query.set('created_at', `gte.${from}`);
+      else if (to) query.set('created_at', `lt.${to}`);
+      if (actorUserId) query.set('actor_user_id', eq(actorUserId));
+      if (action) query.set('action', eq(action));
+      if (entityType) query.set('entity_type', eq(entityType));
+      if (entityId) query.set('entity_id', eq(entityId));
       return table(userRest(accessToken), 'audit_events', query);
     },
     async getSettings({ organizationId, accessToken }) {

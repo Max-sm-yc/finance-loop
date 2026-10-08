@@ -5,6 +5,7 @@ import { buildReceiptInventoryChoices, JevInventoryMatchError, matchReceiptLines
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { calculateProductAnalytics } from '../engine/analytics.mjs';
 import { calculateInventory } from '../engine/inventory.mjs';
+import { DomainCommandInputError, normalizeDraftCatalogItem, normalizePurchaseOrder } from '../domain/commands.mjs';
 
 const JSON_HEADERS = { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' };
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -12,7 +13,7 @@ const ISO = /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d{1,3})?Z$/;
 const MAX_SYNC_WINDOW_MS = 366 * 24 * 60 * 60 * 1000;
 const MAX_PURCHASE_RECEIPT_BYTES = 8 * 1024 * 1024;
 const RECEIPT_MIME_TYPES = new Set(['application/pdf','image/jpeg','image/png']);
-const roles = new Set(['owner', 'operator', 'reviewer', 'read_only']);
+const roles = new Set(['owner', 'administrator', 'manager', 'employee', 'operator', 'reviewer', 'read_only', 'custom']);
 const own = (o, k) => Object.prototype.hasOwnProperty.call(o, k);
 
 class HttpError extends Error { constructor(status, code) { super(code); this.status = status; this.code = code; } }
@@ -126,6 +127,15 @@ function safeThrown(error) {
   if (error instanceof HttpError) return bad(error.status, error.code);
   const safeDatabaseMessage=typeof error?.message==='string'?error.message.toLowerCase():'';
   if (error?.code==='P0001' || error?.code==='23505') {
+    if (safeDatabaseMessage.includes('active teams identity with directory email required')) return bad(409,'TEAMS_IDENTITY_EMAIL_REQUIRED');
+    if (safeDatabaseMessage.includes('power_automate_approval_one_active_mapping')) return bad(409,'APPROVAL_INTEGRATION_EXISTS');
+    if (safeDatabaseMessage.includes('power automate approval integration not found')) return bad(404,'APPROVAL_INTEGRATION_NOT_FOUND');
+    if (safeDatabaseMessage.includes('permission required') || safeDatabaseMessage.includes('role required')
+        || safeDatabaseMessage.includes('permission is not held') || safeDatabaseMessage.includes('cannot approve or reject their own action')) return bad(403,'FORBIDDEN');
+    if (safeDatabaseMessage.includes('idempotency key collision')) return bad(409,'IDEMPOTENCY_CONFLICT');
+    if (safeDatabaseMessage.includes('proposal changed') || safeDatabaseMessage.includes('source_version_conflict')
+        || safeDatabaseMessage.includes('no longer pending') || safeDatabaseMessage.includes('proposal expired')) return bad(409,'ACTION_PROPOSAL_CONFLICT');
+    if (safeDatabaseMessage.includes('action proposal not found')) return bad(404,'ACTION_PROPOSAL_NOT_FOUND');
     if (safeDatabaseMessage.includes('period_closed')) return bad(409,'PERIOD_CLOSED');
     if (safeDatabaseMessage.includes('organization owner or reviewer role required')) return bad(403,'FORBIDDEN');
     if (safeDatabaseMessage.includes('only failed receipts without drafts, decisions or effects can be reprocessed')) return bad(409,'RECEIPT_NOT_REPROCESSABLE');
@@ -156,7 +166,7 @@ function safeThrown(error) {
  */
 export function createHandlers(adapters) {
   const { supabase, db, queue, config, squareCatalog } = requireAdapters(adapters);
-  const authorize = async (req, organizationId, allowedRoles) => {
+  const authorize = async (req, organizationId, allowedRoles, requiredPermission = null, locationId = null) => {
     const { data, error } = await supabase.auth.getUser(parseBearer(req));
     const user = data?.user;
     if (error || !user?.id) throw new HttpError(401, 'UNAUTHENTICATED');
@@ -165,6 +175,11 @@ export function createHandlers(adapters) {
     const membership = await db.getMembership({ organizationId, userId: user.id, accessToken: token });
     if (!membership || !roles.has(membership.role)) throw new HttpError(403, 'FORBIDDEN');
     if (allowedRoles && !allowedRoles.includes(membership.role)) throw new HttpError(403, 'FORBIDDEN');
+    if (requiredPermission) {
+      if (typeof db.hasOrganizationPermission !== 'function') throw new HttpError(503, 'AUTHORIZATION_UNAVAILABLE');
+      const allowed = await db.hasOrganizationPermission({ organizationId, permission: requiredPermission, locationId, accessToken: token });
+      if (!allowed) throw new HttpError(403, 'FORBIDDEN');
+    }
     return { userId: user.id, role: membership.role, accessToken: token };
   };
   const featureAvailability = async (organizationId, accessToken) => {
@@ -191,7 +206,7 @@ export function createHandlers(adapters) {
     if (req.method !== 'GET') throw new HttpError(405, 'METHOD_NOT_ALLOWED');
     const u = new URL(req.url); const organizationId = u.searchParams.get('organizationId');
     const accountId = u.searchParams.get('accountId'); const from = u.searchParams.get('from'); const to = u.searchParams.get('to');
-    const actor = await authorize(req, organizationId);
+    const actor = await authorize(req, organizationId, null, 'finance.metrics.read');
     if ((accountId && !UUID.test(accountId)) || !validDate(from) || !validDate(to) || Date.parse(from) >= Date.parse(to)) throw new HttpError(400, 'INVALID_QUERY');
     return ok(await db.getDashboard({ organizationId, accountId, from, to, actorUserId: actor.userId, accessToken: actor.accessToken }));
   });
@@ -203,7 +218,7 @@ export function createHandlers(adapters) {
     const supportedKinds = ['cash_deposit','purchase','pay','misc_spend','other_inflow'];
     const signedAsExpected = ['cash_deposit','other_inflow'].includes(body.kind) ? body.amountMinor > 0 : ['purchase','pay','misc_spend'].includes(body.kind) ? body.amountMinor < 0 : true;
     if (!exactObject(body, fields, fields) || !UUID.test(body.organizationId) || !UUID.test(body.accountId) || !supportedKinds.includes(body.kind) || !validMoney(body.amountMinor) || !signedAsExpected || !/^[A-Z]{3}$/.test(body.currency) || !validDate(body.occurredAt) || !text(body.description, 500) || !text(body.evidenceRef, 1000)) throw new HttpError(400, 'INVALID_MOVEMENT');
-    const actor = await authorize(req, body.organizationId, ['owner','operator']);
+    const actor = await authorize(req, body.organizationId, ['owner','operator'], 'finance.cash.write');
     const userDb = db.asUser(actor.accessToken);
     if (typeof userDb?.rpc !== 'function') throw new HttpError(503, 'DATABASE_UNAVAILABLE');
     const { data, error } = await userDb.rpc('record_cash_movement', { organization_id: body.organizationId, account_id: body.accountId, kind: body.kind, amount_minor: body.amountMinor, currency: body.currency, occurred_at: body.occurredAt, description: body.description, evidence_file_id: body.evidenceRef, idempotency_key: key, approved_by: null });
@@ -216,7 +231,7 @@ export function createHandlers(adapters) {
     const body = await readJson(req); const key = idempotency(req);
     const fields = ['organizationId','accountId','amountMinor','currency','observedAt','evidenceRef'];
     if (!exactObject(body, fields, fields) || !UUID.test(body.organizationId) || !UUID.test(body.accountId) || !Number.isSafeInteger(body.amountMinor) || !/^[A-Z]{3}$/.test(body.currency) || !validDate(body.observedAt) || !text(body.evidenceRef, 1000)) throw new HttpError(400, 'INVALID_OBSERVATION');
-    const actor = await authorize(req, body.organizationId, ['owner','operator']);
+    const actor = await authorize(req, body.organizationId, ['owner','operator'], 'finance.cash.write');
     const userDb = db.asUser(actor.accessToken);
     if (typeof userDb?.rpc !== 'function') throw new HttpError(503, 'DATABASE_UNAVAILABLE');
     const { data, error } = await userDb.rpc('record_balance_observation', { organization_id: body.organizationId, account_id: body.accountId, amount_minor: body.amountMinor, currency: body.currency, observed_at: body.observedAt, evidence_file_id: body.evidenceRef, idempotency_key: key });
@@ -228,7 +243,7 @@ export function createHandlers(adapters) {
     if (req.method !== 'POST') throw new HttpError(405, 'METHOD_NOT_ALLOWED');
     const body = await readJson(req); const key = idempotency(req);
     if (!exactObject(body, ['organizationId','issueId']) || !UUID.test(body.organizationId) || !UUID.test(body.issueId)) throw new HttpError(400, 'INVALID_PROPOSAL_REQUEST');
-    const actor = await authorize(req, body.organizationId, ['owner','operator']);
+    const actor = await authorize(req, body.organizationId, ['owner','operator'], 'issues.propose');
     const issue = await db.getIssue({ organizationId: body.organizationId, issueId: body.issueId, accessToken: actor.accessToken });
     if (!issue) throw new HttpError(404, 'ISSUE_NOT_FOUND');
     if (!SUPPORTED_DIAGNOSIS_ISSUE_TYPES.includes(issue.type)) throw new HttpError(422, 'PROPOSAL_UNAVAILABLE');
@@ -436,7 +451,7 @@ export function createHandlers(adapters) {
   const issues = run(async req => {
     if (req.method !== 'GET') throw new HttpError(405, 'METHOD_NOT_ALLOWED');
     const u = new URL(req.url); const organizationId = u.searchParams.get('organizationId');
-    const actor = await authorize(req, organizationId);
+    const actor = await authorize(req, organizationId, null, 'issues.read');
     const records = await db.listIssues({ organizationId, state: u.searchParams.get('state') ?? undefined, accessToken: actor.accessToken });
     return ok({ issues: records });
   });
@@ -445,7 +460,7 @@ export function createHandlers(adapters) {
     const u = new URL(req.url); const organizationId = u.searchParams.get('organizationId');
     const issueId = u.pathname.split('/').at(-2) ?? '';
     if (!UUID.test(organizationId ?? '') || !UUID.test(issueId)) throw new HttpError(400, 'INVALID_ISSUE_EVIDENCE_REQUEST');
-    const actor = await authorize(req, organizationId, ['owner','operator','reviewer','read_only']);
+    const actor = await authorize(req, organizationId, null, 'finance.metrics.read');
     const issue = await db.getIssue({ organizationId, issueId, accessToken: actor.accessToken });
     if (!issue) throw new HttpError(404, 'ISSUE_NOT_FOUND');
     const result = await db.getIssueEvidence({ organizationId, issueId, accessToken: actor.accessToken });
@@ -454,7 +469,7 @@ export function createHandlers(adapters) {
   const manualMovements = run(async req => {
     if (req.method !== 'GET') throw new HttpError(405, 'METHOD_NOT_ALLOWED');
     const u = new URL(req.url); const organizationId = u.searchParams.get('organizationId');
-    const actor = await authorize(req, organizationId);
+    const actor = await authorize(req, organizationId, null, 'finance.metrics.read');
     const accountId = u.searchParams.get('accountId') ?? undefined, from = u.searchParams.get('from') ?? undefined, to = u.searchParams.get('to') ?? undefined;
     if ((accountId && !UUID.test(accountId)) || (from && !validDate(from)) || (to && !validDate(to)) || (from && to && Date.parse(from) >= Date.parse(to))) throw new HttpError(400, 'INVALID_QUERY');
     return ok({ movements: await db.listManualMovements({ organizationId, accountId, from, to, accessToken: actor.accessToken }) });
@@ -462,7 +477,7 @@ export function createHandlers(adapters) {
   const observations = run(async req => {
     if (req.method !== 'GET') throw new HttpError(405, 'METHOD_NOT_ALLOWED');
     const u = new URL(req.url); const organizationId = u.searchParams.get('organizationId');
-    const actor = await authorize(req, organizationId);
+    const actor = await authorize(req, organizationId, null, 'finance.metrics.read');
     const accountId = u.searchParams.get('accountId') ?? undefined;
     if (accountId && !UUID.test(accountId)) throw new HttpError(400, 'INVALID_QUERY');
     return ok({ observations: await db.listObservations({ organizationId, accountId, accessToken: actor.accessToken }) });
@@ -470,10 +485,19 @@ export function createHandlers(adapters) {
   const audit = run(async req => {
     if (req.method !== 'GET') throw new HttpError(405, 'METHOD_NOT_ALLOWED');
     const u = new URL(req.url); const organizationId = u.searchParams.get('organizationId');
-    const actor = await authorize(req, organizationId);
+    const actor = await authorize(req, organizationId, null, 'audit.read');
     const limit = Number(u.searchParams.get('limit') ?? 100);
-    if (!Number.isInteger(limit) || limit < 1 || limit > 500) throw new HttpError(400, 'INVALID_QUERY');
-    return ok({ events: await db.listAuditEvents({ organizationId, limit, accessToken: actor.accessToken }) });
+    const from = u.searchParams.get('from') ?? undefined, to = u.searchParams.get('to') ?? undefined;
+    const actorUserId = u.searchParams.get('actorUserId') ?? undefined, action = u.searchParams.get('action') ?? undefined;
+    const entityType = u.searchParams.get('entityType') ?? undefined, entityId = u.searchParams.get('entityId') ?? undefined;
+    if (!Number.isInteger(limit) || limit < 1 || limit > 500
+        || (from !== undefined && !validDate(from)) || (to !== undefined && !validDate(to))
+        || (from !== undefined && to !== undefined && (Date.parse(from) >= Date.parse(to) || Date.parse(to) - Date.parse(from) > 5 * 366 * 86400000))
+        || (actorUserId !== undefined && !UUID.test(actorUserId))
+        || (action !== undefined && !/^[a-z][a-z0-9_.-]{0,99}$/.test(action))
+        || (entityType !== undefined && !/^[a-z][a-z0-9_.-]{0,99}$/.test(entityType))
+        || (entityId !== undefined && (entityId.length < 1 || entityId.length > 200))) throw new HttpError(400, 'INVALID_QUERY');
+    return ok({ events: await db.listAuditEvents({ organizationId, limit, from, to, actorUserId, action, entityType, entityId, accessToken: actor.accessToken }) });
   });
   const settings = run(async req => {
     if (req.method !== 'GET') throw new HttpError(405, 'METHOD_NOT_ALLOWED');
@@ -484,12 +508,273 @@ export function createHandlers(adapters) {
     return ok({ settings: { ...settingsData, features: availability } });
   });
 
+  const domainCatalog = run(async req => {
+    if (req.method !== 'GET') throw new HttpError(405, 'METHOD_NOT_ALLOWED');
+    const u = new URL(req.url); const organizationId = u.searchParams.get('organizationId');
+    const actor = await authorize(req, organizationId, null, 'catalog.read');
+    if (typeof db.getDomainCatalog !== 'function') throw new HttpError(503, 'DOMAIN_CATALOG_UNAVAILABLE');
+    return ok({ items: await db.getDomainCatalog({ organizationId, accessToken: actor.accessToken }) });
+  });
+  const domainCatalogItem = run(async req => {
+    if (req.method !== 'POST') throw new HttpError(405, 'METHOD_NOT_ALLOWED');
+    const body = await readJson(req, 100_000); const key = idempotency(req);
+    if (!exactObject(body, ['organizationId','item','reason'], ['organizationId','item','reason'])
+        || !UUID.test(body.organizationId) || !text(body.reason, 1000) || body.reason.trim().length < 10) {
+      throw new HttpError(400, 'INVALID_DRAFT_CATALOG_ITEM');
+    }
+    let item;
+    try { item = normalizeDraftCatalogItem(body.item); }
+    catch (error) { if (error instanceof DomainCommandInputError) throw new HttpError(400, error.code); throw error; }
+    const actor = await authorize(req, body.organizationId, null, 'catalog.write');
+    if (item.variations.some(variation => variation.priceMinor != null)
+        && !await db.hasOrganizationPermission({ organizationId: body.organizationId, permission: 'catalog.price.write', accessToken: actor.accessToken })) {
+      throw new HttpError(403, 'FORBIDDEN');
+    }
+    if (typeof db.createDomainCatalogItem !== 'function') throw new HttpError(503, 'DOMAIN_CATALOG_UNAVAILABLE');
+    return created(await db.createDomainCatalogItem({ organizationId: body.organizationId, item, reason: body.reason.trim(), idempotencyKey: key, accessToken: actor.accessToken }));
+  });
+  const domainPurchaseOrders = run(async req => {
+    if (req.method === 'GET') {
+      const u = new URL(req.url); const organizationId = u.searchParams.get('organizationId');
+      // The database filters each order by its location-scoped read grant.
+      const actor = await authorize(req, organizationId, null);
+      if (typeof db.listDomainPurchaseOrders !== 'function') throw new HttpError(503, 'PURCHASE_ORDERS_UNAVAILABLE');
+      return ok({ purchaseOrders: await db.listDomainPurchaseOrders({ organizationId, accessToken: actor.accessToken }) });
+    }
+    if (req.method !== 'POST') throw new HttpError(405, 'METHOD_NOT_ALLOWED');
+    const body = await readJson(req, 100_000); const key = idempotency(req);
+    if (!exactObject(body, ['organizationId','purchaseOrder','reason'], ['organizationId','purchaseOrder','reason'])
+        || !UUID.test(body.organizationId) || !text(body.reason, 1000) || body.reason.trim().length < 10) {
+      throw new HttpError(400, 'INVALID_PURCHASE_ORDER');
+    }
+    let purchaseOrder;
+    try { purchaseOrder = normalizePurchaseOrder(body.purchaseOrder); }
+    catch (error) { if (error instanceof DomainCommandInputError) throw new HttpError(400, error.code); throw error; }
+    const actor = await authorize(req, body.organizationId, null, 'purchases.write', purchaseOrder.locationId);
+    if (typeof db.createDomainPurchaseOrder !== 'function') throw new HttpError(503, 'PURCHASE_ORDERS_UNAVAILABLE');
+    return created(await db.createDomainPurchaseOrder({ organizationId: body.organizationId, purchaseOrder, reason: body.reason.trim(), idempotencyKey: key, accessToken: actor.accessToken }));
+  });
+  const financialEvents = run(async req => {
+    if (req.method !== 'GET') throw new HttpError(405, 'METHOD_NOT_ALLOWED');
+    const u = new URL(req.url), organizationId = u.searchParams.get('organizationId');
+    const from = u.searchParams.get('from'), to = u.searchParams.get('to');
+    if (!validDate(from) || !validDate(to) || Date.parse(from) >= Date.parse(to)
+        || Date.parse(to) - Date.parse(from) > 366 * 86400000) throw new HttpError(400, 'INVALID_QUERY');
+    const actor = await authorize(req, organizationId, null, 'finance.metrics.read');
+    if (typeof db.listFinancialEvents !== 'function') throw new HttpError(503, 'FINANCIAL_LEDGER_UNAVAILABLE');
+    return ok({ events: await db.listFinancialEvents({ organizationId, from, to, accessToken: actor.accessToken }) });
+  });
+  const squareInventoryCounts = run(async req => {
+    if (req.method !== 'GET') throw new HttpError(405, 'METHOD_NOT_ALLOWED');
+    const organizationId = new URL(req.url).searchParams.get('organizationId');
+    const actor = await authorize(req, organizationId, null);
+    if (typeof db.getSquareInventoryCounts !== 'function') throw new HttpError(503, 'INVENTORY_SYNC_UNAVAILABLE');
+    const counts = await db.getSquareInventoryCounts({ organizationId, accessToken: actor.accessToken });
+    if (typeof db.hasOrganizationPermission !== 'function') throw new HttpError(503, 'AUTHORIZATION_UNAVAILABLE');
+    const allowedLocations = new Set();
+    for (const locationId of new Set((counts ?? []).map(count => count?.locationId).filter(value => typeof value === 'string'))) {
+      if (await db.hasOrganizationPermission({ organizationId, permission: 'inventory.read', locationId, accessToken: actor.accessToken })) allowedLocations.add(locationId);
+    }
+    return ok({ counts: (counts ?? []).filter(count => allowedLocations.has(count.locationId)) });
+  });
+  const actionProposals = run(async req => {
+    const u = new URL(req.url);
+    if (req.method === 'GET') {
+      const organizationId = u.searchParams.get('organizationId'); const status = u.searchParams.get('status');
+      if (status && !['draft','pending_approval','approved','rejected','expired','cancelled','executing','retrying','succeeded','failed','conflicted'].includes(status)) throw new HttpError(400,'INVALID_ACTION_STATUS');
+       const actor = await authorize(req, organizationId, null, 'approvals.read');
+       if (typeof db.listActionProposals !== 'function') throw new HttpError(503,'APPROVALS_UNAVAILABLE');
+       if (typeof db.expireActionProposalsSystem === 'function') await db.expireActionProposalsSystem({ organizationId });
+       return ok({ proposals: await db.listActionProposals({ organizationId, status, accessToken: actor.accessToken }) });
+    }
+    if (req.method !== 'POST') throw new HttpError(405,'METHOD_NOT_ALLOWED');
+    const body = await readJson(req); const key = idempotency(req);
+    const fields = ['organizationId','actionType','payload','expectedSourceVersion','locationId','amountMinor','currency','evidenceRefs','sourceMessageRef','supersedesProposalId'];
+    if (!exactObject(body,fields,['organizationId','actionType','payload']) || !UUID.test(body.organizationId)
+      || !['square.catalog.item.create','square.catalog.item.update','square.catalog.item.archive','square.catalog.variation.update','square.catalog.variation.add','square.inventory.count.set'].includes(body.actionType)
+      || !body.payload || typeof body.payload!=='object' || Array.isArray(body.payload) || Buffer.byteLength(JSON.stringify(body.payload),'utf8')>20000
+      || (body.locationId!=null&&!UUID.test(body.locationId))
+      || (body.supersedesProposalId!=null&&!UUID.test(body.supersedesProposalId))
+      || (body.expectedSourceVersion!=null&&!text(String(body.expectedSourceVersion),200))
+      || (body.amountMinor!=null&&(!Number.isSafeInteger(body.amountMinor)||body.amountMinor<0))
+      || (body.currency!=null&&!/^[A-Z]{3}$/.test(body.currency))
+      || (body.evidenceRefs!=null&&(!Array.isArray(body.evidenceRefs)||body.evidenceRefs.length>100||body.evidenceRefs.some(ref=>!text(ref,300))))
+      || (body.sourceMessageRef!=null&&!text(body.sourceMessageRef,300))) throw new HttpError(400,'INVALID_ACTION_PROPOSAL');
+    if ((body.amountMinor==null)!==(body.currency==null)) throw new HttpError(400,'INVALID_ACTION_AMOUNT');
+    const payload = body.payload;
+    const squareId = value => text(value,200);
+    if (body.actionType==='square.catalog.item.update' && (!exactObject(payload,['sourceMappingId','squareItemId','name','description','expectedSquareVersion','proposalReason'])
+        ||!squareId(payload.squareItemId)||!text(payload.name,200)||typeof payload.description!=='string'
+        || !UUID.test(payload.sourceMappingId??'') || !text(payload.expectedSquareVersion,200)||!text(payload.proposalReason,1000)||payload.proposalReason.trim().length<10)) throw new HttpError(400,'INVALID_ACTION_PAYLOAD');
+    if (body.actionType==='square.catalog.variation.update' && (!squareId(payload.squareItemId)||!squareId(payload.squareVariationId)
+        ||!exactObject(payload,['sourceMappingId','squareItemId','squareVariationId','variationName','sku','pricingType','priceMinor','currency','expectedSquareVersion','proposalReason'],
+          ['sourceMappingId','squareItemId','squareVariationId','variationName','sku','pricingType','expectedSquareVersion'])
+        ||!text(payload.variationName,200)||typeof payload.sku!=='string'||!['FIXED_PRICING','VARIABLE_PRICING'].includes(payload.pricingType)
+        ||!UUID.test(payload.sourceMappingId??'')||!text(payload.expectedSquareVersion,200)||!text(payload.proposalReason,1000)||payload.proposalReason.trim().length<10
+        ||(payload.pricingType==='FIXED_PRICING'&&(!own(payload,'priceMinor')||!own(payload,'currency')||!Number.isSafeInteger(payload.priceMinor)||payload.priceMinor<0||! /^[A-Z]{3}$/.test(payload.currency??'')))
+        ||(payload.pricingType==='VARIABLE_PRICING'&&(own(payload,'priceMinor')||own(payload,'currency'))))) throw new HttpError(400,'INVALID_ACTION_PAYLOAD');
+    if (body.actionType==='square.catalog.item.archive' && (!exactObject(payload,['sourceMappingId','squareItemId','archived','expectedSquareVersion','proposalReason'])
+        ||!squareId(payload.squareItemId)||typeof payload.archived!=='boolean'
+        ||!UUID.test(payload.sourceMappingId??'')||!text(payload.expectedSquareVersion,200)||!text(payload.proposalReason,1000)||payload.proposalReason.trim().length<10)) throw new HttpError(400,'INVALID_ACTION_PAYLOAD');
+    if (body.actionType==='square.catalog.variation.add' && (!exactObject(payload,['sourceMappingId','squareItemId','variationName','sku','pricingType','priceMinor','currency','expectedSquareVersion','proposalReason'],
+          ['sourceMappingId','squareItemId','variationName','sku','pricingType','expectedSquareVersion'])
+        ||!squareId(payload.squareItemId)||!text(payload.variationName,200)
+        ||typeof payload.sku!=='string'||!['FIXED_PRICING','VARIABLE_PRICING'].includes(payload.pricingType)
+        ||!UUID.test(payload.sourceMappingId??'')||!text(payload.expectedSquareVersion,200)
+        ||(payload.pricingType==='FIXED_PRICING'&&(!own(payload,'priceMinor')||!own(payload,'currency')||!Number.isSafeInteger(payload.priceMinor)||payload.priceMinor<0||! /^[A-Z]{3}$/.test(payload.currency??'')))
+        ||(payload.pricingType==='VARIABLE_PRICING'&&(own(payload,'priceMinor')||own(payload,'currency'))))) throw new HttpError(400,'INVALID_ACTION_PAYLOAD');
+    if (body.actionType==='square.catalog.variation.add' && (!own(payload,'proposalReason')||!text(payload.proposalReason,1000)||payload.proposalReason.trim().length<10)) throw new HttpError(400,'INVALID_ACTION_PAYLOAD');
+    if (body.actionType==='square.catalog.item.create' && (!exactObject(payload,['name','description','variations','proposalReason'],['name','variations','proposalReason'])
+        ||!text(payload.name,200)||!text(payload.proposalReason,1000)||payload.proposalReason.trim().length<10||(payload.description!=null&&typeof payload.description!=='string')||!Array.isArray(payload.variations)
+        ||payload.variations.length<1||payload.variations.length>250||payload.variations.some(v=>!v||typeof v!=='object'
+          ||!exactObject(v,['name','sku','pricingType','priceMinor','currency'],['name','pricingType'])
+          ||!text(v.name,200)||(v.sku!=null&&typeof v.sku!=='string')||!['FIXED_PRICING','VARIABLE_PRICING'].includes(v.pricingType)
+          ||(v.pricingType==='FIXED_PRICING'&&(!own(v,'priceMinor')||!own(v,'currency')||!Number.isSafeInteger(v.priceMinor)||v.priceMinor<0||! /^[A-Z]{3}$/.test(v.currency??'')))
+          ||(v.pricingType==='VARIABLE_PRICING'&&(own(v,'priceMinor')||own(v,'currency')))))) throw new HttpError(400,'INVALID_ACTION_PAYLOAD');
+    if (body.actionType==='square.inventory.count.set' && (!exactObject(payload,
+      ['sourceMappingId','locationMappingId','businessLocationId','squareVariationId','squareLocationId','state','quantity','expectedSquareVersion','proposalReason'])
+      ||!UUID.test(payload.sourceMappingId??'')||!UUID.test(payload.locationMappingId??'')||!UUID.test(payload.businessLocationId??'')
+      ||!squareId(payload.squareVariationId)||!squareId(payload.squareLocationId)||payload.businessLocationId!==body.locationId
+      ||payload.state!=='IN_STOCK'||!Number.isFinite(payload.quantity)||payload.quantity<0||payload.quantity>1_000_000_000_000
+      ||Math.abs(payload.quantity*100_000-Math.round(payload.quantity*100_000))>1e-7
+      ||(payload.expectedSquareVersion!==null&&!text(payload.expectedSquareVersion,200))
+      ||!text(payload.proposalReason,1000)||payload.proposalReason.trim().length<10)) throw new HttpError(400,'INVALID_ACTION_PAYLOAD');
+    const versionRequired=body.actionType!=='square.catalog.item.create'&&body.actionType!=='square.inventory.count.set';
+    if ((versionRequired&&(!text(body.expectedSourceVersion,200)||body.expectedSourceVersion!==payload.expectedSquareVersion))
+        ||(body.actionType==='square.inventory.count.set'&&body.expectedSourceVersion!==(payload.expectedSquareVersion??null))
+        ||(body.actionType==='square.catalog.item.create'&&body.expectedSourceVersion!=null)) throw new HttpError(400,'INVALID_SOURCE_VERSION');
+    const actor = await authorize(req, body.organizationId, null, 'actions.propose', body.locationId ?? null);
+    if (body.actionType==='square.inventory.count.set') await authorize(req, body.organizationId, null, 'inventory.write', body.locationId);
+    if (body.actionType.startsWith('square.catalog.')) {
+      await authorize(req, body.organizationId, null, 'catalog.write', body.locationId ?? null);
+      const priceChange = ['square.catalog.variation.update','square.catalog.variation.add'].includes(body.actionType)
+        || (body.actionType==='square.catalog.item.create' && payload.variations.some(variation => variation.pricingType==='FIXED_PRICING'));
+      if (priceChange) await authorize(req, body.organizationId, null, 'catalog.price.write', body.locationId ?? null);
+    }
+    const userDb=db.asUser(actor.accessToken);
+    const {data,error}=await userDb.rpc('propose_action',{p_organization_id:body.organizationId,p_action_type:body.actionType,p_payload:payload,
+      p_expected_source_version:body.expectedSourceVersion??null,p_location_id:body.locationId??null,p_amount_minor:body.amountMinor??null,
+      p_currency:body.currency??null,p_evidence_refs:body.evidenceRefs??[],p_idempotency_key:key,
+      p_source_message_ref:body.sourceMessageRef??null,p_originating_automation:null,p_supersedes_proposal_id:body.supersedesProposalId??null});
+    if(error) throw error;
+    return created(data);
+  });
+  const actionDecision = run(async req => {
+    if (req.method!=='POST') throw new HttpError(405,'METHOD_NOT_ALLOWED');
+    const body=await readJson(req); const key=idempotency(req);
+    if(!exactObject(body,['organizationId','decision','reason','expectedPayloadSha256'])||!UUID.test(body.organizationId)
+      ||!['approved','rejected'].includes(body.decision)||!text(body.reason,1000)||body.reason.trim().length<10
+      ||! /^[0-9a-f]{64}$/.test(body.expectedPayloadSha256??'')) throw new HttpError(400,'INVALID_ACTION_DECISION');
+    const proposalId=new URL(req.url).pathname.split('/').at(-2)??'';
+    if(!UUID.test(proposalId)) throw new HttpError(400,'INVALID_ACTION_PROPOSAL_ID');
+    const actor=await authorize(req,body.organizationId,null,'approvals.decide'); const userDb=db.asUser(actor.accessToken);
+    const {data,error}=await userDb.rpc('decide_action',{p_organization_id:body.organizationId,p_proposal_id:proposalId,
+      p_decision:body.decision,p_reason:body.reason.trim(),p_expected_payload_sha256:body.expectedPayloadSha256,p_idempotency_key:key});
+    if(error) throw error;
+    return ok(data);
+  });
+  const actionCancellation = run(async req => {
+    if (req.method!=='POST') throw new HttpError(405,'METHOD_NOT_ALLOWED');
+    const body=await readJson(req); const key=idempotency(req);
+    if(!exactObject(body,['organizationId','reason'])||!UUID.test(body.organizationId)||!text(body.reason,1000)||body.reason.trim().length<10)
+      throw new HttpError(400,'INVALID_ACTION_CANCELLATION');
+    const proposalId=new URL(req.url).pathname.split('/').at(-2)??'';
+    if(!UUID.test(proposalId)) throw new HttpError(400,'INVALID_ACTION_PROPOSAL_ID');
+    const actor=await authorize(req,body.organizationId); const {data,error}=await db.asUser(actor.accessToken).rpc('cancel_action_proposal',{
+      p_organization_id:body.organizationId,p_proposal_id:proposalId,p_reason:body.reason.trim(),p_idempotency_key:key,
+    });
+    if(error) throw error;
+    return ok(data);
+  });
+  const roleSettings = run(async req => {
+    if(req.method!=='GET') throw new HttpError(405,'METHOD_NOT_ALLOWED');
+    const organizationId=new URL(req.url).searchParams.get('organizationId');
+    const actor=await authorize(req,organizationId,null,'people.manage');
+    if(typeof db.getOrganizationRoles!=='function') throw new HttpError(503,'ROLE_SETTINGS_UNAVAILABLE');
+    return ok({roles:await db.getOrganizationRoles({organizationId,accessToken:actor.accessToken})});
+  });
+  const customRole = run(async req => {
+    if(req.method!=='POST') throw new HttpError(405,'METHOD_NOT_ALLOWED');
+    const body=await readJson(req);
+    if(!exactObject(body,['organizationId','name','description','permissions'],['organizationId','name','permissions'])
+      ||!UUID.test(body.organizationId)||!text(body.name,80)||!Array.isArray(body.permissions)||body.permissions.length>50
+      ||body.permissions.some(permission=>!text(permission,100))|| (body.description!=null&&typeof body.description!=='string')) throw new HttpError(400,'INVALID_CUSTOM_ROLE');
+    const actor=await authorize(req,body.organizationId,null,'people.manage'); const {data,error}=await db.asUser(actor.accessToken).rpc('create_custom_role',{
+      p_organization_id:body.organizationId,p_name:body.name.trim(),p_description:body.description??'',p_permissions:body.permissions,
+    });
+    if(error) throw error;
+    return created({id:data});
+  });
+  const membershipRole = run(async req => {
+    if(req.method!=='PATCH') throw new HttpError(405,'METHOD_NOT_ALLOWED');
+    const body=await readJson(req);
+    if(!exactObject(body,['organizationId','userId','role','customRoleId','locationScopeMode','locationIds'],['organizationId','userId','role','locationScopeMode','locationIds'])
+      ||!UUID.test(body.organizationId)||!UUID.test(body.userId)||!['owner','administrator','manager','employee','operator','reviewer','read_only','custom'].includes(body.role)
+      ||(body.customRoleId!=null&&!UUID.test(body.customRoleId))||!['all','selected'].includes(body.locationScopeMode)
+      ||!Array.isArray(body.locationIds)||body.locationIds.length>100||body.locationIds.some(id=>!UUID.test(id))) throw new HttpError(400,'INVALID_MEMBERSHIP_ROLE');
+    const actor=await authorize(req,body.organizationId,null,'people.manage'); const {data,error}=await db.asUser(actor.accessToken).rpc('set_membership_role',{
+      p_organization_id:body.organizationId,p_user_id:body.userId,p_role:body.role,p_custom_role_id:body.customRoleId??null,
+      p_location_scope_mode:body.locationScopeMode,p_location_ids:body.locationIds,
+    });
+    if(error) throw error;
+    return ok({updated:data===true});
+  });
+  const rolePermission = run(async req => {
+    if(req.method!=='PATCH') throw new HttpError(405,'METHOD_NOT_ALLOWED');
+    const body=await readJson(req);
+    if(!exactObject(body,['organizationId','role','permission','allowed'])||!UUID.test(body.organizationId)
+      ||!['administrator','manager','employee','operator','reviewer','read_only'].includes(body.role)
+      ||!text(body.permission,100)||typeof body.allowed!=='boolean') throw new HttpError(400,'INVALID_ROLE_PERMISSION');
+    const actor=await authorize(req,body.organizationId,null,'people.manage'); const {data,error}=await db.asUser(actor.accessToken).rpc('set_role_permission',{
+      p_organization_id:body.organizationId,p_role:body.role,p_permission_key:body.permission,p_allowed:body.allowed,
+    });
+    if(error) throw error;
+    return ok({updated:data===true});
+  });
+  const teamsIdentity = run(async req => {
+    if(req.method!=='POST') throw new HttpError(405,'METHOD_NOT_ALLOWED');
+    const body=await readJson(req);
+    const fields=['organizationId','userId','tenantId','teamsUserId','email','active','reason'];
+    if(!exactObject(body,fields,['organizationId','userId','tenantId','teamsUserId','active','reason'])
+      ||![body.organizationId,body.userId,body.tenantId,body.teamsUserId].every(value=>UUID.test(value??''))
+      ||typeof body.active!=='boolean'||!text(body.reason,1000)||body.reason.trim().length<10
+      ||(body.email!=null&&(typeof body.email!=='string'||body.email.length>320||!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(body.email)))) throw new HttpError(400,'INVALID_TEAMS_IDENTITY');
+    const actor=await authorize(req,body.organizationId,null,'people.manage');
+    const {data,error}=await db.asUser(actor.accessToken).rpc('set_teams_identity',{
+      p_organization_id:body.organizationId,p_user_id:body.userId,p_tenant_id:body.tenantId,p_teams_user_id:body.teamsUserId,
+      p_email:body.email?.trim().toLowerCase()??null,p_active:body.active,p_reason:body.reason.trim(),
+    });
+    if(error) throw error;
+    return created(data);
+  });
+  const approvalPolicy = run(async req => {
+    if(req.method!=='POST') throw new HttpError(405,'METHOD_NOT_ALLOWED');
+    const body=await readJson(req);
+    const fields=['organizationId','actionType','locationId','amountCurrency','minAmountMinor','maxAmountMinor','requiredPermission','requiredRole','requiredApprovalCount','maxSingleApproverMinor'];
+    if(!exactObject(body,fields,['organizationId','actionType','requiredPermission','requiredRole','requiredApprovalCount'])||!UUID.test(body.organizationId)
+      ||!['square.catalog.item.create','square.catalog.item.update','square.catalog.item.archive','square.catalog.variation.update','square.catalog.variation.add','square.inventory.count.set'].includes(body.actionType)
+      ||(body.locationId!=null&&!UUID.test(body.locationId))||!['approvals.decide','finance.cost.approve','catalog.price.write'].includes(body.requiredPermission)
+      ||!['owner','administrator','manager','reviewer'].includes(body.requiredRole)||!Number.isSafeInteger(body.requiredApprovalCount)
+      ||body.requiredApprovalCount<1||body.requiredApprovalCount>5
+      ||['minAmountMinor','maxAmountMinor','maxSingleApproverMinor'].some(key=>body[key]!=null&&(!Number.isSafeInteger(body[key])||body[key]<0))
+      ||(body.amountCurrency!=null&&!/^[A-Z]{3}$/.test(body.amountCurrency))
+      ||(['minAmountMinor','maxAmountMinor','maxSingleApproverMinor'].some(key=>body[key]!=null)!==(body.amountCurrency!=null))) throw new HttpError(400,'INVALID_APPROVAL_POLICY');
+    const actor=await authorize(req,body.organizationId,null,'people.manage'); const {data,error}=await db.asUser(actor.accessToken).rpc('set_action_approval_policy',{
+      p_organization_id:body.organizationId,p_action_type:body.actionType,p_location_id:body.locationId??null,p_amount_currency:body.amountCurrency??null,
+      p_min_amount_minor:body.minAmountMinor??null,p_max_amount_minor:body.maxAmountMinor??null,
+      p_required_permission:body.requiredPermission,p_required_role:body.requiredRole,
+      p_required_approval_count:body.requiredApprovalCount,p_max_single_approver_minor:body.maxSingleApproverMinor??null,
+    });
+    if(error) throw error;
+    return created({id:data});
+  });
+
   const inventory = run(async req => {
     if (req.method !== 'GET') throw new HttpError(405, 'METHOD_NOT_ALLOWED');
     const u = new URL(req.url), organizationId = u.searchParams.get('organizationId');
     const from = u.searchParams.get('from'), to = u.searchParams.get('to');
     if (!validDate(from) || !validDate(to) || Date.parse(from) >= Date.parse(to) || Date.parse(to) - Date.parse(from) > 366 * 86400000) throw new HttpError(400, 'INVALID_QUERY');
-    const actor = await authorize(req, organizationId);
+    const actor = await authorize(req, organizationId, null, 'inventory.read');
     await requireFeature(organizationId, actor.accessToken, 'inventoryTracking');
     if (typeof db.listInventoryMovements !== 'function' || typeof db.getInventorySnapshot !== 'function') throw new HttpError(503, 'INVENTORY_UNAVAILABLE');
     const currency = u.searchParams.get('currency');
@@ -511,7 +796,9 @@ export function createHandlers(adapters) {
       itemDefinitions: (snapshot.items ?? []).map(item => ({ id: item.id, squareCatalogObjectId: item.square_catalog_object_id ?? item.squareCatalogObjectId, name: item.name })) });
     const coverageFrom = snapshot.sourceCoverage?.requiredFrom ?? from;
     const snapshotHealth = snapshot.sourceHealth ?? [];
-    const inventoryHealthIncomplete = sourceHealthIncomplete(snapshotHealth, ['square', 'orders', 'catalog']);
+    const hasSquareBackedItems = (snapshot.items ?? []).some(item => Boolean(item.square_catalog_object_id ?? item.squareCatalogObjectId));
+    const requiredInventoryResources = ['square', 'orders', 'catalog', ...(hasSquareBackedItems ? ['inventory'] : [])];
+    const inventoryHealthIncomplete = sourceHealthIncomplete(snapshotHealth, requiredInventoryResources);
     const missingInventoryParents = (snapshot.sourceGaps?.missingParentOrderLineCount ?? 0) > 0;
     if (!windowCovered(snapshot.sourceCoverage?.windows, coverageFrom, to) || inventoryHealthIncomplete || missingInventoryParents) {
       if (report.status !== 'failed') report.status = 'incomplete';
@@ -599,6 +886,112 @@ export function createHandlers(adapters) {
       return ok({revoked:true});
     }
     throw new HttpError(405,'METHOD_NOT_ALLOWED');
+  });
+  const powerAutomateApprovalIntegration = run(async req => {
+    if (req.method === 'GET') {
+      const organizationId = new URL(req.url).searchParams.get('organizationId');
+      const actor = await authorize(req, organizationId, ['owner']);
+      if (typeof db.listPowerAutomateApprovalIntegrations !== 'function') throw new HttpError(503, 'APPROVAL_INTEGRATION_UNAVAILABLE');
+      return ok({ integrations: await db.listPowerAutomateApprovalIntegrations({ organizationId, accessToken: actor.accessToken }) });
+    }
+    if (req.method === 'POST') {
+      const body = await readJson(req);
+      if (!exactObject(body, ['organizationId','mappingId','name']) || !UUID.test(body.organizationId ?? '')
+          || !UUID.test(body.mappingId ?? '') || !text(body.name, 100)) throw new HttpError(400, 'INVALID_APPROVAL_INTEGRATION');
+      const actor = await authorize(req, body.organizationId, ['owner']);
+      if (typeof db.createPowerAutomateApprovalIntegration !== 'function') throw new HttpError(503, 'APPROVAL_INTEGRATION_UNAVAILABLE');
+      const token = `flpa_${randomBytes(32).toString('base64url')}`;
+      const result = await db.createPowerAutomateApprovalIntegration({
+        organizationId: body.organizationId, mappingId: body.mappingId, name: body.name.trim(),
+        tokenSha256: createHash('sha256').update(token).digest('hex'), accessToken: actor.accessToken,
+      });
+      return created({ id: result?.id ?? result?.integrationId ?? result?.integration_id, token });
+    }
+    if (req.method === 'DELETE') {
+      const body = await readJson(req);
+      if (!exactObject(body, ['organizationId']) || !UUID.test(body.organizationId ?? '')) throw new HttpError(400, 'INVALID_APPROVAL_INTEGRATION');
+      const integrationId = new URL(req.url).pathname.split('/').at(-1) ?? '';
+      if (!UUID.test(integrationId)) throw new HttpError(400, 'INVALID_INTEGRATION_ID');
+      const actor = await authorize(req, body.organizationId, ['owner']);
+      if (typeof db.revokePowerAutomateApprovalIntegration !== 'function') throw new HttpError(503, 'APPROVAL_INTEGRATION_UNAVAILABLE');
+      await db.revokePowerAutomateApprovalIntegration({ organizationId: body.organizationId, integrationId, accessToken: actor.accessToken });
+      return ok({ revoked: true });
+    }
+    throw new HttpError(405, 'METHOD_NOT_ALLOWED');
+  });
+  const powerAutomateApprovalCredential = async req => {
+    let token;
+    try { token = parseBearer(req); } catch { throw new HttpError(401, 'UNAUTHENTICATED'); }
+    if (!token.startsWith('flpa_') || typeof db.authorizePowerAutomateApprovalIntegration !== 'function') throw new HttpError(401, 'UNAUTHENTICATED');
+    const credential = await db.authorizePowerAutomateApprovalIntegration({ tokenSha256: createHash('sha256').update(token).digest('hex') });
+    if (!credential?.organizationId || !credential?.integrationId || !credential?.tenantId || !credential?.teamsUserId || !credential?.email) {
+      throw new HttpError(401, 'UNAUTHENTICATED');
+    }
+    return credential;
+  };
+  const powerAutomateApprovalNext = run(async req => {
+    if (req.method !== 'GET') throw new HttpError(405, 'METHOD_NOT_ALLOWED');
+    const credential = await powerAutomateApprovalCredential(req);
+    if (typeof db.claimPowerAutomateActionProposal !== 'function') throw new HttpError(503, 'APPROVAL_INTEGRATION_UNAVAILABLE');
+    const claimed = await db.claimPowerAutomateActionProposal({ integrationId: credential.integrationId });
+    if (!claimed?.proposal) return ok({ proposal: null });
+    const proposal = claimed.proposal;
+    const card = {
+      $schema: 'http://adaptivecards.io/schemas/adaptive-card.json',
+      type: 'AdaptiveCard',
+      version: '1.3',
+      body: [
+        { type: 'TextBlock', text: 'Action approval required', weight: 'Bolder', size: 'Large', wrap: true },
+        { type: 'FactSet', facts: [
+          { title: 'Organization', value: String(proposal.organizationName ?? 'Workspace').slice(0, 200) },
+          { title: 'Action', value: String(proposal.actionType ?? '').slice(0, 200) },
+          { title: 'Expires', value: String(proposal.expiresAt ?? '').slice(0, 80) },
+        ] },
+        { type: 'TextBlock', text: 'Review this exact payload and its evidence references before deciding.', wrap: true },
+        { type: 'TextBlock', text: JSON.stringify({ payload: proposal.payload, evidenceRefs: proposal.evidenceRefs ?? [] }, null, 2), fontType: 'Monospace', wrap: true },
+        { type: 'Input.Text', id: 'reason', label: 'Decision reason (at least 10 characters)', isMultiline: true,
+          isRequired: true, errorMessage: 'Enter a reason of at least 10 characters.' },
+      ],
+      actions: [
+        { type: 'Action.Submit', title: 'Approve', data: { decision: 'approved', proposalId: proposal.id } },
+        { type: 'Action.Submit', title: 'Reject', data: { decision: 'rejected', proposalId: proposal.id } },
+      ],
+    };
+    return ok({ recipientEmail: claimed.recipientEmail, expectedResponder: claimed.expectedResponder, proposal, card });
+  });
+  const powerAutomateApprovalDecision = run(async req => {
+    if (req.method !== 'POST') throw new HttpError(405, 'METHOD_NOT_ALLOWED');
+    const credential = await powerAutomateApprovalCredential(req);
+    const proposalId = new URL(req.url).pathname.split('/').at(-2) ?? '';
+    if (!UUID.test(proposalId)) throw new HttpError(400, 'INVALID_ACTION_PROPOSAL_ID');
+    const body = await readJson(req);
+    if (!exactObject(body, ['decision','reason','expectedPayloadSha256','responderTenantId','responderTeamsUserId'])
+        || !['approved','rejected'].includes(body.decision) || !text(body.reason, 1000) || body.reason.trim().length < 10
+        || !/^[0-9a-f]{64}$/.test(body.expectedPayloadSha256 ?? '')
+        || !UUID.test(body.responderTenantId ?? '') || !UUID.test(body.responderTeamsUserId ?? '')) {
+      throw new HttpError(400, 'INVALID_ACTION_DECISION');
+    }
+    const key = idempotency(req);
+    if (typeof db.decideActionFromPowerAutomate !== 'function') throw new HttpError(503, 'APPROVAL_INTEGRATION_UNAVAILABLE');
+    const sourceMessageRef = `pa:${credential.integrationId}:${proposalId}:${createHash('sha256').update(key).digest('hex')}`;
+    const result = await db.decideActionFromPowerAutomate({
+      integrationId: credential.integrationId, organizationId: credential.organizationId, proposalId,
+      responderTenantId: body.responderTenantId, responderTeamsUserId: body.responderTeamsUserId,
+      decision: body.decision, reason: body.reason.trim(), payloadSha256: body.expectedPayloadSha256,
+      idempotencyKey: key, sourceMessageRef,
+    });
+    if (result?.status === 'unauthorized') throw new HttpError(403, 'FORBIDDEN');
+    if (result?.status === 'not_found') throw new HttpError(404, 'ACTION_PROPOSAL_NOT_FOUND');
+    if (['not_pending','decision_not_applied','conflicted','expired'].includes(result?.status)) throw new HttpError(409, 'ACTION_PROPOSAL_CONFLICT');
+    return ok(result);
+  });
+  const powerAutomateApprovalRelease = run(async req => {
+    if (req.method !== 'POST') throw new HttpError(405, 'METHOD_NOT_ALLOWED');
+    const credential = await powerAutomateApprovalCredential(req);
+    const proposalId = new URL(req.url).pathname.split('/').at(-2) ?? '';
+    if (!UUID.test(proposalId)) throw new HttpError(400, 'INVALID_ACTION_PROPOSAL_ID');
+    if (typeof db.releasePowerAutomateActionProposal !== 'function') throw new HttpError(503, 'APPROVAL_INTEGRATION_UNAVAILABLE');
+    return ok({ released: await db.releasePowerAutomateActionProposal({ integrationId: credential.integrationId, proposalId }) });
   });
   const integrationCredential = async req => {
     let token;
@@ -1125,7 +1518,7 @@ export function createHandlers(adapters) {
     const u = new URL(req.url), organizationId = u.searchParams.get('organizationId');
     const from = u.searchParams.get('from'), to = u.searchParams.get('to'), currency = u.searchParams.get('currency');
     if (!validDate(from) || !validDate(to) || Date.parse(from) >= Date.parse(to) || Date.parse(to) - Date.parse(from) > 366 * 86400000 || !/^[A-Z]{3}$/.test(currency ?? '')) throw new HttpError(400, 'INVALID_QUERY');
-    const actor = await authorize(req, organizationId);
+    const actor = await authorize(req, organizationId, null, 'finance.metrics.read');
     await requireFeature(organizationId, actor.accessToken, 'productAnalytics');
     if (typeof db.listProductAnalyticsFacts !== 'function') throw new HttpError(503, 'ANALYTICS_UNAVAILABLE');
     const sourceData = await db.listProductAnalyticsFacts({ organizationId, from, to, currency, accessToken: actor.accessToken });
@@ -1262,12 +1655,18 @@ export function createHandlers(adapters) {
     const u = new URL(req.url);
     const organizationId = u.searchParams.get('organizationId');
     const evidenceId = u.searchParams.get('evidenceId');
-    const actor = await authorize(req, organizationId);
+    const actor = await authorize(req, organizationId, null, 'finance.metrics.read');
     if (!UUID.test(evidenceId ?? '')) throw new HttpError(400, 'INVALID_EVIDENCE_ID');
     const result = await db.getEvidenceSignedUrl({ organizationId, evidenceId, accessToken: actor.accessToken });
     if (!result) throw new HttpError(404, 'EVIDENCE_NOT_FOUND');
     return ok(result);
   });
 
-  return Object.freeze({ dashboard, issues, issueEvidence, audit, settings, inventory, inventoryPurchase, receiptDraft, receiptItemCosts, receiptIntegration, purchaseReceiptIntake, purchaseReceiptComplete, purchaseReceiptStatus, purchaseReceipts, manualPurchaseReceiptIntake, inventoryCorrection, inventoryOpening, inventoryItem, squareCatalogItem, squareCatalogCreate, squareCatalogManage, analytics, evidence, evidenceUrl, manualMovement, manualMovements, observation, observations, proposal, itemCost, saleLineCost, refundReview, decision, replay, sync, webhook });
+  return Object.freeze({ dashboard, issues, issueEvidence, audit, settings, domainCatalog, domainCatalogItem, domainPurchaseOrders, financialEvents, actionProposals, actionDecision, actionCancellation,
+    roleSettings, customRole, membershipRole, rolePermission, teamsIdentity, approvalPolicy, inventory, squareInventoryCounts, inventoryPurchase, receiptDraft,
+    receiptItemCosts, receiptIntegration, powerAutomateApprovalIntegration, powerAutomateApprovalNext, powerAutomateApprovalDecision, powerAutomateApprovalRelease,
+    purchaseReceiptIntake, purchaseReceiptComplete, purchaseReceiptStatus,
+    purchaseReceipts, manualPurchaseReceiptIntake, inventoryCorrection, inventoryOpening, inventoryItem,
+    squareCatalogItem, squareCatalogCreate, squareCatalogManage, analytics, evidence, evidenceUrl, manualMovement,
+    manualMovements, observation, observations, proposal, itemCost, saleLineCost, refundReview, decision, replay, sync, webhook });
 }
