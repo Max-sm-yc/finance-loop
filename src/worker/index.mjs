@@ -334,27 +334,20 @@ export function createWorker(dependencies) {
 
   async function syncSquareLocations(client, organizationId) {
     if (typeof db.upsertSquareLocations !== 'function') return { status: 'skipped', count: 0 };
-    let cursor = null; let pages = 0; const seen = new Set(); const locations = [];
+    const locations = [];
     try {
-      do {
-        if (++pages > Math.min(maxPages, 100)) throw Object.assign(new Error('Square location page limit exceeded'), { permanent: true });
-        const query = new URLSearchParams({ limit: '100' });
-        if (cursor) query.set('cursor', cursor);
-        const page = await withRetry(() => client.request(`/v2/locations?${query.toString()}`), { retries: 4, sleep, random });
-        if (!Array.isArray(page?.locations)) throw Object.assign(new Error('Square locations response is invalid'), { permanent: true });
-        for (const location of page.locations) {
-          if (!location?.id || !location?.name) continue;
-          locations.push({ id: String(location.id), name: String(location.name).slice(0, 200),
-            timezone: typeof location.timezone === 'string' ? location.timezone : null,
-            status: String(location.status ?? 'ACTIVE'), version: location.version == null ? null : String(location.version),
-            updatedAt: typeof location.updated_at === 'string' ? location.updated_at : null,
-            address: location.address && typeof location.address === 'object' ? location.address : {},
-          });
-        }
-        cursor = typeof page.cursor === 'string' && page.cursor ? page.cursor : null;
-        if (cursor && seen.has(cursor)) throw Object.assign(new Error('Square repeated a location cursor'), { permanent: true });
-        if (cursor) seen.add(cursor);
-      } while (cursor);
+      const response = await withRetry(() => client.request('/v2/locations'), { retries: 4, sleep, random });
+      if (!Array.isArray(response?.locations)) throw Object.assign(new Error('Square locations response is invalid'), { permanent: true });
+      for (const location of response.locations) {
+        if (!location?.id || !location?.name) continue;
+        locations.push({ id: String(location.id), name: String(location.name).slice(0, 200),
+          timezone: typeof location.timezone === 'string' ? location.timezone : null,
+          status: String(location.status ?? 'ACTIVE'), version: location.version == null ? null : String(location.version),
+          updatedAt: typeof location.updated_at === 'string' ? location.updated_at : null,
+          address: location.address && typeof location.address === 'object' ? location.address : {},
+        });
+      }
+      if (locations.length > 1000) throw Object.assign(new Error('Square location count exceeds persistence limit'), { permanent: true });
       const stored = await db.upsertSquareLocations({ organizationId, locations });
       await db.recordSourceHealth({ organizationId, resource: 'locations', status: 'fresh', lastSuccessfulSyncAt: now().toISOString(),
         sourceRevision: null, checkedAt: now().toISOString(), syncResult: { count: stored?.count ?? locations.length } });

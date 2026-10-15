@@ -12,7 +12,7 @@ type SquareTokenRefresh = {
   access_token?: string; refresh_token?: string; expires_at?: string;
   merchant_id?: string; scopes?: string[]; token_type?: string;
 };
-type SquareLocationsPage = { locations?: Array<{ id?: string; status?: string }>; cursor?: string | null };
+type SquareLocationsResponse = { locations?: Array<{ id?: string; status?: string }> };
 
 function codedError(code: string) {
   return Object.assign(new Error(code), { code });
@@ -58,25 +58,15 @@ async function listActiveSquareLocations(organizationId: string, adapters: Retur
     apiVersion: process.env.SQUARE_API_VERSION ?? '2026-09-16',
   });
   const locations = new Map<string, { id: string }>();
-  const cursors = new Set<string>();
-  let cursor: string | null = null;
-  for (let page = 0; page < 100; page += 1) {
-    const query = new URLSearchParams({ limit: '100' });
-    if (cursor) query.set('cursor', cursor);
-    const result = await client.request(`/v2/locations?${query.toString()}`) as SquareLocationsPage;
-    if (!Array.isArray(result.locations)) throw codedError('SQUARE_LOCATIONS_UNAVAILABLE');
-    for (const location of result.locations) {
-      if (typeof location?.id === 'string' && location.id.trim() && location.status !== 'INACTIVE') {
-        locations.set(location.id, { id: location.id });
-        if (locations.size > 100) return [...locations.values()];
-      }
+  const result = await client.request('/v2/locations') as SquareLocationsResponse;
+  if (!Array.isArray(result.locations)) throw codedError('SQUARE_LOCATIONS_UNAVAILABLE');
+  for (const location of result.locations) {
+    if (typeof location?.id === 'string' && location.id.trim() && location.status !== 'INACTIVE') {
+      locations.set(location.id, { id: location.id });
+      if (locations.size > 100) return [...locations.values()];
     }
-    cursor = typeof result.cursor === 'string' && result.cursor ? result.cursor : null;
-    if (!cursor) return [...locations.values()];
-    if (cursors.has(cursor)) throw codedError('SQUARE_LOCATIONS_UNAVAILABLE');
-    cursors.add(cursor);
   }
-  throw codedError('SQUARE_LOCATIONS_UNAVAILABLE');
+  return [...locations.values()];
 }
 
 async function createSquareCatalogItemForOrganization(args: {
