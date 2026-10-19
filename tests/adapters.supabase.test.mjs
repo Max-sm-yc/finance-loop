@@ -510,3 +510,24 @@ test('approval expiry sweep uses the server key and a tenant-scoped bounded batc
   assert.deepEqual(calls[0].body, { p_organization_id: org, p_limit: 500 });
   assert.equal(calls[0].headers.get('authorization'), `Bearer ${serviceKey}`);
 });
+
+test('Square location upsert does not materialize financial events before backfill', async () => {
+  const calls = [];
+  const adapters = createSupabaseAdapters({
+    url: 'https://tenant.supabase.test', secretKey: serviceKey,
+    fetchImpl: async (url, init) => {
+      calls.push({ url: String(url), body: JSON.parse(init.body) });
+      return response(2);
+    },
+  });
+  const result = await adapters.db.upsertSquareLocations({
+    organizationId: org,
+    locations: [{ id: 'location-1', name: 'Main', status: 'active' }],
+  });
+  assert.deepEqual(result, { count: 2 });
+  assert.deepEqual(calls.map(call => call.url.split('/').at(-1)), ['upsert_square_locations']);
+  assert.deepEqual(calls[0].body, {
+    p_organization_id: org,
+    p_locations: [{ id: 'location-1', name: 'Main', status: 'active' }],
+  });
+});

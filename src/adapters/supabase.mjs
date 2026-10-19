@@ -738,10 +738,8 @@ export function createSupabaseAdapters({ url, publishableKey, secretKey, tokenEn
         p_organization_id: organizationId, p_locations: locations,
       });
       if (error) throw error;
-      const { error: materializeError } = await serviceRest().rpc('materialize_square_financial_events', {
-        p_organization_id: organizationId,
-      });
-      if (materializeError) throw materializeError;
+      // The sync worker materializes financial events once after backfill. Do
+      // not scan the full fact history during this preliminary locations step.
       return { count: Number.isSafeInteger(data) ? data : 0 };
     },
     async getSquareInventoryTargetsSystem({ organizationId }) {
