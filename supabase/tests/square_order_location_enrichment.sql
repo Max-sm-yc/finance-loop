@@ -1,5 +1,5 @@
 begin;
-select plan(7);
+select plan(13);
 select set_config('request.jwt.claims', '{"role":"service_role"}', true);
 
 create temporary table square_order_enrichment_test_org (id uuid) on commit drop;
@@ -53,6 +53,61 @@ select lives_ok(
     'pgTAP order location enrichment duplicate'
   ),
   'repeated identical enrichment is idempotent'
+);
+
+select lives_ok(
+  format(
+    'select public.upsert_square_facts(%L::uuid, %L::jsonb, %L)',
+    (select id from square_order_enrichment_test_org),
+    '[{"kind":"order","objectId":"enrichment-test-order-missing-location","version":"6","versionSort":"n:0000000000000000000000000000000000000006","fact":{"totalMinor":1250}}]',
+    'pgTAP order missing location seed'
+  ),
+  'initial order fact with an omitted locationId is stored'
+);
+
+select lives_ok(
+  format(
+    'select public.upsert_square_facts(%L::uuid, %L::jsonb, %L)',
+    (select id from square_order_enrichment_test_org),
+    '[{"kind":"order","objectId":"enrichment-test-order-missing-location","version":"6","versionSort":"n:0000000000000000000000000000000000000006","fact":{"locationId":"location-test-b","totalMinor":1250}}]',
+    'pgTAP order missing location enrichment'
+  ),
+  'same-version omitted-to-known location is appended as an enrichment'
+);
+
+select is(
+  (select count(*) from private.square_fact_versions
+    where organization_id=(select id from square_order_enrichment_test_org)
+      and fact_kind='order' and object_id='enrichment-test-order-missing-location'),
+  2::bigint,
+  'original omitted-location and enriched order facts are both preserved'
+);
+
+select ok(
+  (select not (v.fact ? 'locationId') from private.square_fact_versions v
+    where v.organization_id=(select id from square_order_enrichment_test_org)
+      and v.fact_kind='order' and v.object_id='enrichment-test-order-missing-location'
+      and v.object_version='6'),
+  'the original fact remains unchanged with locationId omitted'
+);
+
+select is(
+  (select v.fact->>'locationId' from private.square_fact_current c
+    join private.square_fact_versions v using (organization_id,fact_kind,object_id,object_version)
+    where c.organization_id=(select id from square_order_enrichment_test_org)
+      and c.fact_kind='order' and c.object_id='enrichment-test-order-missing-location'),
+  'location-test-b',
+  'the enriched fact for an omitted location becomes current'
+);
+
+select lives_ok(
+  format(
+    'select public.upsert_square_facts(%L::uuid, %L::jsonb, %L)',
+    (select id from square_order_enrichment_test_org),
+    '[{"kind":"order","objectId":"enrichment-test-order-missing-location","version":"6","versionSort":"n:0000000000000000000000000000000000000006","fact":{"locationId":"location-test-b","totalMinor":1250}}]',
+    'pgTAP order missing location enrichment duplicate'
+  ),
+  'repeated omitted-to-known enrichment is idempotent'
 );
 
 select throws_ok(
