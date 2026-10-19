@@ -110,6 +110,13 @@ test('normalizers preserve source facts, identifiers, money, catalog IDs and pay
   assert.equal(mixedFee.feeStatus, 'processing_fee_currency_mismatch');
   assert.equal(normalizeRefund({ id: 'r1', payment_id: 'p1', amount_money: { amount: 100, currency: 'USD' } })[0].paymentId, 'p1');
   assert.equal(normalizeCatalog({ id: 'v1', type: 'ITEM_VARIATION', item_variation_data: { item_id: 'i1', sku: 'SKU' } })[0].itemId, 'i1');
+  const catalogWithEnrichedMetadata = normalizeCatalog({
+    id: 'catalog-normalization-v4', type: 'ITEM', version: 17, updated_at: '2026-10-08T13:38:05Z',
+    item_data: { name: 'Test item', category_id: 'test-category' },
+  })[0];
+  assert.equal(catalogWithEnrichedMetadata.version, '17|normalization-4');
+  assert.equal(catalogWithEnrichedMetadata.sourceUpdatedAt, '2026-10-08T13:38:05Z');
+  assert.equal(catalogWithEnrichedMetadata.categoryId, 'test-category');
   assert.equal(normalizePayout({ id: 'po1', amount_money: { amount: 485, currency: 'USD' } })[0].amountMinor, 485);
   assert.equal(normalizePayoutEntry({ id: 'pe1', payment_id: 'p1', amount_money: { amount: 500, currency: 'USD' } }, 'po1')[0].payoutId, 'po1');
 });

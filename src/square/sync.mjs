@@ -139,7 +139,7 @@ export function normalizeCatalog(obj) {
   const variation = obj.type === 'ITEM_VARIATION' ? obj.item_variation_data : null;
   const priceMoney = variation?.price_money;
   return [{ kind: 'catalog', objectId: obj.id,
-    version: sourceVersion ? `${sourceVersion}|normalization-3` : '',
+    version: sourceVersion ? `${sourceVersion}|normalization-4` : '',
     objectType: obj.type ?? null,
     sourceUpdatedAt: obj.updated_at ?? null,
     name: obj.item_data?.name ?? variation?.name ?? obj.category_data?.name ?? null,
