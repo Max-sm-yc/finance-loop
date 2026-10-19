@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createHmac } from 'node:crypto';
 import { createAuthorizationUrl, exchangeAuthorizationCode, refreshAccessToken, verifyWebhookSignature, acceptSquareWebhook, MemoryWebhookInbox, backfillSquare, normalizeOrder, normalizePayment, normalizeRefund, normalizeCatalog, normalizePayout, normalizePayoutEntry, normalizeGiftCardActivity } from '../src/square/index.mjs';
+import { SquareApiClient } from '../src/square/client.mjs';
 
 test('OAuth URL and server-side code/refresh exchange use least-privilege caller scopes', async () => {
   const url = new URL(createAuthorizationUrl({ clientId: 'app', redirectUri: 'https://host/cb', state: 'csrf', scopes: ['ORDERS_READ', 'PAYMENTS_READ'] }));
@@ -36,6 +37,22 @@ test('Square OAuth token errors expose only sanitized provider diagnostics', asy
       return true;
     }
   );
+});
+
+test('Square API invalid JSON errors preserve HTTP status and request ID without response body', async () => {
+  const fetchImpl = async () => new Response('proxy response body must not escape', {
+    status: 502,
+    headers: { 'square-request-id': 'req-invalid-json-safe' },
+  });
+  const client = new SquareApiClient({ accessToken: 'test-token', fetchImpl });
+  await assert.rejects(() => client.request('/v2/locations'), error => {
+    assert.equal(error.status, 502);
+    assert.equal(error.responseFormat, 'invalid_json');
+    assert.equal(error.squareRequestId, 'req-invalid-json-safe');
+    assert.equal(error.message, 'Square returned invalid JSON (502)');
+    assert.equal(error.message.includes('proxy response body'), false);
+    return true;
+  });
 });
 
 test('webhook verifies exact raw body and atomically deduplicates notification IDs', async () => {

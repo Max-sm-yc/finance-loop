@@ -80,6 +80,7 @@ test('completed cash payments normalize with no processing fee instead of raisin
 
 test('sync uses a linked Square CHARGE payout entry to fill a delayed payment processing fee', async () => {
   const state = harness({ request: async path => {
+    if (path === '/v2/locations') return { locations: [{ id: 'location-one', name: 'Test location', status: 'ACTIVE' }] };
     if (path.includes('/orders/search')) return { orders: [] };
     if (path.includes('/payments?')) return { payments: [
       {
@@ -111,6 +112,7 @@ test('sync uses a linked Square CHARGE payout entry to fill a delayed payment pr
     }] };
     throw new Error(`Unexpected request ${path}`);
   } });
+  state.db.upsertSquareLocations = async ({ locations }) => ({ count: locations.length });
   const result = await state.worker.processJob({
     id: 'sync-delayed-fee', type: 'square.sync', organizationId: org,
     payload: { startAt: '2026-09-01T00:00:00Z', endAt: '2026-10-01T00:00:00Z', locationIds: ['loc-1'] },
@@ -118,6 +120,8 @@ test('sync uses a linked Square CHARGE payout entry to fill a delayed payment pr
   const payment = state.facts.get(`${org}:payment:pay-delayed-fee`);
   const noSale = state.facts.get(`${org}:payment:external-no-sale`);
   assert.equal(result.freshness, 'fresh');
+  assert.equal(result.resources.locations.status, 'fresh');
+  assert.equal(result.resources.locations.count, 1);
   assert.equal(payment.feeMinor, 30);
   assert.equal(payment.feeStatus, 'provided_from_payout_entry');
   assert.match(payment.version, /\|payout-fee-1$/);
@@ -126,6 +130,41 @@ test('sync uses a linked Square CHARGE payout entry to fill a delayed payment pr
   assert.equal(noSale.feeStatus, 'not_applicable_no_sale');
   assert.equal(state.events.filter(event => event[0] === 'projection').length, 1);
   assert.equal(state.issues.has('SOURCE_GAP'), false);
+});
+
+test('Square locations sync failures preserve sanitized stage and transport diagnostics', async () => {
+  const networkFailure = new TypeError('fetch failed', {
+    cause: Object.assign(new Error('socket reset detail must not escape'), { code: 'ECONNRESET' }),
+  });
+  const state = harness({ request: async path => {
+    if (path === '/v2/locations') throw networkFailure;
+    if (path.includes('/orders/search')) return { orders: [] };
+    if (path.includes('/payments?')) return { payments: [] };
+    if (path.includes('/refunds?')) return { refunds: [] };
+    if (path.includes('/catalog/list')) return { objects: [] };
+    if (path.includes('/gift-cards/activities?')) return { gift_card_activities: [] };
+    if (path.includes('/payouts?')) return { payouts: [] };
+    if (path === '/v2/inventory/counts/batch-retrieve') return { counts: [] };
+    throw new Error(`Unexpected request ${path}`);
+  } });
+  state.db.upsertSquareLocations = async () => ({ count: 0 });
+  const job = { id: 'locations-transport-failure', type: 'square.sync', organizationId: org,
+    payload: { startAt: '2026-09-01T00:00:00Z', endAt: '2026-10-01T00:00:00Z' },
+    attempts: 1, maxAttempts: 3, leaseToken: 'test-lease' };
+  state.queue.claim = async () => job;
+
+  const outcome = await state.worker.runOne({ workerId: 'worker-test' });
+  assert.equal(outcome.status, 'retrying');
+  assert.equal(outcome.code, 'SQUARE_LOCATIONS_SYNC_FAILED');
+  assert.equal(outcome.failureResource, 'locations');
+  assert.deepEqual(outcome.failureDiagnostics, {
+    kind: 'square_locations_sync_failure', stage: 'square_request', failureClass: 'transport_error',
+    errorName: 'TypeError', transportCode: 'ECONNRESET',
+  });
+  assert.equal(JSON.stringify(outcome.failureDiagnostics).includes('socket reset detail'), false);
+  const locationsHealth = state.events.find(event => event[0] === 'health'
+    && event[1].resource === 'locations' && event[1].status === 'incomplete');
+  assert.deepEqual(locationsHealth[1].gap.diagnostics, outcome.failureDiagnostics);
 });
 
 test('sync dead-letters fact-version conflicts with sanitized resource diagnostics', async () => {

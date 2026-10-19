@@ -14,6 +14,20 @@ const JOBS = new Set(['square.webhook', 'square.sync', 'projection.replay', 'iss
 const EVENT_KIND = new Map([['order', 'order'], ['payment', 'payment'], ['refund', 'refund'], ['catalog', 'catalog'], ['payout', 'payout'], ['inventory', 'inventory']]);
 const defaultSleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
+async function withRetry(fn, { retries = 4, sleep = defaultSleep, random = Math.random, onRetry } = {}) {
+  for (let attempt = 0;; attempt++) {
+    try { return await fn(); } catch (error) {
+      const retryable = error?.status === 429 || error?.status >= 500 || error?.status == null;
+      if (!retryable || attempt >= retries) throw error;
+      const retryAfterMs = Number(error?.retryAfter) * 1000;
+      const delayMs = Number.isFinite(retryAfterMs) && retryAfterMs > 0
+        ? retryAfterMs : Math.min(30_000, 500 * 2 ** attempt) * (0.75 + random() * 0.5);
+      onRetry?.({ attempt: attempt + 1, delayMs: Math.round(delayMs), status: Number.isInteger(error?.status) ? error.status : null });
+      await sleep(delayMs);
+    }
+  }
+}
+
 function requireInterface(dependencies) {
   const { queue, db, tokenVault, config } = dependencies ?? {};
   if (!queue || !db || !tokenVault || !config) throw new TypeError('durable queue, database, encrypted token vault, and config adapters are required');
@@ -38,10 +52,12 @@ function failureMetadata(error) {
   const providerCode = typeof error?.providerCode === 'string' && /^[A-Za-z0-9_.-]{1,100}$/.test(error.providerCode) ? error.providerCode : null;
   const rawResource = typeof error?.failureResource === 'string' ? error.failureResource : null;
   const resource = rawResource?.startsWith('payout_entries:') ? 'payout_entries' : rawResource;
+  const diagnosticsKind = error?.failureDiagnostics?.kind;
   return {
     status: Number.isInteger(error?.status) ? error.status : null, code, providerCode,
     resource: resource && /^[A-Za-z0-9_:.-]{1,200}$/.test(resource) ? resource : null,
-    diagnostics: error?.failureDiagnostics?.kind === 'square_fact_version_conflict' ? error.failureDiagnostics : null,
+    diagnostics: ['square_fact_version_conflict', 'square_locations_sync_failure'].includes(diagnosticsKind)
+      ? error.failureDiagnostics : null,
   };
 }
 function safeFailureDescription(error) {
@@ -345,9 +361,12 @@ export function createWorker(dependencies) {
   async function syncSquareLocations(client, organizationId) {
     if (typeof db.upsertSquareLocations !== 'function') return { status: 'skipped', count: 0 };
     const locations = [];
+    let stage = 'square_request';
     try {
       const response = await withRetry(() => client.request('/v2/locations'), { retries: 4, sleep, random });
+      stage = 'validate_response';
       if (!Array.isArray(response?.locations)) throw Object.assign(new Error('Square locations response is invalid'), { permanent: true });
+      stage = 'normalize_locations';
       for (const location of response.locations) {
         if (!location?.id || !location?.name) continue;
         locations.push({ id: String(location.id), name: String(location.name).slice(0, 200),
@@ -357,17 +376,43 @@ export function createWorker(dependencies) {
           address: location.address && typeof location.address === 'object' ? location.address : {},
         });
       }
+      stage = 'validate_location_count';
       if (locations.length > 1000) throw Object.assign(new Error('Square location count exceeds persistence limit'), { permanent: true });
+      stage = 'persist_locations';
       const stored = await db.upsertSquareLocations({ organizationId, locations });
+      stage = 'record_locations_health';
       await db.recordSourceHealth({ organizationId, resource: 'locations', status: 'fresh', lastSuccessfulSyncAt: now().toISOString(),
         sourceRevision: null, checkedAt: now().toISOString(), syncResult: { count: stored?.count ?? locations.length } });
       return { status: 'fresh', count: stored?.count ?? locations.length };
     } catch (error) {
       const status = Number.isInteger(error?.status) ? error.status : null;
-      const providerCode = typeof error?.code === 'string' && /^[A-Za-z0-9_.-]{1,100}$/.test(error.code) ? error.code : null;
+      const squareProviderCode = Array.isArray(error?.errors)
+        ? error.errors.find(item => typeof item?.code === 'string' && /^[A-Za-z0-9_.-]{1,100}$/.test(item.code))?.code
+        : null;
+      const providerCode = typeof error?.providerCode === 'string' && /^[A-Za-z0-9_.-]{1,100}$/.test(error.providerCode)
+        ? error.providerCode : squareProviderCode ?? null;
+      const errorName = typeof error?.name === 'string' && /^[A-Za-z][A-Za-z0-9_.-]{0,63}$/.test(error.name)
+        ? error.name : null;
+      const transportCode = [error?.cause?.code, stage === 'square_request' ? error?.code : null].find(value =>
+        typeof value === 'string' && /^[A-Za-z0-9_.-]{1,100}$/.test(value)) ?? null;
+      const squareRequestId = typeof error?.squareRequestId === 'string' && /^[A-Za-z0-9-]{1,120}$/.test(error.squareRequestId)
+        ? error.squareRequestId : null;
+      const failureClass = status !== null && (status < 200 || status >= 300) ? 'http_error'
+        : error?.responseFormat === 'invalid_json' ? 'invalid_json'
+          : status !== null ? 'unexpected_http_status'
+          : error?.permanent === true ? 'invalid_response'
+            : error?.cause || transportCode ? 'transport_error' : 'unexpected_error';
+      const diagnostics = {
+        kind: 'square_locations_sync_failure', stage, failureClass,
+        ...(errorName ? { errorName } : {}),
+        ...(error?.responseFormat === 'invalid_json' ? { responseFormat: 'invalid_json' } : {}),
+        ...(transportCode ? { transportCode } : {}),
+        ...(squareRequestId ? { squareRequestId } : {}),
+      };
       const gap = {
         code: 'SQUARE_LOCATIONS_SYNC_FAILED', providerStatus: status,
         ...(providerCode ? { providerCode } : {}),
+        diagnostics,
       };
       await db.recordSourceHealth({ organizationId, resource: 'locations', status: 'incomplete', lastSuccessfulSyncAt: null,
         gap, checkedAt: now().toISOString() });

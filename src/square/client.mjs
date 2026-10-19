@@ -18,8 +18,18 @@ export function createAuthorizationUrl({ clientId, redirectUri, state, scopes, b
 async function jsonRequest(fetchImpl, url, { method = 'GET', headers = {}, body, signal } = {}) {
   const response = await fetchImpl(url, { method, headers: { accept: 'application/json', ...headers }, body, signal });
   const text = await response.text();
+  const requestId = response.headers.get('square-request-id') ?? response.headers.get('x-square-request-id');
+  const safeRequestId = typeof requestId === 'string' && /^[A-Za-z0-9-]{1,120}$/.test(requestId) ? requestId : null;
   let data = {};
-  if (text) { try { data = JSON.parse(text); } catch { throw new Error(`Square returned invalid JSON (${response.status})`); } }
+  if (text) {
+    try { data = JSON.parse(text); } catch {
+      const error = new Error(`Square returned invalid JSON (${response.status})`);
+      error.status = response.status;
+      error.responseFormat = 'invalid_json';
+      if (safeRequestId) error.squareRequestId = safeRequestId;
+      throw error;
+    }
+  }
   if (!response.ok) {
     const error = new Error(data.errors?.map(e => e.detail || e.code).join('; ') || `Square request failed (${response.status})`);
     error.status = response.status; error.retryAfter = response.headers.get('retry-after'); error.errors = data.errors;
@@ -30,8 +40,7 @@ async function jsonRequest(fetchImpl, url, { method = 'GET', headers = {}, body,
     // Some Square OAuth failures use the legacy `{ message, type }` shape
     // (for example, `service.not_authorized`) instead of `error` or `errors`.
     if (typeof data.type === 'string' && /^[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*$/.test(data.type) && data.type.length <= 120) error.providerType = data.type;
-    const requestId = response.headers.get('square-request-id') ?? response.headers.get('x-square-request-id');
-    if (typeof requestId === 'string' && /^[A-Za-z0-9-]{1,120}$/.test(requestId)) error.squareRequestId = requestId;
+    if (safeRequestId) error.squareRequestId = safeRequestId;
     throw error;
   }
   return data;
