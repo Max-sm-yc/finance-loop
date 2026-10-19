@@ -1,5 +1,5 @@
 begin;
-select plan(10);
+select plan(13);
 select set_config('request.jwt.claims', '{"role":"service_role"}', true);
 
 create temporary table square_event_description_test_org (id uuid) on commit drop;
@@ -113,6 +113,51 @@ select is(
   public.materialize_square_financial_events((select id from square_event_description_test_org)),
   0,
   'a fully materialized source revision is idempotent'
+);
+
+insert into auth.users(id,aud,role,email,encrypted_password,email_confirmed_at,created_at,updated_at)
+values('10000000-0000-4000-8000-000000000091','authenticated','authenticated',
+  'square-event-refund@example.invalid','',now(),now(),now());
+
+insert into private.square_fact_versions(
+  organization_id,fact_kind,object_id,object_version,version_sort,fact,cause
+) values (
+  (select id from square_event_description_test_org),'refund','refund-test','v1','t:0000000000000001',
+  jsonb_build_object('orderId','order-test','status','COMPLETED','occurredAt','2026-09-04T17:00:00Z',
+    'currency','USD','amountMinor',50),
+  'refund review materialization test'
+);
+
+insert into private.square_fact_current(
+  organization_id,fact_kind,object_id,object_version,version_sort,source_revision
+)
+select organization_id,fact_kind,object_id,object_version,version_sort,1
+from private.square_fact_versions
+where organization_id=(select id from square_event_description_test_org) and object_id='refund-test';
+
+insert into public.refund_cost_reviews(organization_id,square_refund_id,square_order_id,disposition,
+  approved_cogs_reversal_minor,currency,decision_reason,reviewed_by)
+values((select id from square_event_description_test_org),'refund-test','order-test',
+  'not_returned_to_inventory',0,'USD','Merchant confirmed no restock.',
+  '10000000-0000-4000-8000-000000000091');
+
+select is(
+  public.materialize_square_financial_events((select id from square_event_description_test_org)),
+  2,
+  'refund source and approved refund review materialize together'
+);
+
+select is(
+  (select count(*) from public.financial_events where organization_id=(select id from square_event_description_test_org)
+    and source_type='refund.cogs_reversal'),
+  1::bigint,
+  'approved refund review creates its COGS reversal event'
+);
+
+select is(
+  public.materialize_square_financial_events((select id from square_event_description_test_org)),
+  0,
+  'refund review materialization is idempotent'
 );
 
 select * from finish();
