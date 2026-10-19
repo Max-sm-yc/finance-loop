@@ -634,7 +634,7 @@ function InventoryPanel({ organizationId, accountId, currency, timezone, account
     setAuthorizingSquare(true); setSquareError('');
     try {
       const result = await api<{ authorizationUrl: string }>('/api/square/oauth/start', {
-        method: 'POST', body: JSON.stringify({ organizationId, catalogWrite: true, inventoryWrite: true }),
+        method: 'POST', body: JSON.stringify({ organizationId, inventoryWrite: true }),
       });
       window.location.assign(result.authorizationUrl);
     } catch (err) {
