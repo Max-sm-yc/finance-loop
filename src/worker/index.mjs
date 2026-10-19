@@ -56,7 +56,7 @@ function failureMetadata(error) {
   return {
     status: Number.isInteger(error?.status) ? error.status : null, code, providerCode,
     resource: resource && /^[A-Za-z0-9_:.-]{1,200}$/.test(resource) ? resource : null,
-    diagnostics: ['square_fact_version_conflict', 'square_locations_sync_failure'].includes(diagnosticsKind)
+    diagnostics: ['square_fact_version_conflict', 'square_locations_sync_failure', 'square_inventory_sync_failure'].includes(diagnosticsKind)
       ? error.failureDiagnostics : null,
   };
 }
@@ -460,7 +460,30 @@ export function createWorker(dependencies) {
       const providerStatus = Number.isInteger(error?.status) ? error.status : null;
       const code = typeof error?.code === 'string' && /^[A-Z0-9_.-]{1,100}$/.test(error.code)
         ? error.code : providerStatus === 403 ? 'PERMISSION_LOST' : 'INVENTORY_BACKFILL_INCOMPLETE';
-      const gap = { resource: 'inventory', code, ...(providerStatus === null ? {} : { providerStatus }) };
+      const providerCode = typeof error?.providerCode === 'string' && /^[A-Za-z0-9_.-]{1,100}$/.test(error.providerCode)
+        ? error.providerCode
+        : Array.isArray(error?.errors)
+          ? error.errors.find(item => typeof item?.code === 'string' && /^[A-Za-z0-9_.-]{1,100}$/.test(item.code))?.code ?? null
+          : null;
+      const squareRequestId = typeof error?.squareRequestId === 'string' && /^[A-Za-z0-9-]{1,120}$/.test(error.squareRequestId)
+        ? error.squareRequestId : null;
+      const errorName = typeof error?.name === 'string' && /^[A-Za-z][A-Za-z0-9_.-]{0,63}$/.test(error.name)
+        ? error.name : null;
+      const failureClass = providerStatus !== null && (providerStatus < 200 || providerStatus >= 300) ? 'http_error'
+        : error?.responseFormat === 'invalid_json' ? 'invalid_json'
+          : error?.permanent === true ? 'invalid_response' : 'unexpected_error';
+      const diagnostics = {
+        kind: 'square_inventory_sync_failure', stage: 'inventory_counts_sync', failureClass,
+        ...(errorName ? { errorName } : {}),
+        ...(error?.responseFormat === 'invalid_json' ? { responseFormat: 'invalid_json' } : {}),
+        ...(squareRequestId ? { squareRequestId } : {}),
+      };
+      const gap = {
+        resource: 'inventory', code,
+        ...(providerStatus === null ? {} : { providerStatus }),
+        ...(providerCode ? { providerCode } : {}),
+        diagnostics,
+      };
       result.gaps.push(gap);
       result.resources.inventory = { status: 'incomplete', error: code };
       result.freshness = 'incomplete';

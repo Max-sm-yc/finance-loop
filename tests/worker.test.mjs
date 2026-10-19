@@ -167,6 +167,48 @@ test('Square locations sync failures preserve sanitized stage and transport diag
   assert.deepEqual(locationsHealth[1].gap.diagnostics, outcome.failureDiagnostics);
 });
 
+test('inventory permission failures preserve safe Square provider diagnostics', async () => {
+  const providerError = Object.assign(new Error('provider detail must not escape'), {
+    status: 403,
+    errors: [{ code: 'INSUFFICIENT_SCOPES', detail: 'sensitive provider response detail' }],
+    squareRequestId: 'square-request-123',
+  });
+  const state = harness({ request: async path => {
+    if (path.includes('/orders/search')) return { orders: [] };
+    if (path.includes('/payments?')) return { payments: [] };
+    if (path.includes('/refunds?')) return { refunds: [] };
+    if (path.includes('/catalog/list')) return { objects: [] };
+    if (path.includes('/gift-cards/activities?')) return { gift_card_activities: [] };
+    if (path.includes('/payouts?')) return { payouts: [] };
+    if (path === '/v2/inventory/counts/batch-retrieve') throw providerError;
+    throw new Error(`Unexpected request ${path}`);
+  } });
+  state.db.getSquareInventoryTargetsSystem = async () => ({ catalogObjectIds: ['variation-one'], locationIds: ['location-one'] });
+  state.queue.claim = async () => ({
+    id: 'inventory-permission-failure', type: 'square.sync', organizationId: org,
+    attempts: 1, maxAttempts: 3, leaseToken: 'inventory-lease',
+    payload: { startAt: '2026-09-01T00:00:00Z', endAt: '2026-10-01T00:00:00Z', locationIds: ['location-one'] },
+  });
+
+  const outcome = await state.worker.runOne({ workerId: 'worker-test' });
+
+  assert.equal(outcome.status, 'retrying');
+  assert.equal(outcome.code, 'PERMISSION_LOST');
+  assert.equal(outcome.failureStatus, 403);
+  assert.equal(outcome.failureProviderCode, 'INSUFFICIENT_SCOPES');
+  assert.equal(outcome.failureResource, 'inventory');
+  assert.deepEqual(outcome.failureDiagnostics, {
+    kind: 'square_inventory_sync_failure', stage: 'inventory_counts_sync', failureClass: 'http_error',
+    errorName: 'Error', squareRequestId: 'square-request-123',
+  });
+  const inventoryHealth = state.events.find(event => event[0] === 'health'
+    && event[1].resource === 'inventory' && event[1].status === 'incomplete');
+  assert.equal(inventoryHealth[1].gap.providerCode, 'INSUFFICIENT_SCOPES');
+  assert.deepEqual(inventoryHealth[1].gap.diagnostics, outcome.failureDiagnostics);
+  assert.equal(JSON.stringify(outcome).includes('sensitive provider response detail'), false);
+  assert.equal(JSON.stringify(outcome).includes('provider detail must not escape'), false);
+});
+
 test('sync dead-letters fact-version conflicts with sanitized resource diagnostics', async () => {
   const state = harness({ request: async path => {
     if (path.includes('/orders/search')) return { orders: [] };
