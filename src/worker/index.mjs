@@ -29,10 +29,20 @@ function canonical(value) {
   return value;
 }
 const hash = value => createHash('sha256').update(JSON.stringify(canonical(value))).digest('hex');
-function errorMessage(error) { return error?.status ? `Square/API failure (${error.status})` : 'Worker job failed'; }
+function errorMessage(error) {
+  if (error?.code === 'SQUARE_FACT_VERSION_CONFLICT') return 'Square fact version conflict during sync';
+  return error?.status ? `Square/API failure (${error.status})` : 'Worker job failed';
+}
 function failureMetadata(error) {
   const code = typeof error?.code === 'string' && /^[A-Za-z0-9_.-]{1,100}$/.test(error.code) ? error.code : null;
-  return { status: Number.isInteger(error?.status) ? error.status : null, code };
+  const providerCode = typeof error?.providerCode === 'string' && /^[A-Za-z0-9_.-]{1,100}$/.test(error.providerCode) ? error.providerCode : null;
+  const rawResource = typeof error?.failureResource === 'string' ? error.failureResource : null;
+  const resource = rawResource?.startsWith('payout_entries:') ? 'payout_entries' : rawResource;
+  return {
+    status: Number.isInteger(error?.status) ? error.status : null, code, providerCode,
+    resource: resource && /^[A-Za-z0-9_:.-]{1,200}$/.test(resource) ? resource : null,
+    diagnostics: error?.failureDiagnostics?.kind === 'square_fact_version_conflict' ? error.failureDiagnostics : null,
+  };
 }
 function safeFailureDescription(error) {
   const { status, code } = failureMetadata(error);
@@ -354,7 +364,11 @@ export function createWorker(dependencies) {
       return { status: 'fresh', count: stored?.count ?? locations.length };
     } catch (error) {
       const status = Number.isInteger(error?.status) ? error.status : null;
-      const gap = { code: 'SQUARE_LOCATIONS_SYNC_FAILED', providerStatus: status };
+      const providerCode = typeof error?.code === 'string' && /^[A-Za-z0-9_.-]{1,100}$/.test(error.code) ? error.code : null;
+      const gap = {
+        code: 'SQUARE_LOCATIONS_SYNC_FAILED', providerStatus: status,
+        ...(providerCode ? { providerCode } : {}),
+      };
       await db.recordSourceHealth({ organizationId, resource: 'locations', status: 'incomplete', lastSuccessfulSyncAt: null,
         gap, checkedAt: now().toISOString() });
       await db.upsertSourceIssue({ organizationId, code: 'SOURCE_GAP', state: 'awaiting_human', revision: null,
@@ -463,7 +477,19 @@ export function createWorker(dependencies) {
       await recomputeProjection(job.organizationId, sourceRevision, `sync:${job.id}`, { startAt, endAt });
     }
     await recordSyncResult(job.organizationId, result);
-    if (result.gaps.length) throw Object.assign(new Error('Square backfill incomplete'), { retryableGap: true });
+    if (result.gaps.length) {
+      const firstGap = result.gaps.find(gap => gap.diagnostics?.kind === 'square_fact_version_conflict') ?? result.gaps[0];
+      const isFactConflict = firstGap?.diagnostics?.kind === 'square_fact_version_conflict';
+      throw Object.assign(new Error('Square backfill incomplete'), {
+        code: isFactConflict ? 'SQUARE_FACT_VERSION_CONFLICT' : firstGap?.code ?? 'SQUARE_SYNC_INCOMPLETE',
+        status: Number.isInteger(firstGap?.providerStatus) ? firstGap.providerStatus : undefined,
+        providerCode: firstGap?.providerCode,
+        failureResource: firstGap?.resource,
+        failureDiagnostics: firstGap?.diagnostics,
+        permanent: isFactConflict,
+        retryableGap: !isFactConflict,
+      });
+    }
     return result;
   }
 
@@ -827,6 +853,7 @@ export function createWorker(dependencies) {
             return {
               status: 'dead_lettered', jobId: job.id, code: 'SOURCE_GAP_WRITE_FAILED',
               failureStatus: failure.status, failureCode: failure.code,
+              failureProviderCode: failure.providerCode, failureResource: failure.resource, failureDiagnostics: failure.diagnostics,
               gapWriteStatus: gapWrite.status, gapWriteCode: gapWrite.code,
             };
           }
@@ -838,12 +865,20 @@ export function createWorker(dependencies) {
           catch { /* The receipt remains visibly projection-pending. */ }
         }
         const failure = failureMetadata(error);
-        return { status: 'dead_lettered', jobId: job.id, code: error.code ?? 'WORKER_JOB_FAILED', failureStatus: failure.status, failureCode: failure.code };
+        return {
+          status: 'dead_lettered', jobId: job.id, code: error.code ?? 'WORKER_JOB_FAILED',
+          failureStatus: failure.status, failureCode: failure.code,
+          failureProviderCode: failure.providerCode, failureResource: failure.resource, failureDiagnostics: failure.diagnostics,
+        };
       }
       const retryAfterMs = Math.min(15 * 60_000, 1000 * 2 ** Math.min(attempts - 1, 10)) * (0.75 + random() * 0.5);
       await queue.retry({ jobId: job.id, workerId, leaseToken: job.leaseToken, delayMs: Math.round(retryAfterMs), code: error.code ?? 'WORKER_JOB_FAILED' });
       const failure = failureMetadata(error);
-      return { status: 'retrying', jobId: job.id, code: error.code ?? 'WORKER_JOB_FAILED', failureStatus: failure.status, failureCode: failure.code };
+      return {
+        status: 'retrying', jobId: job.id, code: error.code ?? 'WORKER_JOB_FAILED',
+        failureStatus: failure.status, failureCode: failure.code,
+        failureProviderCode: failure.providerCode, failureResource: failure.resource, failureDiagnostics: failure.diagnostics,
+      };
     }
   }
 

@@ -73,6 +73,8 @@ while (!stopping) {
     if (result.status !== 'idle') log(result.status === 'completed' ? 'info' : 'warn', 'job_finished', {
       status: result.status, jobId: result.jobId, code: result.code,
       failureStatus: result.failureStatus, failureCode: result.failureCode,
+      failureProviderCode: result.failureProviderCode, failureResource: result.failureResource,
+      failureDiagnostics: result.failureDiagnostics,
       gapWriteStatus: result.gapWriteStatus, gapWriteCode: result.gapWriteCode,
     });
     if (result.status !== 'completed' && !stopping) await new Promise(resolve => setTimeout(resolve, pollMs));

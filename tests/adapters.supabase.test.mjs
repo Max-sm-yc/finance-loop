@@ -234,6 +234,7 @@ test('worker fact upserts use the service key, preserve version ordering, and om
     facts: [
       { kind: 'payment', objectId: 'payment-1', version: '2026-09-30T12:00:00Z', status: 'COMPLETED', amountMinor: 100, raw: { card_details: { card: { last_4: '1234' } } } },
       { kind: 'payment', objectId: 'cash-1', version: '2026-09-30T12:00:00Z|normalization-2', status: 'COMPLETED', amountMinor: 100, feeMinor: 0, feeStatus: 'not_applicable_cash' },
+      { kind: 'payout_entry', objectId: 'entry-1', version: '2026-09-30T12:00:00Z|normalization-3', occurredAt: '2026-09-30T12:00:00Z', amountMinor: 970 },
     ],
   });
   assert.deepEqual(result, { changed: true, revision: 7 });
@@ -249,7 +250,34 @@ test('worker fact upserts use the service key, preserve version ordering, and om
   const cashCorrection = call.body.p_facts.find(row => row.objectId === 'cash-1');
   assert.match(cashCorrection.versionSort, /^t:\d{16}\|normalization-2$/);
   assert.ok(cashCorrection.versionSort > fact.versionSort, 'normalization correction sorts after its original Square version');
+  const payoutEntry = call.body.p_facts.find(row => row.objectId === 'entry-1');
+  assert.match(payoutEntry.versionSort, /^t:\d{16}\|normalization-3$/);
+  assert.equal(payoutEntry.fact.occurredAt, '2026-09-30T12:00:00Z');
   assert.match(calls[1].url, /rpc\/materialize_square_financial_events$/);
+});
+
+test('worker errors expose only allowlisted diagnostics for Square same-version conflicts', async () => {
+  const adapters = createSupabaseAdapters({
+    url: 'https://tenant.supabase.test', secretKey: 'sb_secret_worker',
+    fetchImpl: async () => response({
+      code: 'P0001',
+      message: 'Square returned conflicting content for the same object version',
+      details: `fact_kind=payout_entry; object_key_sha256=${'a'.repeat(20)}; version_key_sha256=${'b'.repeat(20)}; differing_fields=occurredAt; stored_fact_sha256=${'c'.repeat(64)}; incoming_fact_sha256=${'d'.repeat(64)}`,
+    }, 400),
+  });
+  await assert.rejects(adapters.db.upsertSquareFacts({ organizationId: org, cause: 'test', facts: [
+    { kind: 'payout_entry', objectId: 'entry-1', version: '2026-09-30T12:00:00Z|normalization-3', occurredAt: '2026-09-30T12:00:00Z' },
+  ] }), error => {
+    assert.equal(error.code, 'P0001');
+    assert.deepEqual(error.diagnostics, {
+      kind: 'square_fact_version_conflict', factKind: 'payout_entry',
+      objectKeyHashPrefix: 'a'.repeat(20), versionKeyHashPrefix: 'b'.repeat(20),
+      differingFields: ['occurredAt'],
+      storedFactHash: 'c'.repeat(64), incomingFactHash: 'd'.repeat(64),
+    });
+    assert.equal(JSON.stringify(error.diagnostics).includes('entry-1'), false);
+    return true;
+  });
 });
 
 test('worker fact upserts split large Square pages below the database RPC limit', async () => {

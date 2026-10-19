@@ -137,7 +137,8 @@ test('payout normalizers accept Square payout Money fields and preserve gross, f
   assert.equal(entry.feeMinor, 30);
   assert.equal(entry.feeCurrency, 'USD');
   assert.equal(entry.netAmountMinor, 970);
-  assert.equal(entry.version, '2026-09-30T12:00:00Z|normalization-2');
+  assert.equal(entry.occurredAt, '2026-09-30T12:00:00Z');
+  assert.equal(entry.version, '2026-09-30T12:00:00Z|normalization-3');
 });
 
 test('backfill paginates, retries transient failures, persists normalized payout entries and records sync freshness', async () => {

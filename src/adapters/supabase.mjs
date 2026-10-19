@@ -19,6 +19,20 @@ function safeError(payload, status) {
   const error = new Error(`Supabase request failed (${status})`);
   error.status = status;
   error.code = payload?.code ?? 'SUPABASE_ERROR';
+  if (payload?.code === 'P0001' && payload?.message === 'Square returned conflicting content for the same object version') {
+    const match = typeof payload?.details === 'string'
+      ? payload.details.match(/^fact_kind=([a-z_]+); object_key_sha256=([a-f0-9]{20}); version_key_sha256=([a-f0-9]{20}); differing_fields=([A-Za-z0-9_,]{1,500}); stored_fact_sha256=([a-f0-9]{64}); incoming_fact_sha256=([a-f0-9]{64})$/)
+      : null;
+    const factKinds = new Set(['order', 'order_line', 'payment', 'refund', 'catalog', 'payout', 'payout_entry', 'gift_card_activity']);
+    const fields = match?.[4]?.split(',') ?? [];
+    if (match && factKinds.has(match[1]) && fields.length <= 20 && fields.every(field => /^[A-Za-z][A-Za-z0-9_]{0,63}$/.test(field))) {
+      error.diagnostics = {
+        kind: 'square_fact_version_conflict', factKind: match[1],
+        objectKeyHashPrefix: match[2], versionKeyHashPrefix: match[3], differingFields: fields,
+        storedFactHash: match[5], incomingFactHash: match[6],
+      };
+    }
+  }
   return error;
 }
 

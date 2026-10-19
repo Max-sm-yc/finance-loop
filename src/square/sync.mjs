@@ -37,6 +37,7 @@ async function paginate({ name, fetchPage, onPage, state, retries, sleep, random
       message: error.message,
       ...(Number.isInteger(error?.status) ? { providerStatus: error.status } : {}),
       ...(providerCode ? { providerCode } : {}),
+      ...(error?.diagnostics?.kind === 'square_fact_version_conflict' ? { diagnostics: error.diagnostics } : {}),
       cursor,
     });
     state.resources[name] = { status: 'incomplete', pages, cursor, error: error.message };
@@ -172,7 +173,10 @@ export function normalizePayoutEntry(e, payoutId) {
   // net is the payout balance impact; amount_money remains a legacy fallback.
   return [{
     kind: 'payout_entry', objectId: e.id,
-    version: `${String(e.effective_at ?? e.type ?? '')}|normalization-2`,
+    // occurredAt was added to this normalized fact after normalization-2 had
+    // already been stored. Version the expanded representation separately so
+    // the immutable fact history can retain both forms.
+    version: `${String(e.effective_at ?? e.type ?? '')}|normalization-3`,
     occurredAt: e.effective_at ?? null,
     payoutId: e.payout_id ?? payoutId ?? null, type: e.type ?? null,
     paymentId: e.payment_id ?? e.type_charge_details?.payment_id ?? e.type_refund_details?.payment_id ?? null,

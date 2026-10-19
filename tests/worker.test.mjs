@@ -128,6 +128,51 @@ test('sync uses a linked Square CHARGE payout entry to fill a delayed payment pr
   assert.equal(state.issues.has('SOURCE_GAP'), false);
 });
 
+test('sync dead-letters fact-version conflicts with sanitized resource diagnostics', async () => {
+  const state = harness({ request: async path => {
+    if (path.includes('/orders/search')) return { orders: [] };
+    if (path.includes('/payments?')) return { payments: [] };
+    if (path.includes('/refunds?')) return { refunds: [] };
+    if (path.includes('/catalog/list')) return { objects: [] };
+    if (path.includes('/gift-cards/activities?')) return { gift_card_activities: [] };
+    if (path.includes('/payouts?')) return { payouts: [{ id: 'payout-one', amount_money: { amount: 970, currency: 'USD' } }] };
+    if (path.includes('/payout-entries?')) return { payout_entries: [{
+      id: 'entry-one', payout_id: 'payout-one', type: 'CHARGE', effective_at: '2026-09-30T12:00:00Z',
+      net_amount_money: { amount: 970, currency: 'USD' },
+    }] };
+    throw new Error(`Unexpected request ${path}`);
+  } });
+  const ordinaryUpsert = state.db.upsertSquareFacts;
+  const diagnostics = {
+    kind: 'square_fact_version_conflict', factKind: 'payout_entry',
+    objectKeyHashPrefix: 'a'.repeat(20), versionKeyHashPrefix: 'b'.repeat(20),
+    differingFields: ['occurredAt'],
+    storedFactHash: 'c'.repeat(64), incomingFactHash: 'd'.repeat(64),
+  };
+  state.db.upsertSquareFacts = async args => {
+    if (args.facts.some(fact => fact.kind === 'payout_entry')) {
+      throw Object.assign(new Error('Supabase request failed (400)'), { status: 400, code: 'P0001', diagnostics });
+    }
+    return ordinaryUpsert(args);
+  };
+  state.queue.claim = async () => ({
+    id: 'sync-conflict', type: 'square.sync', organizationId: org,
+    attempts: 1, maxAttempts: 5, leaseToken: 'lease-conflict',
+    payload: { startAt: '2026-09-01T00:00:00Z', endAt: '2026-10-01T00:00:00Z', locationIds: ['loc-1'] },
+  });
+
+  const result = await state.worker.runOne({ workerId: 'worker-1' });
+
+  assert.equal(result.status, 'dead_lettered');
+  assert.equal(result.code, 'SQUARE_FACT_VERSION_CONFLICT');
+  assert.equal(result.failureStatus, 400);
+  assert.equal(result.failureProviderCode, 'P0001');
+  assert.equal(result.failureResource, 'payout_entries');
+  assert.equal(JSON.stringify(result).includes('payout-one'), false);
+  assert.deepEqual(result.failureDiagnostics, diagnostics);
+  assert.equal(state.events.some(event => event[0] === 'retry'), false);
+});
+
 test('reordered webhook notifications cannot overwrite newer authoritative Square versions', async () => {
   const getPayload = notificationId => notificationId === 'evt-old'
     ? webhook('evt-old', 'order.updated', { order: { id: 'order-1', version: 2 } })
