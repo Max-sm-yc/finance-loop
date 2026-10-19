@@ -1,5 +1,5 @@
 begin;
-select plan(6);
+select plan(10);
 select set_config('request.jwt.claims', '{"role":"service_role"}', true);
 
 create temporary table square_event_description_test_org (id uuid) on commit drop;
@@ -70,6 +70,49 @@ select ok(
   (select bool_and(status='incomplete' and amount_minor is null) from public.financial_events
     where organization_id=(select id from square_event_description_test_org) and source_type='order_line.cogs'),
   'missing acquisition costs stay incomplete and are not replaced with zero'
+);
+
+insert into private.square_fact_versions(
+  organization_id,fact_kind,object_id,object_version,version_sort,fact,cause
+)
+select (select id from square_event_description_test_org),'order_line','order-test:batch:'||line_number::text,
+  'v1','t:'||lpad(line_number::text,16,'0'),
+  jsonb_build_object('orderId','order-test','occurredAt','2026-09-04T16:00:00Z','currency','USD',
+    'grossMinor',100+line_number,'name','Batch item','quantity','1','itemType','ITEM','grossStatus','provided',
+    'lineItemUid','batch-'||line_number::text),
+  'description fallback batch test'
+from generate_series(1,101) as lines(line_number);
+
+insert into private.square_fact_current(
+  organization_id,fact_kind,object_id,object_version,version_sort,source_revision
+)
+select organization_id,fact_kind,object_id,object_version,version_sort,1
+from private.square_fact_versions
+where organization_id=(select id from square_event_description_test_org)
+  and object_id like 'order-test:batch:%';
+
+select is(
+  public.materialize_square_financial_events((select id from square_event_description_test_org)),
+  100,
+  'materialization limits the first call to one bounded batch'
+);
+
+select is(
+  public.materialize_square_financial_events((select id from square_event_description_test_org)),
+  100,
+  'materialization advances to the next pending batch'
+);
+
+select is(
+  public.materialize_square_financial_events((select id from square_event_description_test_org)),
+  2,
+  'materialization drains the final partial batch'
+);
+
+select is(
+  public.materialize_square_financial_events((select id from square_event_description_test_org)),
+  0,
+  'a fully materialized source revision is idempotent'
 );
 
 select * from finish();

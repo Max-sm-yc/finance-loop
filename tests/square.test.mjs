@@ -71,6 +71,14 @@ test('normalizers preserve source facts, identifiers, money, catalog IDs and pay
   assert.equal(order[1].grossMinor, 600);
   assert.equal(order[1].grossStatus, 'provided');
   assert.equal(order[1].discountMinor, 50);
+  const repeatedVariationLines = normalizeOrder({ id: 'o-repeated-variation', version: 3, line_items: [
+    { catalog_object_id: 'variation-repeated', name: 'Tea small', quantity: '1' },
+    { catalog_object_id: 'variation-repeated', name: 'Tea large', quantity: '2' },
+  ] }).filter(fact => fact.kind === 'order_line');
+  assert.deepEqual(repeatedVariationLines.map(fact => fact.objectId), [
+    'o-repeated-variation:variation-repeated',
+    'o-repeated-variation:variation-repeated:line:1',
+  ]);
   const absentGross = normalizeOrder({ id: 'o2', line_items: [{ uid: 'l2', quantity: '1', base_price_money: { amount: 999, currency: 'USD' }, total_money: { amount: 999, currency: 'USD' } }] })[1];
   assert.equal(absentGross.grossMinor, null);
   assert.equal(absentGross.grossStatus, 'missing_square_gross_sales_money');

@@ -339,6 +339,22 @@ export function createSupabaseAdapters({ url, publishableKey, secretKey, tokenEn
     if (!Array.isArray(rows) || rows.length > 1) throw new Error(`Unexpected ${context} response`);
     return rows[0] ?? null;
   };
+  const materializeSquareFinancialEvents = async organizationId => {
+    let total = 0;
+    // The database RPC commits each bounded batch independently. Keep going
+    // until no more source events are pending so large syncs can make progress
+    // without one request exceeding Postgres' statement timeout.
+    for (;;) {
+      const { data, error } = await serviceRest().rpc('materialize_square_financial_events', {
+        p_organization_id: organizationId,
+      });
+      if (error) throw error;
+      if (!Number.isSafeInteger(data) || data < 0) throw new Error('Unexpected Square financial event materialization response');
+      if (data === 0) return total;
+      total += data;
+      if (!Number.isSafeInteger(total)) throw new Error('Square financial event materialization count exceeded the safe integer range');
+    }
+  };
   const getWorkerHealth = async organizationId => {
     try {
       const { data, error } = await serviceRest().rpc('get_square_worker_health', { organization_id: organizationId });
@@ -726,10 +742,7 @@ export function createSupabaseAdapters({ url, publishableKey, secretKey, tokenEn
         if (error) throw error;
       }
       if (normalized.length && deferFinancialEvents !== true) {
-        const { error } = await serviceRest().rpc('materialize_square_financial_events', {
-          p_organization_id: organizationId,
-        });
-        if (error) throw error;
+        await materializeSquareFinancialEvents(organizationId);
       }
       return { changed, revision };
     },
@@ -761,11 +774,7 @@ export function createSupabaseAdapters({ url, publishableKey, secretKey, tokenEn
         unmappedRefs: Array.isArray(data?.unmappedRefs) ? data.unmappedRefs : [] };
     },
     async materializeFinancialEvents({ organizationId }) {
-      const { data, error } = await serviceRest().rpc('materialize_square_financial_events', {
-        p_organization_id: organizationId,
-      });
-      if (error) throw error;
-      return Number.isSafeInteger(data) ? data : 0;
+      return materializeSquareFinancialEvents(organizationId);
     },
     async recordSourceHealth(record) {
       const { data, error } = await serviceRest().rpc('record_square_worker_health', {

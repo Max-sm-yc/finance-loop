@@ -84,10 +84,16 @@ export function normalizeOrder(o) {
   const orderVersion = String(o.version ?? o.updated_at ?? o.created_at ?? '');
   const currency = o.total_money?.currency ?? o.line_items?.find(x => x.base_price_money?.currency)?.base_price_money.currency ?? null;
   const facts = [{ kind: 'order', objectId: id, version: orderVersion, occurredAt: o.created_at ?? null, updatedAt: o.updated_at ?? null, locationId: o.location_id ?? null, status: o.state ?? null, currency, raw: o, totals: { totalMinor: minor(o.total_money), taxMinor: minor(o.total_tax_money), discountMinor: minor(o.total_discount_money), serviceChargeMinor: minor(o.total_service_charge_money) } }];
-  for (const line of o.line_items ?? []) {
+  const lineObjectIds = new Set();
+  for (const [lineIndex, line] of (o.line_items ?? []).entries()) {
+    const baseObjectId = `${id}:${line.uid ?? line.catalog_object_id ?? facts.length}`;
+    let objectId = baseObjectId;
+    if (lineObjectIds.has(objectId)) objectId = `${baseObjectId}:line:${lineIndex}`;
+    while (lineObjectIds.has(objectId)) objectId = `${baseObjectId}:line:${lineIndex}:duplicate`;
+    lineObjectIds.add(objectId);
     const appliedDiscounts = Array.isArray(line.applied_discounts) ? line.applied_discounts : null;
     const discountMinor = minor(line.total_discount_money) ?? (appliedDiscounts && appliedDiscounts.every(discount => minor(discount.applied_money) !== null) ? appliedDiscounts.reduce((sum, discount) => sum + minor(discount.applied_money), 0) : null);
-    facts.push({ kind: 'order_line', objectId: `${id}:${line.uid ?? line.catalog_object_id ?? facts.length}`, version: orderVersion, parentId: id, orderId: id, occurredAt: o.created_at ?? null, lineItemUid: line.uid ?? null, itemType: line.item_type ?? null, catalogObjectId: line.catalog_object_id ?? null, name: line.name ?? null, quantity: line.quantity ?? null, currency: line.gross_sales_money?.currency ?? line.total_money?.currency ?? currency, grossMinor: minor(line.gross_sales_money), grossStatus: line.gross_sales_money ? 'provided' : 'missing_square_gross_sales_money', totalMinor: minor(line.total_money), taxMinor: minor(line.total_tax_money), tipMinor: minor(line.total_tip_money) ?? 0, discountMinor, discountStatus: discountMinor === null ? 'missing_square_discount_total' : 'provided_or_no_applied_discounts', raw: line });
+    facts.push({ kind: 'order_line', objectId, version: orderVersion, parentId: id, orderId: id, occurredAt: o.created_at ?? null, lineItemUid: line.uid ?? null, itemType: line.item_type ?? null, catalogObjectId: line.catalog_object_id ?? null, name: line.name ?? null, quantity: line.quantity ?? null, currency: line.gross_sales_money?.currency ?? line.total_money?.currency ?? currency, grossMinor: minor(line.gross_sales_money), grossStatus: line.gross_sales_money ? 'provided' : 'missing_square_gross_sales_money', totalMinor: minor(line.total_money), taxMinor: minor(line.total_tax_money), tipMinor: minor(line.total_tip_money) ?? 0, discountMinor, discountStatus: discountMinor === null ? 'missing_square_discount_total' : 'provided_or_no_applied_discounts', raw: line });
   }
   return facts;
 }

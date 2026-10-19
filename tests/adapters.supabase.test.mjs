@@ -226,7 +226,7 @@ test('worker fact upserts use the service key, preserve version ordering, and om
     url: 'https://tenant.supabase.test', secretKey: 'sb_secret_worker',
     fetchImpl: async (url, init) => {
       calls.push({ url: String(url), headers: new Headers(init.headers), body: JSON.parse(init.body) });
-      return response({ changed: true, revision: 7 });
+      return response(String(url).endsWith('/rpc/upsert_square_facts') ? { changed: true, revision: 7 } : 0);
     }
   });
   const result = await adapters.db.upsertSquareFacts({
@@ -273,6 +273,23 @@ test('worker fact upserts split large Square pages below the database RPC limit'
   const result = await adapters.db.upsertSquareFacts({ organizationId: org, cause: 'sync:large-page', facts });
   assert.deepEqual(batches.map(batch => batch.length), [500, 500, 1]);
   assert.deepEqual(result, { changed: true, revision: 3 });
+});
+
+test('Square financial event materialization drains committed batches until no work remains', async () => {
+  const batches = [100, 100, 2, 0];
+  const calls = [];
+  const adapters = createSupabaseAdapters({
+    url: 'https://tenant.supabase.test', secretKey: 'sb_secret_worker',
+    fetchImpl: async (url, init) => {
+      calls.push({ url: String(url), body: JSON.parse(init.body) });
+      return response(batches.shift());
+    }
+  });
+  const inserted = await adapters.db.materializeFinancialEvents({ organizationId: org });
+  assert.equal(inserted, 202);
+  assert.equal(calls.length, 4);
+  assert.ok(calls.every(call => call.url.endsWith('/rpc/materialize_square_financial_events')));
+  assert.ok(calls.every(call => call.body.p_organization_id === org));
 });
 
 test('worker projection snapshot maps Square income, refunds, approved costs, and configured reconciliations', async () => {
