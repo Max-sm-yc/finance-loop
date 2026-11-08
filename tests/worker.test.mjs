@@ -432,6 +432,72 @@ test('terminal job gap-write failure dead-letters instead of retrying beyond the
   assert.equal(dead.message.includes('private response details'), false);
 });
 
+test('terminal Square webhook failures preserve sanitized provider and source diagnostics', async () => {
+  const objectId = 'payment-opaque_with_underscore';
+  const payload = webhook('evt-permission-failure', 'payment.updated', { payment: { id: objectId } });
+  const privateDetail = 'private customer and payment response data';
+  const state = harness({ payload, request: async () => {
+    const error = Object.assign(new Error(privateDetail), {
+      status: 403, errors: [{ code: 'ACCESS_DENIED', detail: privateDetail }], squareRequestId: 'square-request-123',
+    });
+    throw error;
+  } });
+  state.queue.claim = async () => ({ id: 'webhook-permission-failure', type: 'square.webhook', organizationId: org,
+    attempts: 3, maxAttempts: 3, leaseToken: 'lease-permission-failure', payload: { notificationId: 'evt-permission-failure' } });
+
+  const result = await state.worker.runOne({ workerId: 'worker-1' });
+  const issue = state.issues.get('SOURCE_GAP');
+
+  assert.equal(result.status, 'dead_lettered');
+  assert.equal(issue.details.code, 'PERMISSION_LOST');
+  assert.equal(issue.details.resource, 'payment');
+  assert.equal(issue.details.eventType, 'payment.updated');
+  assert.equal(issue.details.objectId, objectId);
+  assert.deepEqual(issue.sourceRefs, [objectId]);
+  assert.equal(issue.details.providerStatus, 403);
+  assert.equal(issue.details.providerCode, 'ACCESS_DENIED');
+  assert.equal(issue.details.squareRequestId, 'square-request-123');
+  assert.equal(issue.details.diagnostics.failureClass, 'http_error');
+  assert.equal(JSON.stringify(issue.details).includes(privateDetail), false);
+});
+
+test('terminal webhook normalization gaps retain the authoritative object missing code', async () => {
+  const payload = webhook('evt-missing-object', 'order.updated', { order: { id: 'order-missing' } });
+  const state = harness({ payload, responses: { '/v2/orders/order-missing': { order: {} } } });
+  state.queue.claim = async () => ({ id: 'webhook-missing-object', type: 'square.webhook', organizationId: org,
+    attempts: 3, maxAttempts: 3, leaseToken: 'lease-missing-object', payload: { notificationId: 'evt-missing-object' } });
+
+  await state.worker.runOne({ workerId: 'worker-1' });
+  const issue = state.issues.get('SOURCE_GAP');
+
+  assert.equal(issue.details.code, 'AUTHORITATIVE_OBJECT_MISSING');
+  assert.equal(issue.details.resource, 'order');
+  assert.equal(issue.details.eventType, 'order.updated');
+  assert.equal(issue.details.objectId, 'order-missing');
+  assert.deepEqual(issue.sourceRefs, ['order-missing']);
+});
+
+test('Square webhook 404s are classified as a missing authoritative object', async () => {
+  const payload = webhook('evt-not-found', 'payment.updated', { payment: { id: 'payment-not-found' } });
+  const state = harness({ payload, request: async () => {
+    throw Object.assign(new Error('Square response body must not be persisted'), {
+      status: 404, errors: [{ code: 'NOT_FOUND', detail: 'provider-private detail' }],
+    });
+  } });
+  state.queue.claim = async () => ({ id: 'webhook-not-found', type: 'square.webhook', organizationId: org,
+    attempts: 3, maxAttempts: 3, leaseToken: 'lease-not-found', payload: { notificationId: 'evt-not-found' } });
+
+  await state.worker.runOne({ workerId: 'worker-1' });
+  const issue = state.issues.get('SOURCE_GAP');
+
+  assert.equal(issue.details.code, 'AUTHORITATIVE_OBJECT_MISSING');
+  assert.equal(issue.details.providerStatus, 404);
+  assert.equal(issue.details.providerCode, 'NOT_FOUND');
+  assert.equal(issue.details.resource, 'payment');
+  assert.equal(issue.details.objectId, 'payment-not-found');
+  assert.equal(JSON.stringify(issue.details).includes('provider-private detail'), false);
+});
+
 test('inventory webhook notifications are re-fetched from Square before the canonical count write', async () => {
   const payload = webhook('evt-inventory', 'inventory.count.updated', { inventory_counts: [{
     catalog_object_id: 'variation-1', catalog_object_type: 'ITEM_VARIATION', location_id: 'location-1',

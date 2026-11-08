@@ -13,7 +13,7 @@ function setup({ role = 'operator', proposalFixture = false, proposalType = 'unk
   const db = {
     async getMembership(arg) { calls.push(['membership', arg]); return { role }; },
     async hasOrganizationPermission(arg) { calls.push(['permission', arg]); return permissionCheck(arg); },
-    async getDashboard(arg) { calls.push(['dashboard', arg]); return { income: { status: 'complete' }, freshness: 'fresh', projectionCurrent: dashboardProjectionCurrent }; },
+    async getDashboard(arg) { calls.push(['dashboard', arg]); return { income: { status: 'complete' }, freshness: 'fresh', projectionCurrent: dashboardProjectionCurrent, sourceRevision: 1 }; },
     async listIssues(arg) { calls.push(['issues', arg]); return []; },
     async listManualMovements(arg) { calls.push(['movements', arg]); return []; },
     async listObservations(arg) { calls.push(['observations', arg]); return []; },
@@ -396,7 +396,7 @@ test('Square inventory counts are returned through inventory permission checks a
   assert.equal(denied.calls.some(call => call[0] === 'rpc'), false);
 });
 
-test('sync refreshes a whole covered period when its exact projection is missing', async () => {
+test('sync queues a projection replay from a covered period when its exact projection is missing', async () => {
   const app = setup({ role: 'owner', dashboardProjectionCurrent: false, syncCoverage: {
     windows: [
       { from: '2026-01-01T00:00:00Z', to: '2026-01-15T00:00:00Z' },
@@ -407,14 +407,63 @@ test('sync refreshes a whole covered period when its exact projection is missing
   const body = { organizationId: org, startAt: '2026-01-01T00:00:00Z', endAt: '2026-02-01T00:00:00Z' };
   const response = await app.handlers.sync(post('/api/sync', body, { 'idempotency-key': 'sync:projection-missing' }));
   assert.equal(response.status, 201);
-  assert.equal((await read(response)).syncScope, 'period');
+  const responseBody = await read(response);
+  assert.equal(responseBody.projectionQueued, true);
+  assert.equal(responseBody.syncScope, 'projection');
   assert.deepEqual(app.calls.find(call => call[0] === 'dashboard')[1], {
     organizationId: org, accountId: null, from: body.startAt, to: body.endAt, accessToken: 'valid.jwt.token',
   });
-  const queued = app.calls.filter(call => call[0] === 'sync').map(call => call[1]);
-  assert.deepEqual(queued.map(({ startAt, endAt }) => ({ startAt, endAt })), [
-    { startAt: body.startAt, endAt: body.endAt },
-  ]);
+  const replay = app.calls.find(call => call[0] === 'projection-replay')[1];
+  assert.deepEqual({ organizationId: replay.organizationId, startAt: replay.startAt, endAt: replay.endAt, requestedBy: replay.requestedBy }, {
+    organizationId: org, startAt: body.startAt, endAt: body.endAt, requestedBy: user,
+  });
+  assert.equal(app.calls.some(call => call[0] === 'square-locations'), false);
+  assert.equal(app.calls.some(call => call[0] === 'sync'), false);
+});
+
+test('date-range projection replay uses covered stored data and leaves Square untouched', async () => {
+  const app = setup({ role: 'reviewer', dashboardProjectionCurrent: false, syncCoverage: {
+    windows: [
+      { from: '2026-01-01T00:00:00Z', to: '2026-01-15T00:00:00Z' },
+      { from: '2026-01-15T00:00:00Z', to: '2026-02-01T00:00:00Z' },
+    ], pendingWindows: [], sourceHealthFresh: false,
+    sourceGaps: { missingParentOrderLineCount: 1, missingPayoutEntryHealthCount: 0 },
+  } });
+  const body = { organizationId: org, startAt: '2026-01-01T00:00:00Z', endAt: '2026-02-01T00:00:00Z' };
+  const response = await app.handlers.projectionReplay(post('/api/projection/replay', body, {
+    'idempotency-key': `projection-range:${org}:${body.startAt}:${body.endAt}:1`,
+  }));
+  assert.equal(response.status, 201);
+  assert.deepEqual(await read(response), {
+    projectionQueued: true, jobId: 'replay-1', sourceRevision: 1, startAt: body.startAt, endAt: body.endAt,
+  });
+  const replay = app.calls.find(call => call[0] === 'projection-replay')[1];
+  assert.deepEqual({ organizationId: replay.organizationId, startAt: replay.startAt, endAt: replay.endAt, requestedBy: replay.requestedBy }, {
+    organizationId: org, startAt: body.startAt, endAt: body.endAt, requestedBy: user,
+  });
+  assert.equal(app.calls.some(call => call[0] === 'square-locations' || call[0] === 'sync'), false);
+});
+
+test('date-range projection replay skips uncovered periods and waits for pending Square syncs', async () => {
+  const body = { organizationId: org, startAt: '2026-01-01T00:00:00Z', endAt: '2026-02-01T00:00:00Z' };
+  const uncovered = setup({ role: 'owner', dashboardProjectionCurrent: false, syncCoverage: {
+    windows: [], pendingWindows: [], sourceHealthFresh: true,
+    sourceGaps: { missingParentOrderLineCount: 0, missingPayoutEntryHealthCount: 0 },
+  } });
+  const key = 'projection-range:uncovered-period';
+  const missing = await uncovered.handlers.projectionReplay(post('/api/projection/replay', body, { 'idempotency-key': key }));
+  assert.equal(missing.status, 200);
+  assert.equal((await read(missing)).reason, 'SOURCE_NOT_COVERED');
+  assert.equal(uncovered.calls.some(call => call[0] === 'projection-replay'), false);
+
+  const pending = setup({ role: 'owner', dashboardProjectionCurrent: false, syncCoverage: {
+    windows: [], pendingWindows: [{ from: body.startAt, to: body.endAt }], sourceHealthFresh: false,
+    sourceGaps: { missingParentOrderLineCount: 0, missingPayoutEntryHealthCount: 0 },
+  } });
+  const waiting = await pending.handlers.projectionReplay(post('/api/projection/replay', body, { 'idempotency-key': key }));
+  assert.equal(waiting.status, 200);
+  assert.equal((await read(waiting)).reason, 'SYNC_IN_PROGRESS');
+  assert.equal(pending.calls.some(call => call[0] === 'projection-replay'), false);
 });
 
 test('sync queues only uncovered gaps when existing coverage and source health are fresh', async () => {

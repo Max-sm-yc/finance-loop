@@ -329,6 +329,7 @@ async function dispatch(request: Request) {
   if (resource === 'evidence' && !id && method === 'GET') return route.evidenceUrl(request);
   if (resource === 'runs' && id && action === 'replay' && method === 'POST') return route.replay(request);
   if (resource === 'sync' && method === 'POST') return route.sync(request);
+  if (resource === 'projection' && id === 'replay' && method === 'POST') return route.projectionReplay(request);
   if (resource === 'square' && id === 'webhook' && method === 'POST') return route.webhook(request);
   return Response.json({ error: 'NOT_FOUND', code: 'NOT_FOUND' }, { status: 404, headers: { 'cache-control': 'no-store' } });
 }

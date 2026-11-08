@@ -27,6 +27,8 @@ export type Dashboard = {
   organization?: { id: string; name: string; timezone?: string };
   period?: { from: string; to: string; currency?: string };
   projectionVersion?: string;
+  projectionCurrent?: boolean;
+  sourceRevision?: number | null;
   freshness?: { lastSyncedAt?: string | null; status?: string };
   income?: { netSalesMinor?: number; grossItemSalesMinor?: number; discountsMinor?: number; refundsMinor?: number; cogsMinor?: number | null; squareFeesMinor?: number; operationalMarginMinor?: number | null; giftCardLiabilityChangeMinor?: number | null; giftCardActivationsMinor?: number; giftCardLoadsMinor?: number; giftCardRedemptionsMinor?: number; status?: string; currency?: string; lines?: Array<Record<string, unknown>> };
   cash?: { expectedBalanceMinor?: number; observedBalanceMinor?: number | null; discrepancyMinor?: number | null; status?: string; currency?: string };

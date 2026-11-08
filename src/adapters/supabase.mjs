@@ -183,6 +183,43 @@ function issueEvidenceRefs(issue) {
   return refs;
 }
 
+function issueDiagnosticsForClient(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const kind = value.kind;
+  const identifier = (field, max = 120) => typeof value[field] === 'string'
+    && value[field].length <= max && /^[A-Za-z0-9_.-]+$/.test(value[field]) ? value[field] : null;
+  if (['square_worker_failure', 'square_locations_sync_failure', 'square_inventory_sync_failure'].includes(kind)) {
+    const result = { kind };
+    const stage = identifier('stage', 80);
+    const errorName = typeof value.errorName === 'string' && /^[A-Za-z][A-Za-z0-9_.-]{0,63}$/.test(value.errorName) ? value.errorName : null;
+    const transportCode = identifier('transportCode', 100);
+    const requestId = typeof value.squareRequestId === 'string' && /^[A-Za-z0-9-]{1,120}$/.test(value.squareRequestId)
+      ? value.squareRequestId : null;
+    if (stage) result.stage = stage;
+    if (['http_error', 'invalid_json', 'unexpected_http_status', 'invalid_response', 'transport_error', 'unexpected_error'].includes(value.failureClass)) result.failureClass = value.failureClass;
+    if (errorName) result.errorName = errorName;
+    if (value.responseFormat === 'invalid_json') result.responseFormat = 'invalid_json';
+    if (transportCode) result.transportCode = transportCode;
+    if (requestId) result.squareRequestId = requestId;
+    return result;
+  }
+  if (kind === 'square_fact_version_conflict') {
+    const result = { kind };
+    if (['order', 'order_line', 'payment', 'refund', 'catalog', 'payout', 'payout_entry', 'gift_card_activity'].includes(value.factKind)) result.factKind = value.factKind;
+    for (const key of ['objectKeyHashPrefix', 'versionKeyHashPrefix']) {
+      if (typeof value[key] === 'string' && /^[a-f0-9]{20}$/i.test(value[key])) result[key] = value[key];
+    }
+    if (Array.isArray(value.differingFields)) {
+      result.differingFields = value.differingFields.filter(field => typeof field === 'string' && /^[A-Za-z][A-Za-z0-9_]{0,63}$/.test(field)).slice(0, 20);
+    }
+    for (const key of ['storedFactHash', 'incomingFactHash']) {
+      if (typeof value[key] === 'string' && /^[a-f0-9]{64}$/i.test(value[key])) result[key] = value[key];
+    }
+    return result;
+  }
+  return null;
+}
+
 function issueDetailsForClient(details, issueCode) {
   if (!details || typeof details !== 'object' || Array.isArray(details)) return {};
   const visible = {};
@@ -192,6 +229,10 @@ function issueDetailsForClient(details, issueCode) {
   for (const key of ['providerStatus', 'source_revision', 'revision', 'freshnessTargetMs']) {
     if (Number.isSafeInteger(details[key])) visible[key] = details[key];
   }
+  if (typeof details.failureCode === 'string' && /^[A-Za-z0-9_.-]{1,100}$/.test(details.failureCode)) visible.failureCode = details.failureCode;
+  if (typeof details.squareRequestId === 'string' && /^[A-Za-z0-9-]{1,120}$/.test(details.squareRequestId)) visible.squareRequestId = details.squareRequestId;
+  const diagnostics = issueDiagnosticsForClient(details.diagnostics);
+  if (diagnostics) visible.diagnostics = diagnostics;
   for (const key of ['period_start', 'period_end', 'lastSuccessfulSyncAt']) {
     if (typeof details[key] === 'string' && details[key].length <= 40) visible[key] = details[key];
   }

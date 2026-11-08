@@ -387,9 +387,10 @@ export function createHandlers(adapters) {
       && Array.isArray(coverage.pendingWindows)
       && Number.isSafeInteger(sourceGaps.missingParentOrderLineCount) && Number.isSafeInteger(sourceGaps.missingPayoutEntryHealthCount);
     const coverageCurrent = canTrustCoverage && coverage.sourceHealthFresh && !hasSourceGaps && gaps.length === 0;
+    let dashboard = null;
     let projectionCurrent = false;
     if (coverageCurrent) {
-      const dashboard = await db.getDashboard({ organizationId: body.organizationId, accountId: null,
+      dashboard = await db.getDashboard({ organizationId: body.organizationId, accountId: null,
         from: body.startAt, to: body.endAt, accessToken: actor.accessToken });
       projectionCurrent = dashboard?.projectionCurrent === true;
       if (projectionCurrent) {
@@ -400,6 +401,14 @@ export function createHandlers(adapters) {
       Number.isFinite(Date.parse(window?.from)) && Number.isFinite(Date.parse(window?.to))
       && Date.parse(window.from) < Date.parse(body.endAt) && Date.parse(window.to) > Date.parse(body.startAt))) {
       return ok({ skipped: true, reason: 'SYNC_IN_PROGRESS', startAt: body.startAt, endAt: body.endAt });
+    }
+    if (coverageCurrent && !projectionCurrent && Number.isSafeInteger(dashboard?.sourceRevision) && dashboard.sourceRevision >= 0) {
+      const revision = dashboard.sourceRevision;
+      const replayKey = `projection-range:${createHash('sha256').update(`${key}:${body.organizationId}:${body.startAt}:${body.endAt}:${revision}`).digest('hex')}`;
+      const job = await queue.enqueueProjectionReplay({ organizationId: body.organizationId,
+        startAt: body.startAt, endAt: body.endAt, idempotencyKey: replayKey, requestedBy: actor.userId });
+      return created({ projectionQueued: true, syncScope: 'projection', jobId: job.id ?? null,
+        sourceRevision: revision, startAt: body.startAt, endAt: body.endAt });
     }
     const refreshWholeWindow = !canTrustCoverage || !coverage.sourceHealthFresh || hasSourceGaps || (coverageCurrent && !projectionCurrent);
     const plannedWindows = refreshWholeWindow ? [{ startAt: body.startAt, endAt: body.endAt }] : gaps;
@@ -436,6 +445,50 @@ export function createHandlers(adapters) {
       queuedWindows: jobs.length,
       syncScope: refreshWholeWindow ? 'period' : 'uncovered',
     });
+  });
+
+  const projectionReplay = run(async req => {
+    if (req.method !== 'POST') throw new HttpError(405, 'METHOD_NOT_ALLOWED');
+    const body = await readJson(req); const key = idempotency(req);
+    if (!exactObject(body, ['organizationId','startAt','endAt']) || !UUID.test(body.organizationId)
+        || !validDate(body.startAt) || !validDate(body.endAt) || Date.parse(body.startAt) >= Date.parse(body.endAt)) {
+      throw new HttpError(400, 'INVALID_PROJECTION_REPLAY');
+    }
+    if (Date.parse(body.endAt) - Date.parse(body.startAt) > MAX_SYNC_WINDOW_MS) throw new HttpError(400, 'SYNC_WINDOW_TOO_LARGE');
+    const actor = await authorize(req, body.organizationId, ['owner','reviewer']);
+    if (typeof db.getSquareSyncCoverage !== 'function') return ok({ skipped: true, reason: 'SOURCE_COVERAGE_UNAVAILABLE' });
+    let coverage;
+    try {
+      coverage = await db.getSquareSyncCoverage({ organizationId: body.organizationId, startAt: body.startAt,
+        endAt: body.endAt, accessToken: actor.accessToken });
+    } catch (error) {
+      if (error?.code === 'PGRST202') return ok({ skipped: true, reason: 'SOURCE_COVERAGE_UNAVAILABLE' });
+      throw new HttpError(503, 'SQUARE_SYNC_STATUS_UNAVAILABLE');
+    }
+    if (!coverage || !Array.isArray(coverage.windows) || !Array.isArray(coverage.pendingWindows)) {
+      return ok({ skipped: true, reason: 'SOURCE_COVERAGE_UNAVAILABLE' });
+    }
+    const dashboard = await db.getDashboard({ organizationId: body.organizationId, accountId: null,
+      from: body.startAt, to: body.endAt, accessToken: actor.accessToken });
+    if (dashboard?.projectionCurrent === true) {
+      return ok({ skipped: true, reason: 'PROJECTION_CURRENT', startAt: body.startAt, endAt: body.endAt });
+    }
+    if (coverage.pendingWindows.some(window => Number.isFinite(Date.parse(window?.from)) && Number.isFinite(Date.parse(window?.to))
+        && Date.parse(window.from) < Date.parse(body.endAt) && Date.parse(window.to) > Date.parse(body.startAt))) {
+      return ok({ skipped: true, reason: 'SYNC_IN_PROGRESS', startAt: body.startAt, endAt: body.endAt });
+    }
+    if (!windowCovered(coverage.windows, body.startAt, body.endAt)) {
+      return ok({ skipped: true, reason: 'SOURCE_NOT_COVERED', startAt: body.startAt, endAt: body.endAt });
+    }
+    if (!Number.isSafeInteger(dashboard?.sourceRevision) || dashboard.sourceRevision < 0) {
+      return ok({ skipped: true, reason: 'SOURCE_REVISION_UNAVAILABLE', startAt: body.startAt, endAt: body.endAt });
+    }
+    const revision = dashboard.sourceRevision;
+    const replayKey = `projection-range:${createHash('sha256').update(`${key}:${body.organizationId}:${body.startAt}:${body.endAt}:${revision}`).digest('hex')}`;
+    const job = await queue.enqueueProjectionReplay({ organizationId: body.organizationId,
+      startAt: body.startAt, endAt: body.endAt, idempotencyKey: replayKey, requestedBy: actor.userId });
+    return created({ projectionQueued: true, jobId: job.id ?? null, sourceRevision: revision,
+      startAt: body.startAt, endAt: body.endAt });
   });
 
   const webhook = run(async req => {
@@ -1668,5 +1721,5 @@ export function createHandlers(adapters) {
     purchaseReceiptIntake, purchaseReceiptComplete, purchaseReceiptStatus,
     purchaseReceipts, manualPurchaseReceiptIntake, inventoryCorrection, inventoryOpening, inventoryItem,
     squareCatalogItem, squareCatalogCreate, squareCatalogManage, analytics, evidence, evidenceUrl, manualMovement,
-    manualMovements, observation, observations, proposal, itemCost, saleLineCost, refundReview, decision, replay, sync, webhook });
+    manualMovements, observation, observations, proposal, itemCost, saleLineCost, refundReview, decision, replay, sync, projectionReplay, webhook });
 }

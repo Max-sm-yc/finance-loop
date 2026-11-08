@@ -456,6 +456,38 @@ test('issue list carries pending review id/revision and only the bounded proposa
   assert.equal(url.searchParams.get('organization_id'), `eq.${org}`);
 });
 
+test('issue list exposes bounded worker diagnostics while omitting raw provider messages', async () => {
+  const privateDetail = 'provider response body must stay private';
+  const adapters = createSupabaseAdapters({
+    url: 'https://tenant.supabase.test', publishableKey: 'publishable',
+    fetchImpl: async () => response([{
+      id: 'source-gap-1', organization_id: org, code: 'SOURCE_GAP', state: 'awaiting_human', source_refs: [],
+      details: {
+        origin: 'worker', code: 'PERMISSION_LOST', resource: 'payment', eventType: 'payment.updated',
+        jobId: 'worker-job-1', objectId: 'payment-object-1', providerStatus: 403, providerCode: 'ACCESS_DENIED',
+        failureCode: 'SQUARE_API_FAILURE', squareRequestId: 'square-request-1', reason: privateDetail,
+        diagnostics: {
+          kind: 'square_worker_failure', failureClass: 'http_error', errorName: 'Error',
+          squareRequestId: 'square-request-1', privateDetail,
+        },
+        secretDebug: privateDetail,
+      }, proposals: [],
+    }]),
+  });
+  const [issue] = await adapters.db.listIssues({ organizationId: org, accessToken: userJwt });
+
+  assert.equal(issue.details.providerStatus, 403);
+  assert.equal(issue.details.providerCode, 'ACCESS_DENIED');
+  assert.equal(issue.details.failureCode, 'SQUARE_API_FAILURE');
+  assert.equal(issue.details.squareRequestId, 'square-request-1');
+  assert.deepEqual(issue.details.diagnostics, {
+    kind: 'square_worker_failure', failureClass: 'http_error', errorName: 'Error', squareRequestId: 'square-request-1',
+  });
+  assert.equal(issue.details.reason, undefined);
+  assert.equal(issue.details.secretDebug, undefined);
+  assert.equal(JSON.stringify(issue.details).includes(privateDetail), false);
+});
+
 test('replay source is unavailable unless the row stores an actual source snapshot', async () => {
   const adapters = createSupabaseAdapters({
     url: 'https://tenant.supabase.test', publishableKey: 'publishable',

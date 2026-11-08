@@ -22,7 +22,7 @@ const UUID_INPUT = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-
 type Organization = { id: string; name: string; base_currency?: string; timezone?: string; role?: string };
 type IssueEvidence = { id: string; type?: 'sale_line' | 'refund'; occurred_at?: string; currency?: string; quantity?: string | number; amount_minor?: string | number; gross_minor?: string | number; unit_price_minor?: string | number; discount_minor?: string | number; catalog_object_id?: string | null; item_name?: string | null; provider_object_id?: string; line_id?: string; refund_id?: string; order_id?: string; status?: string };
 type IssueSourceProblem = { objectId?: string; fields?: string[] };
-type IssueReviewContext = { summary: string; nextStep: string; resource: string; gapCode: string; problems: IssueSourceProblem[]; queueSync: boolean; providerCode?: string; providerStatus?: number; eventType?: string; objectId?: string; jobId?: string };
+type IssueReviewContext = { summary: string; nextStep: string; resource: string; gapCode: string; problems: IssueSourceProblem[]; queueSync: boolean; providerCode?: string; providerStatus?: number; eventType?: string; objectId?: string; jobId?: string; workerFailureCode?: string };
 const supportsIssueEvidence = (issue: Issue) => ['UNKNOWN_ITEM', 'REFUND_COGS_REVIEW'].includes(issue.code ?? '');
 const ISSUE_FIELD_LABELS: Record<string, string> = {
   missing_occurred_at: 'event date or time is missing',
@@ -97,6 +97,7 @@ function sourceGapReviewContext(issue: Issue): IssueReviewContext | null {
     ...(typeof details.eventType === 'string' ? { eventType: details.eventType } : {}),
     ...(typeof details.objectId === 'string' ? { objectId: details.objectId } : {}),
     ...(typeof details.jobId === 'string' ? { jobId: details.jobId } : {}),
+    ...(typeof details.failureCode === 'string' ? { workerFailureCode: details.failureCode } : {}),
   };
 }
 function issueFieldLabel(field: string) { return ISSUE_FIELD_LABELS[field] ?? field.replaceAll('_', ' ').toLowerCase(); }
@@ -203,6 +204,11 @@ export default function Home() {
   const [syncing, setSyncing] = useState(false);
   const [syncQueued, setSyncQueued] = useState(false);
   const syncQueuedRef = useRef(false);
+  const [projectionQueuedWindow, setProjectionQueuedWindow] = useState('');
+  const projectionQueuedWindowRef = useRef('');
+  const [projectionCheckWindow, setProjectionCheckWindow] = useState('');
+  const projectionCheckWindowRef = useRef('');
+  const projectionAttemptRef = useRef<{ key: string; dashboard: Dashboard | null } | null>(null);
   const syncBaselineRef = useRef<string | null>(null);
   const syncBaselineStatusRef = useRef<string | null>(null);
   const [syncStatus, setSyncStatus] = useState('');
@@ -215,6 +221,10 @@ export default function Home() {
   const loadSequence = useRef(0);
   const supabase = useMemo(() => { try { return browserSupabase(); } catch { return null; } }, []);
   const reportTimezone = dashboard?.organization?.timezone ?? 'UTC';
+  const projectionWindowKey = organizationId && from && to
+    ? `${organizationId}:${zonedMidnight(from, reportTimezone)}:${zonedMidnight(nextDate(to), reportTimezone)}` : '';
+  const projectionWindowRef = useRef(projectionWindowKey);
+  projectionWindowRef.current = projectionWindowKey;
 
   useEffect(() => {
     const timer = window.setInterval(() => setClockTick(tick => tick + 1), 60_000);
@@ -293,6 +303,8 @@ export default function Home() {
         accounts: settings.accounts ?? [],
         period: (raw.period as Dashboard['period']) ?? { from: String(projection.period_start ?? from), to: String(projection.period_end ?? to), currency: String(result.income?.currency ?? settings.organization?.base_currency ?? 'USD') },
         projectionVersion: String(raw.projectionVersion ?? projection.calculation_version ?? 'unavailable'),
+        projectionCurrent: raw.projectionCurrent === true,
+        sourceRevision: Number.isSafeInteger(raw.sourceRevision) ? Number(raw.sourceRevision) : null,
         freshness: typeof rawFreshness === 'string' ? { status: rawFreshness, lastSyncedAt: typeof raw.lastSyncedAt === 'string' ? raw.lastSyncedAt : null } : rawFreshness as Dashboard['freshness'],
         income: (raw.income ?? result.income) as Dashboard['income'],
         cash: (raw.cash ?? accountCash ?? result.cash) as Dashboard['cash'],
@@ -305,6 +317,17 @@ export default function Home() {
           syncQueuedRef.current = false; setSyncQueued(false);
           setSyncStatus(syncFailed ? 'Square reported a sync problem. Review source status and open issues.' : 'Square sync finished. Workspace data was updated automatically.');
         }
+      }
+      const dataWindowKey = `${organizationId}:${data.period?.from ?? ''}:${data.period?.to ?? ''}`;
+      if (data.projectionCurrent && dataWindowKey === projectionWindowKey) {
+        if (projectionQueuedWindowRef.current === projectionWindowKey) {
+          projectionQueuedWindowRef.current = ''; setProjectionQueuedWindow('');
+          setSyncStatus('Report updated from stored Square data.');
+        }
+        if (projectionCheckWindowRef.current === projectionWindowKey) {
+          projectionCheckWindowRef.current = ''; setProjectionCheckWindow('');
+        }
+        projectionAttemptRef.current = null;
       }
       setDashboard(data);
       if (!accountId && data.accounts?.length) setAccountId(data.accounts[0].id);
@@ -320,22 +343,83 @@ export default function Home() {
   useEffect(() => { void load(); /* Refreshed when filters or identity change. */ }, [user, organizationId, accountId, from, to, reportTimezone]);
 
   useEffect(() => {
-    if (!syncQueued || !organizationId) return;
+    const role = organizations.find(org => org.id === organizationId)?.role;
+    if (!dashboard || !projectionWindowKey || !from || !to || from > to
+        || !['owner', 'reviewer'].includes(role ?? '') || syncQueued
+        || dashboard.projectionCurrent === true
+        || dashboard.period?.from !== zonedMidnight(from, reportTimezone)
+        || dashboard.period?.to !== zonedMidnight(nextDate(to), reportTimezone)
+        || projectionQueuedWindow === projectionWindowKey) return;
+
+    const requestKey = `${projectionWindowKey}:${dashboard.sourceRevision ?? 'unknown'}`;
+    const previousAttempt = projectionAttemptRef.current;
+    const retryAfterSyncCheck = projectionCheckWindow === projectionWindowKey
+      && previousAttempt?.key === requestKey && previousAttempt.dashboard !== dashboard;
+    if (previousAttempt?.key === requestKey && !retryAfterSyncCheck) return;
+    projectionAttemptRef.current = { key: requestKey, dashboard };
+    const startAt = zonedMidnight(from, reportTimezone);
+    const endAt = zonedMidnight(nextDate(to), reportTimezone);
+    void api<{ projectionQueued?: boolean; skipped?: boolean; reason?: string }>('/api/projection/replay', {
+      method: 'POST',
+      headers: { 'Idempotency-Key': `projection-range:${requestKey}` },
+      body: JSON.stringify({ organizationId, startAt, endAt }),
+    }).then(result => {
+      if (projectionWindowRef.current !== projectionWindowKey) return;
+      if (result.projectionQueued) {
+        projectionQueuedWindowRef.current = projectionWindowKey;
+        setProjectionQueuedWindow(projectionWindowKey);
+        projectionCheckWindowRef.current = '';
+        setProjectionCheckWindow('');
+        setSyncStatus(`Report update queued from stored data for ${from} through ${to}.`);
+      } else if (result.reason === 'SYNC_IN_PROGRESS') {
+        projectionCheckWindowRef.current = projectionWindowKey;
+        setProjectionCheckWindow(projectionWindowKey);
+        setSyncStatus(`Waiting for the existing Square sync for ${from} through ${to} to finish.`);
+      } else if (result.reason === 'PROJECTION_CURRENT') {
+        void load();
+      } else {
+        projectionCheckWindowRef.current = '';
+        setProjectionCheckWindow('');
+        if (result.reason === 'SOURCE_NOT_COVERED') {
+          setSyncStatus(`Square source data for ${from} through ${to} has not been synced yet. Use Sync data to fetch it.`);
+        } else if (result.reason === 'SOURCE_COVERAGE_UNAVAILABLE' || result.reason === 'SOURCE_REVISION_UNAVAILABLE') {
+          setSyncStatus('Stored Square data is not ready to rebuild this report. Use Sync data to refresh the period.');
+        }
+      }
+    }).catch(() => {
+      if (projectionWindowRef.current !== projectionWindowKey) return;
+      projectionCheckWindowRef.current = '';
+      setProjectionCheckWindow('');
+      setSyncStatus('The report could not be rebuilt from stored data. Use Sync data to refresh this period.');
+    });
+  }, [dashboard, organizationId, organizations, from, to, reportTimezone, projectionWindowKey, syncQueued, projectionQueuedWindow, projectionCheckWindow]);
+
+  useEffect(() => {
+    const projectionCheckPending = projectionCheckWindow === projectionWindowKey;
+    const projectionQueued = projectionQueuedWindow === projectionWindowKey;
+    if ((!syncQueued && !projectionQueued && !projectionCheckPending) || !organizationId) return;
     let checks = 0;
     const timer = window.setInterval(() => {
       if (document.visibilityState !== 'visible') return;
       checks += 1;
       if (checks >= 24) {
-        syncQueuedRef.current = false; setSyncQueued(false);
-        setSyncStatus('Square is still processing this sync. The workspace checked automatically and will show new data when it is available.');
+        if (syncQueued) {
+          syncQueuedRef.current = false; setSyncQueued(false);
+          setSyncStatus('Square is still processing this sync. The workspace checked automatically and will show new data when it is available.');
+        } else if (projectionQueued) {
+          projectionQueuedWindowRef.current = ''; setProjectionQueuedWindow('');
+          setSyncStatus('The report update is taking longer than expected. The stored source data is unchanged.');
+        } else {
+          projectionCheckWindowRef.current = ''; setProjectionCheckWindow('');
+        }
         return;
       }
       void load();
     }, 15_000);
     return () => window.clearInterval(timer);
-    // Keep checking the selected report window while its durable Square job runs.
+    // Keep checking the selected report window while its durable job runs.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [syncQueued, organizationId, from, to, accountId, reportTimezone]);
+  }, [syncQueued, projectionQueuedWindow, projectionCheckWindow, projectionWindowKey, organizationId, from, to, accountId, reportTimezone]);
 
   async function signIn(e: FormEvent) {
     e.preventDefault(); if (!supabase) return;
@@ -344,16 +428,17 @@ export default function Home() {
     catch { setError('Sign in could not reach the authentication service. Try again.'); }
     finally { setBusy(false); }
   }
-  async function signOut() { loadSequence.current += 1; await supabase?.auth.signOut(); setDashboard(null); setIssues([]); setMovements([]); setEvents([]); setFeatures(null); syncQueuedRef.current = false; setSyncQueued(false); setSyncStatus(''); setSyncError(''); }
+  async function signOut() { loadSequence.current += 1; await supabase?.auth.signOut(); setDashboard(null); setIssues([]); setMovements([]); setEvents([]); setFeatures(null); syncQueuedRef.current = false; setSyncQueued(false); projectionQueuedWindowRef.current = ''; setProjectionQueuedWindow(''); projectionCheckWindowRef.current = ''; setProjectionCheckWindow(''); projectionAttemptRef.current = null; setSyncStatus(''); setSyncError(''); }
   async function syncSelectedPeriod(): Promise<boolean> {
     if (!organizationId || !from || !to || from > to) {
       setSyncError('Choose a valid period before syncing.'); setSyncStatus(''); return false;
     }
     setSyncing(true); setSyncError(''); setSyncStatus(''); setSyncQueued(false); syncQueuedRef.current = false;
+    projectionCheckWindowRef.current = ''; setProjectionCheckWindow('');
     syncBaselineRef.current = dashboard?.freshness?.lastSyncedAt ?? null;
     syncBaselineStatusRef.current = dashboard?.freshness?.status ?? null;
     try {
-      const result = await api<{ skipped?: boolean; reason?: 'PERIOD_CURRENT' | 'SYNC_IN_PROGRESS'; queuedWindows?: number; syncScope?: 'period' | 'uncovered' }>('/api/sync', {
+      const result = await api<{ skipped?: boolean; projectionQueued?: boolean; reason?: 'PERIOD_CURRENT' | 'SYNC_IN_PROGRESS'; queuedWindows?: number; syncScope?: 'period' | 'uncovered' | 'projection' }>('/api/sync', {
         method: 'POST',
         headers: { 'Idempotency-Key': `square-sync:${crypto.randomUUID()}` },
         body: JSON.stringify({
@@ -368,6 +453,10 @@ export default function Home() {
         setSyncStatus(result.reason === 'SYNC_IN_PROGRESS'
           ? `A Square sync covering ${from} through ${to} is already queued or running.`
           : `Square data for ${from} through ${to} is already covered and current. The report uses the stored facts.`);
+      } else if (result.projectionQueued) {
+        projectionQueuedWindowRef.current = projectionWindowKey;
+        setProjectionQueuedWindow(projectionWindowKey);
+        setSyncStatus(`Report update queued from stored data for ${from} through ${to}.`);
       } else if (result.syncScope === 'uncovered') {
         const count = result.queuedWindows ?? 1;
         syncQueuedRef.current = true; setSyncQueued(true);
@@ -398,6 +487,8 @@ export default function Home() {
   const currency = dashboard?.period?.currency ?? dashboard?.income?.currency ?? 'USD';
   const openIssues = issues.filter(i => !['resolved', 'approved', 'rejected'].includes(i.state));
   const isWorkspaceOwner = organizations.find(org => org.id === organizationId)?.role === 'owner';
+  const projectionQueuedForSelectedPeriod = projectionQueuedWindow === projectionWindowKey;
+  const projectionCheckPendingForSelectedPeriod = projectionCheckWindow === projectionWindowKey;
   const sourceFreshness = dashboard?.freshness?.status ?? 'unknown';
   const sourceFreshnessTone = ({ fresh: 'good', incomplete: 'warn', stale: 'warn', failed: 'bad', unknown: 'neutral' } as Record<string, string>)[sourceFreshness] ?? 'neutral';
   const sourceFreshnessLabel = ({ fresh: 'Synced with Square', incomplete: 'Sync incomplete', stale: 'Sync overdue', failed: 'Sync failed', unknown: 'Sync status unavailable' } as Record<string, string>)[sourceFreshness] ?? 'Sync status unavailable';
@@ -425,11 +516,11 @@ export default function Home() {
       <nav aria-label="Main navigation">{navItems.map(item => <button key={item.id} className={`nav-link ${page === item.id ? 'selected' : ''}`} onClick={() => navigate(item.id)} aria-current={page === item.id ? 'page' : undefined}><UiIcon name={item.icon} size={17} />{item.label}{item.id === 'review' && openIssues.length > 0 && <i>{openIssues.length}</i>}</button>)}</nav>
       <div className="sidebar-foot"><div className="profile"><span className="avatar">{user.email?.slice(0, 1).toUpperCase() ?? 'U'}</span><span className="profile-info"><b>{user.email}</b><small>Signed in</small></span><button className="icon-button" onClick={signOut} title="Sign out" aria-label="Sign out"><UiIcon name="signOut" /></button></div></div>
     </aside>
-    <section className="main-area"><header className="topbar"><div className="top-controls" role="group" aria-label={`Workspace and reporting controls. Period dates use ${reportTimezone}`}>{organizations.length > 1 && <label className="compact organization-picker">Organization<select value={organizationId} onChange={e => { loadSequence.current += 1; setOrganizationId(e.target.value); setAccountId(''); setDashboard(null); setFeatures(null); syncQueuedRef.current = false; setSyncQueued(false); setSyncStatus(''); setSyncError(''); if (page === 'analytics') setPage('overview'); }}><option value="">Choose workspace</option>{organizations.map(org => <option key={org.id} value={org.id}>{org.name}</option>)}</select></label>}<details className="period-picker"><summary aria-label={`Reporting period ${periodLabel(from, to)}`}>{periodLabel(from, to)}<span aria-hidden="true">⌄</span></summary><div className="period-popover"><label>Start date<input aria-label="Period start date" type="date" value={from} onChange={e => { setFrom(e.target.value); setSyncStatus(''); setSyncError(''); }} /></label><label>End date<input aria-label="Period end date" type="date" value={to} onChange={e => { setTo(e.target.value); setSyncStatus(''); setSyncError(''); }} /></label><small>{reportTimezone}</small></div></details></div><div className="sync-controls"><span className={`sync-source tone-${sourceFreshnessTone}`} role="status" aria-live="polite" title={dashboard?.freshness?.lastSyncedAt ? `Last successful Square sync ${date(dashboard.freshness.lastSyncedAt)}` : sourceFreshnessLabel}><i className="sync-source-dot" aria-hidden="true" />{syncQueued ? 'Sync queued · checking automatically' : `Square · ${sourceSyncSummary}`}</span>{isWorkspaceOwner && <button className="primary with-icon sync-data-button" onClick={() => void syncSelectedPeriod()} disabled={syncing || busy || syncQueued} title="Fetch latest data from Square and connected sources" aria-label="Sync data"><UiIcon name="sync" />{syncing ? 'Starting…' : 'Sync data'}</button>}</div></header>
+    <section className="main-area"><header className="topbar"><div className="top-controls" role="group" aria-label={`Workspace and reporting controls. Period dates use ${reportTimezone}`}>{organizations.length > 1 && <label className="compact organization-picker">Organization<select value={organizationId} onChange={e => { loadSequence.current += 1; setOrganizationId(e.target.value); setAccountId(''); setDashboard(null); setFeatures(null); syncQueuedRef.current = false; setSyncQueued(false); projectionQueuedWindowRef.current = ''; setProjectionQueuedWindow(''); projectionCheckWindowRef.current = ''; setProjectionCheckWindow(''); projectionAttemptRef.current = null; setSyncStatus(''); setSyncError(''); if (page === 'analytics') setPage('overview'); }}><option value="">Choose workspace</option>{organizations.map(org => <option key={org.id} value={org.id}>{org.name}</option>)}</select></label>}<details className="period-picker"><summary aria-label={`Reporting period ${periodLabel(from, to)}`}>{periodLabel(from, to)}<span aria-hidden="true">⌄</span></summary><div className="period-popover"><label>Start date<input aria-label="Period start date" type="date" value={from} onChange={e => { setFrom(e.target.value); setSyncStatus(''); setSyncError(''); }} /></label><label>End date<input aria-label="Period end date" type="date" value={to} onChange={e => { setTo(e.target.value); setSyncStatus(''); setSyncError(''); }} /></label><small>{reportTimezone}</small></div></details></div><div className="sync-controls"><span className={`sync-source tone-${sourceFreshnessTone}`} role="status" aria-live="polite" title={dashboard?.freshness?.lastSyncedAt ? `Last successful Square sync ${date(dashboard.freshness.lastSyncedAt)}` : sourceFreshnessLabel}><i className="sync-source-dot" aria-hidden="true" />{syncQueued ? 'Sync queued · checking automatically' : projectionQueuedForSelectedPeriod ? 'Report update queued · checking automatically' : projectionCheckPendingForSelectedPeriod ? 'Waiting for Square sync · checking automatically' : `Square · ${sourceSyncSummary}`}</span>{isWorkspaceOwner && <button className="primary with-icon sync-data-button" onClick={() => void syncSelectedPeriod()} disabled={syncing || busy || syncQueued} title="Fetch latest data from Square and connected sources" aria-label="Sync data"><UiIcon name="sync" />{syncing ? 'Starting…' : 'Sync data'}</button>}</div></header>
       <main className="page"><div className="page-head"><div><p className="eyebrow">{dashboard?.organization?.name ?? 'FINANCIAL OPERATIONS'}</p><h1>{title}</h1></div></div>
         {error && <div className="notice error-box" role="alert"><b>Data request needs attention</b><span>{error}</span></div>}
         {syncError && <div className="notice error-box" role="alert"><b>Sync could not start</b><span>{syncError}</span></div>}
-        {syncStatus && <div className="notice" role="status"><b>Sync status</b><span>{syncStatus}</span></div>}
+        {syncStatus && <div className="notice" role="status"><b>Workspace status</b><span>{syncStatus}</span></div>}
         {!organizationId ? <section className="empty-state"><div className="empty-icon">⌁</div><h2>{organizations.length ? 'Choose a workspace' : 'No workspace membership found'}</h2><p>Ask a workspace owner to add your account.</p></section> : !dashboard ? <section className="empty-state"><div className="empty-icon">⌁</div><h2>{busy ? 'Loading workspace data' : 'No projection available yet'}</h2><p>A completed projection will appear here.</p><button className="secondary with-icon" onClick={() => void load()}><UiIcon name="refresh" />Retry</button></section> : <>
           {visitedPages.has('overview') && <div hidden={page !== 'overview'}><Overview dashboard={dashboard} currency={currency} issues={openIssues} events={events} accountId={accountId} userId={user.id} onNavigate={navigate} /></div>}
           {visitedPages.has('income') && <div hidden={page !== 'income'}><Income dashboard={dashboard} currency={currency} /><GiftCardSummary income={dashboard.income} currency={currency} /></div>}
@@ -1271,6 +1362,7 @@ function Review({ issues, organizationId, currency, canSync, syncPeriodLabel, on
             {issueDiagnosis.objectId && <div><dt>Square object</dt><dd>{issueDiagnosis.objectId}</dd></div>}
             {issueDiagnosis.providerStatus !== undefined && <div><dt>Provider status</dt><dd>{issueDiagnosis.providerStatus}</dd></div>}
             {issueDiagnosis.providerCode && <div><dt>Provider code</dt><dd>{issueDiagnosis.providerCode}</dd></div>}
+            {issueDiagnosis.workerFailureCode && <div><dt>Worker error</dt><dd>{issueDiagnosis.workerFailureCode}</dd></div>}
             {issueDiagnosis.jobId && <div><dt>Worker job</dt><dd>{issueDiagnosis.jobId}</dd></div>}
           </dl>
           {issueDiagnosis.problems.length > 0 && <>

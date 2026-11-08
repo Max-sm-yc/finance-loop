@@ -49,16 +49,49 @@ function errorMessage(error) {
 }
 function failureMetadata(error) {
   const code = typeof error?.code === 'string' && /^[A-Za-z0-9_.-]{1,100}$/.test(error.code) ? error.code : null;
-  const providerCode = typeof error?.providerCode === 'string' && /^[A-Za-z0-9_.-]{1,100}$/.test(error.providerCode) ? error.providerCode : null;
+  const providerCodeValue = error?.providerCode ?? error?.providerType ?? (Array.isArray(error?.errors)
+    ? error.errors.find(item => typeof item?.code === 'string' && /^[A-Za-z0-9_.-]{1,100}$/.test(item.code))?.code
+    : null);
+  const providerCode = typeof providerCodeValue === 'string' && /^[A-Za-z0-9_.-]{1,100}$/.test(providerCodeValue) ? providerCodeValue : null;
   const rawResource = typeof error?.failureResource === 'string' ? error.failureResource : null;
   const resource = rawResource?.startsWith('payout_entries:') ? 'payout_entries' : rawResource;
   const diagnosticsKind = error?.failureDiagnostics?.kind;
+  const errorName = typeof error?.name === 'string' && /^[A-Za-z][A-Za-z0-9_.-]{0,63}$/.test(error.name) ? error.name : null;
+  const transportCode = [error?.cause?.code, error?.status == null ? error?.code : null].find(value =>
+    typeof value === 'string' && /^[A-Za-z0-9_.-]{1,100}$/.test(value)) ?? null;
+  const squareRequestId = typeof error?.squareRequestId === 'string' && /^[A-Za-z0-9-]{1,120}$/.test(error.squareRequestId)
+    ? error.squareRequestId : null;
+  const objectId = typeof error?.failureObjectId === 'string' && error.failureObjectId.length <= 500
+    && !/[\u0000-\u001F\u007F]/.test(error.failureObjectId) ? error.failureObjectId : null;
+  const failureClass = Number.isInteger(error?.status) ? 'http_error'
+    : error?.responseFormat === 'invalid_json' ? 'invalid_json'
+      : error?.permanent === true ? 'invalid_response'
+        : error?.cause || transportCode ? 'transport_error' : 'unexpected_error';
+  const suppliedDiagnostics = ['square_fact_version_conflict', 'square_locations_sync_failure', 'square_inventory_sync_failure'].includes(diagnosticsKind)
+    ? error.failureDiagnostics : null;
   return {
     status: Number.isInteger(error?.status) ? error.status : null, code, providerCode,
     resource: resource && /^[A-Za-z0-9_:.-]{1,200}$/.test(resource) ? resource : null,
-    diagnostics: ['square_fact_version_conflict', 'square_locations_sync_failure', 'square_inventory_sync_failure'].includes(diagnosticsKind)
-      ? error.failureDiagnostics : null,
+    eventType: typeof error?.failureEventType === 'string' && /^[A-Za-z0-9_.-]{1,120}$/.test(error.failureEventType) ? error.failureEventType : null,
+    squareRequestId, objectId,
+    diagnostics: suppliedDiagnostics ?? {
+      kind: 'square_worker_failure', failureClass,
+      ...(errorName ? { errorName } : {}),
+      ...(error?.responseFormat === 'invalid_json' ? { responseFormat: 'invalid_json' } : {}),
+      ...(transportCode ? { transportCode } : {}),
+      ...(squareRequestId ? { squareRequestId } : {}),
+    },
   };
+}
+function withSquareFailureContext(error, { resource, eventType, objectId } = {}) {
+  if (!error || typeof error !== 'object') return error;
+  try {
+    if (!error.failureProvider) error.failureProvider = 'square';
+    if (resource && !error.failureResource) error.failureResource = resource;
+    if (eventType && !error.failureEventType) error.failureEventType = eventType;
+    if (objectId && !error.failureObjectId) error.failureObjectId = objectId;
+  } catch { /* Preserve the original provider error if it is immutable. */ }
+  return error;
 }
 function safeFailureDescription(error) {
   const { status, code } = failureMetadata(error);
@@ -128,17 +161,22 @@ export function createWorker(dependencies) {
 
   async function getClient(organizationId) {
     let connection = await tokenVault.getDecrypted({ organizationId });
-    if (!connection?.accessToken) throw Object.assign(new Error('Square connection unavailable'), { permanent: true });
+    if (!connection?.accessToken) throw Object.assign(new Error('Square connection unavailable'), { permanent: true, code: 'SQUARE_CONNECTION_UNAVAILABLE' });
     const expiresAt = Date.parse(connection.expiresAt ?? '');
     if (Number.isFinite(expiresAt) && expiresAt <= now().getTime() + 5 * 60_000) {
       if (!connection.refreshToken || !config.squareClientId || !config.squareClientSecret) {
-        throw Object.assign(new Error('Square authorization expired and refresh is not configured'), { permanent: true });
+        throw Object.assign(new Error('Square authorization expired and refresh is not configured'), { permanent: true, code: 'SQUARE_AUTHORIZATION_EXPIRED' });
       }
-      const refreshed = await refreshAccessToken({
-        refreshToken: connection.refreshToken, clientId: config.squareClientId,
-        clientSecret: config.squareClientSecret, fetchImpl,
-        baseUrl: config.squareBaseUrl ?? 'https://connect.squareup.com',
-      });
+      let refreshed;
+      try {
+        refreshed = await refreshAccessToken({
+          refreshToken: connection.refreshToken, clientId: config.squareClientId,
+          clientSecret: config.squareClientSecret, fetchImpl,
+          baseUrl: config.squareBaseUrl ?? 'https://connect.squareup.com',
+        });
+      } catch (error) {
+        throw withSquareFailureContext(error, { resource: 'oauth' });
+      }
       await tokenVault.storeEncrypted({
         organizationId, connectedBy: connection.connectedBy, merchantId: refreshed.merchant_id ?? connection.merchantId,
         accessToken: refreshed.access_token, refreshToken: refreshed.refresh_token,
@@ -264,57 +302,61 @@ export function createWorker(dependencies) {
   async function fetchAuthoritative(client, payload) {
     const resource = eventResource(payload); const id = eventId(payload);
     if (!resource || !id) return { resource: resource ?? 'square', id, unsupported: true };
-    if (resource === 'inventory') {
-      const notifications = payload?.data?.object?.inventory_counts;
-      if (!Array.isArray(notifications) || notifications.length < 1 || notifications.length > 100) return { resource, id, unsupported: true };
-      const catalogObjectIds = [...new Set(notifications.map(count => count?.catalog_object_id).filter(value => typeof value === 'string' && value))];
-      const locationIds = [...new Set(notifications.map(count => count?.location_id).filter(value => typeof value === 'string' && value))];
-      if (!catalogObjectIds.length || !locationIds.length) return { resource, id, unsupported: true };
-      const facts = [];
-      await retrieveSquareInventoryCounts({ client, catalogObjectIds, locationIds, maxPages, sleep, random,
-        persist: async counts => facts.push(...counts) });
+    try {
+      if (resource === 'inventory') {
+        const notifications = payload?.data?.object?.inventory_counts;
+        if (!Array.isArray(notifications) || notifications.length < 1 || notifications.length > 100) return { resource, id, unsupported: true };
+        const catalogObjectIds = [...new Set(notifications.map(count => count?.catalog_object_id).filter(value => typeof value === 'string' && value))];
+        const locationIds = [...new Set(notifications.map(count => count?.location_id).filter(value => typeof value === 'string' && value))];
+        if (!catalogObjectIds.length || !locationIds.length) return { resource, id, unsupported: true };
+        const facts = [];
+        await retrieveSquareInventoryCounts({ client, catalogObjectIds, locationIds, maxPages, sleep, random,
+          persist: async counts => facts.push(...counts) });
+        return { resource, id, facts };
+      }
+      if (resource === 'gift_card_activity') {
+        const notified = eventObject(payload);
+        const giftCardId = notified?.gift_card_id ?? null;
+        const createdAt = notified?.created_at ?? payload?.created_at ?? now().toISOString();
+        const beginTime = new Date(Date.parse(createdAt) - 24 * 60 * 60_000).toISOString();
+        const endTime = now().toISOString();
+        let cursor = null; let pages = 0; const seen = new Set();
+        do {
+          if (++pages > maxPages) throw new Error('Gift card activity page limit exceeded');
+          const query = new URLSearchParams({ begin_time: beginTime, end_time: endTime, sort_order: 'ASC', limit: '100' });
+          if (giftCardId) query.set('gift_card_id', giftCardId);
+          if (cursor) query.set('cursor', cursor);
+          const page = await client.request(`/v2/gift-cards/activities?${query}`);
+          const activity = (page.gift_card_activities ?? []).find(item => item.id === id);
+          if (activity) return { resource, id, facts: normalizeGiftCardActivity(activity) };
+          cursor = page.cursor ?? null;
+          if (cursor && seen.has(cursor)) throw new Error('Square repeated gift card activity cursor');
+          if (cursor) seen.add(cursor);
+        } while (cursor);
+        throw new Error('Square did not return authoritative gift card activity');
+      }
+      const paths = { order: `/v2/orders/${encodeURIComponent(id)}`, payment: `/v2/payments/${encodeURIComponent(id)}`, refund: `/v2/refunds/${encodeURIComponent(id)}`, catalog: `/v2/catalog/object/${encodeURIComponent(id)}?include_related_objects=true`, payout: `/v2/payouts/${encodeURIComponent(id)}` };
+      const response = await client.request(paths[resource]);
+      const key = { order: 'order', payment: 'payment', refund: 'refund', catalog: 'object', payout: 'payout' }[resource];
+      const entity = response[key];
+      if (!entity) throw new Error(`Square authoritative ${resource} response omitted object`);
+      const facts = normalizeResource(resource, resource === 'catalog' ? { ...entity, related_objects: response.related_objects ?? [] } : entity);
+      if (resource === 'payout') {
+        let cursor = null; let pageCount = 0; const seen = new Set();
+        do {
+          if (++pageCount > maxPages) throw new Error('Payout entry page limit exceeded');
+          const suffix = cursor ? `&cursor=${encodeURIComponent(cursor)}` : '';
+          const entriesPage = await client.request(`/v2/payouts/${encodeURIComponent(id)}/payout-entries?limit=100${suffix}`);
+          facts.push(...(entriesPage.payout_entries ?? []).flatMap(entry => normalizePayoutEntry(entry, id)));
+          cursor = entriesPage.cursor ?? null;
+          if (cursor && seen.has(cursor)) throw new Error('Square repeated payout entry cursor');
+          if (cursor) seen.add(cursor);
+        } while (cursor);
+      }
       return { resource, id, facts };
+    } catch (error) {
+      throw withSquareFailureContext(error, { resource, eventType: payload?.type, objectId: id });
     }
-    if (resource === 'gift_card_activity') {
-      const notified = eventObject(payload);
-      const giftCardId = notified?.gift_card_id ?? null;
-      const createdAt = notified?.created_at ?? payload?.created_at ?? now().toISOString();
-      const beginTime = new Date(Date.parse(createdAt) - 24 * 60 * 60_000).toISOString();
-      const endTime = now().toISOString();
-      let cursor = null; let pages = 0; const seen = new Set();
-      do {
-        if (++pages > maxPages) throw new Error('Gift card activity page limit exceeded');
-        const query = new URLSearchParams({ begin_time: beginTime, end_time: endTime, sort_order: 'ASC', limit: '100' });
-        if (giftCardId) query.set('gift_card_id', giftCardId);
-        if (cursor) query.set('cursor', cursor);
-        const page = await client.request(`/v2/gift-cards/activities?${query}`);
-        const activity = (page.gift_card_activities ?? []).find(item => item.id === id);
-        if (activity) return { resource, id, facts: normalizeGiftCardActivity(activity) };
-        cursor = page.cursor ?? null;
-        if (cursor && seen.has(cursor)) throw new Error('Square repeated gift card activity cursor');
-        if (cursor) seen.add(cursor);
-      } while (cursor);
-      throw new Error('Square did not return authoritative gift card activity');
-    }
-    const paths = { order: `/v2/orders/${encodeURIComponent(id)}`, payment: `/v2/payments/${encodeURIComponent(id)}`, refund: `/v2/refunds/${encodeURIComponent(id)}`, catalog: `/v2/catalog/object/${encodeURIComponent(id)}?include_related_objects=true`, payout: `/v2/payouts/${encodeURIComponent(id)}` };
-    const response = await client.request(paths[resource]);
-    const key = { order: 'order', payment: 'payment', refund: 'refund', catalog: 'object', payout: 'payout' }[resource];
-    const entity = response[key];
-    if (!entity) throw new Error(`Square authoritative ${resource} response omitted object`);
-    const facts = normalizeResource(resource, resource === 'catalog' ? { ...entity, related_objects: response.related_objects ?? [] } : entity);
-    if (resource === 'payout') {
-      let cursor = null; let pageCount = 0; const seen = new Set();
-      do {
-        if (++pageCount > maxPages) throw new Error('Payout entry page limit exceeded');
-        const suffix = cursor ? `&cursor=${encodeURIComponent(cursor)}` : '';
-        const entriesPage = await client.request(`/v2/payouts/${encodeURIComponent(id)}/payout-entries?limit=100${suffix}`);
-        facts.push(...(entriesPage.payout_entries ?? []).flatMap(entry => normalizePayoutEntry(entry, id)));
-        cursor = entriesPage.cursor ?? null;
-        if (cursor && seen.has(cursor)) throw new Error('Square repeated payout entry cursor');
-        if (cursor) seen.add(cursor);
-      } while (cursor);
-    }
-    return { resource, id, facts };
   }
 
   async function handleWebhook(job) {
@@ -330,8 +372,11 @@ export function createWorker(dependencies) {
       return { notificationId, outcome: 'gap_backfill_scheduled' };
     }
     if (!authoritative.facts?.length) {
-      await recordGap(job.organizationId, authoritative.resource, 'AUTHORITATIVE_OBJECT_MISSING', { notificationId, objectId: authoritative.id });
-      throw new Error('Authoritative Square object was not normalized');
+      throw Object.assign(new Error('Authoritative Square object was not normalized'), {
+        code: 'AUTHORITATIVE_OBJECT_MISSING', failureProvider: 'square',
+        failureResource: authoritative.resource, failureEventType: notification.payload.type,
+        failureObjectId: authoritative.id,
+      });
     }
     if (authoritative.resource === 'inventory') {
       if (typeof db.upsertSquareInventoryCounts !== 'function') throw Object.assign(new Error('Square inventory persistence is unavailable'), { permanent: true });
@@ -910,7 +955,31 @@ export function createWorker(dependencies) {
           catch { /* Dead-letter remains authoritative if status metadata cannot be updated. */ }
         }
         if (job.type === 'square.webhook' || job.type === 'square.sync') {
-          try { await recordGap(job.organizationId, job.type, 'SOURCE_GAP', { jobId: job.id, reason: errorMessage(error) }); }
+          const failure = failureMetadata(error);
+          const authoritativeObjectMissing = error.code === 'AUTHORITATIVE_OBJECT_MISSING'
+            || (job.type === 'square.webhook' && error.failureProvider === 'square'
+              && (failure.status === 404 || failure.providerCode === 'NOT_FOUND'));
+          const knownGapCode = ['PERMISSION_LOST', 'RATE_LIMITED', 'BACKFILL_INCOMPLETE',
+            'SQUARE_FACT_VERSION_CONFLICT', 'SQUARE_LOCATIONS_SYNC_FAILED', 'PROCESSING_FEE_UNAVAILABLE',
+            'INVENTORY_BACKFILL_INCOMPLETE', 'INVENTORY_SYNC_UNAVAILABLE', 'INVENTORY_COUNT_UNMAPPED_SOURCE',
+            'INVENTORY_COUNT_CONFLICT', 'SQUARE_SYNC_INCOMPLETE'].includes(error.code);
+          let gapCode = 'SOURCE_GAP';
+          if (authoritativeObjectMissing) gapCode = 'AUTHORITATIVE_OBJECT_MISSING';
+          else if (knownGapCode) gapCode = error.code;
+          else if ((error.failureProvider === 'square' || failure.providerCode) && failure.status === 403) gapCode = 'PERMISSION_LOST';
+          else if ((error.failureProvider === 'square' || failure.providerCode) && failure.status === 429) gapCode = 'RATE_LIMITED';
+          const gapDetails = {
+            jobId: job.id, reason: errorMessage(error),
+            ...(failure.resource ? { resource: failure.resource } : {}),
+            ...(failure.eventType ? { eventType: failure.eventType } : {}),
+            ...(failure.objectId ? { objectId: failure.objectId, sourceRefs: [failure.objectId] } : {}),
+            ...(failure.status === null ? {} : { providerStatus: failure.status }),
+            ...(failure.providerCode ? { providerCode: failure.providerCode } : {}),
+            ...(failure.code ? { failureCode: failure.code } : {}),
+            ...(failure.squareRequestId ? { squareRequestId: failure.squareRequestId } : {}),
+            ...(failure.diagnostics ? { diagnostics: failure.diagnostics } : {}),
+          };
+          try { await recordGap(job.organizationId, job.type, gapCode, gapDetails); }
           catch (gapError) {
             const failed = await queue.deadLetter({
               jobId: job.id, workerId, leaseToken: job.leaseToken, code: 'SOURCE_GAP_WRITE_FAILED',
